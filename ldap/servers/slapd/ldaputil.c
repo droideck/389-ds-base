@@ -1712,11 +1712,24 @@ mozldap_ldap_explode_rdn(const char *rdn, const int notypes)
 }
 
 int
-slapi_is_ipv6_addr(const char *hostname)
+slapi_is_ipv4_addr(const char *ipAddress)
 {
     PRNetAddr addr;
 
-    if (PR_StringToNetAddr(hostname, &addr) == PR_SUCCESS &&
+    if (PR_StringToNetAddr(ipAddress, &addr) == PR_SUCCESS &&
+        PR_IsNetAddrType(&addr, PR_IpAddrV4Mapped) &&
+        addr.raw.family == PR_AF_INET) {
+        return 1;
+    }
+    return 0;
+}
+
+int
+slapi_is_ipv6_addr(const char *ipAddress)
+{
+    PRNetAddr addr;
+
+    if (PR_StringToNetAddr(ipAddress, &addr) == PR_SUCCESS &&
         !PR_IsNetAddrType(&addr, PR_IpAddrV4Mapped) &&
         addr.raw.family == PR_AF_INET6) {
         return 1;

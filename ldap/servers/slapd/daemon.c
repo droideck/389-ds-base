@@ -135,12 +135,12 @@ get_pid_file(void)
 }
 
 static int
-accept_and_configure(int s __attribute__((unused)), PRFileDesc *pr_acceptfd, PRNetAddr *pr_netaddr, int addrlen __attribute__((unused)), int secure, int local, PRFileDesc **pr_clonefd)
+accept_and_configure(int s __attribute__((unused)), PRFileDesc *pr_acceptfd, PRNetAddr *pr_netaddr_from, int addrlen __attribute__((unused)), PRNetAddr *pr_netaddr_dest, int dest_addrlen __attribute__((unused)), int secure, int local, int *proxy_connection, PRFileDesc **pr_clonefd)
 {
     int ns = 0;
     PRIntervalTime pr_timeout = PR_MillisecondsToInterval(slapd_accept_wakeup_timer);
 
-    (*pr_clonefd) = PR_Accept(pr_acceptfd, pr_netaddr, pr_timeout);
+    (*pr_clonefd) = PR_Accept(pr_acceptfd, pr_netaddr_from, pr_timeout);
     if (!(*pr_clonefd)) {
         PRErrorCode prerr = PR_GetError();
         slapi_log_err(SLAPI_LOG_ERR, "accept_and_configure", "PR_Accept() failed, " SLAPI_COMPONENT_NAME_NSPR " error %d (%s)\n",
@@ -148,6 +148,11 @@ accept_and_configure(int s __attribute__((unused)), PRFileDesc *pr_acceptfd, PRN
         return (SLAPD_INVALID_SOCKET);
     }
     ns = configure_pr_socket(pr_clonefd, secure, local);
+
+    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After 1\n");
+    // Try to get the IP address of the client and the destination from the PROXY protocol header
+    haproxy_receive(ns, proxy_connection, pr_netaddr_from, pr_netaddr_dest);
+    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After 2\n");
 
     return ns;
 }
@@ -1845,6 +1850,8 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
     Connection *conn = NULL;
     /*    struct sockaddr_in    from;*/
     PRNetAddr from = {{0}};
+    PRNetAddr dest = {{0}};
+    int proxy_connection = 0;
     PRFileDesc *pr_clonefd = NULL;
     slapdFrontendConfig_t *fecfg = getFrontendConfig();
     ber_len_t maxbersize;
@@ -1852,10 +1859,11 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
     if (newconn) {
         *newconn = NULL;
     }
-    if ((ns = accept_and_configure(tcps, pr_acceptfd, &from,
-                                   sizeof(from), secure, local, &pr_clonefd)) == SLAPD_INVALID_SOCKET) {
+    if ((ns = accept_and_configure(tcps, pr_acceptfd, &from, sizeof(from),
+                                   &dest, sizeof(dest), secure, local, &proxy_connection, &pr_clonefd)) == SLAPD_INVALID_SOCKET) {
         return -1;
     }
+    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After accept_and_configure\n");
 
     /* get a new Connection from the Connection Table */
     conn = connection_table_get_connection(ct, ns);
@@ -1863,6 +1871,7 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
         PR_Close(pr_acceptfd);
         return -1;
     }
+    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After connection_table_get_connection\n");
     pthread_mutex_lock(&(conn->c_mutex));
 
     /*
@@ -1926,6 +1935,7 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
     }
 
     connection_reset(conn, ns, &from, sizeof(from), secure);
+    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After connection_reset\n");
 
     /* Call the plugin extension constructors */
     conn->c_extension = factory_create_extension(connection_type, conn, NULL /* Parent */);
