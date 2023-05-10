@@ -36,6 +36,9 @@
 #define PP2_HDR_LEN_INET	(PP2_HEADER_LEN + PP2_ADDR_LEN_INET)
 #define PP2_HDR_LEN_INET6	(PP2_HEADER_LEN + PP2_ADDR_LEN_INET6)
 
+/* Both formats (v1 and v2) are designed to fit in the smallest TCP segment
+ * that any TCP/IP host is required to support (576 - 40 = 536 bytes).
+ */
 #define HAPROXY_HEADER_MAX_LEN 536
 
 /* Define struct for the proxy header */

@@ -10,22 +10,6 @@
 #include <string.h>
 #include <haproxy.h>
 
-void log_prnetaddr(const PRNetAddr *addr) {
-    char ip_str[INET6_ADDRSTRLEN] = {0};
-    uint16_t port = 0;
-
-    if (addr->inet.family == PR_AF_INET) {
-        PR_NetAddrToString(addr, ip_str, sizeof(ip_str));
-        port = PR_ntohs(addr->inet.port);
-        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "IPv4: %s:%u\n", ip_str, port);
-    } else if (addr->raw.family == PR_AF_INET6) {
-        PR_NetAddrToString(addr, ip_str, sizeof(ip_str));
-        port = PR_ntohs(addr->ipv6.port);
-        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "IPv6: %s:%u\n", ip_str, port);
-    } else {
-        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "Unknown address family\n");
-    }
-}
 
 typedef struct test_input {
     const char *input_str;
@@ -124,14 +108,14 @@ void test_libslapd_haproxy_v1(void **state) {
 
         if (test_cases[i].expected_result == 0) {
             // slapi_log_error(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Expected pr_netaddr_from: ");
-            // log_prnetaddr(&test_cases[i].expected_pr_netaddr_from); 
+            // slapi_log_prnetaddr(&test_cases[i].expected_pr_netaddr_from); 
             // slapi_log_error(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Actual pr_netaddr_from: ");
-            // log_prnetaddr(&pr_netaddr_from);
+            // slapi_log_prnetaddr(&pr_netaddr_from);
 
             // slapi_log_error(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Expected pr_netaddr_dest: ");
-            // log_prnetaddr(&test_cases[i].expected_pr_netaddr_dest);
+            // slapi_log_prnetaddr(&test_cases[i].expected_pr_netaddr_dest);
             // slapi_log_error(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Actual pr_netaddr_dest: ");
-            // log_prnetaddr(&pr_netaddr_dest);
+            // slapi_log_prnetaddr(&pr_netaddr_dest);
 
             assert_memory_equal(&test_cases[i].expected_pr_netaddr_from, &pr_netaddr_from, sizeof(PRNetAddr));
             assert_memory_equal(&test_cases[i].expected_pr_netaddr_dest, &pr_netaddr_dest, sizeof(PRNetAddr));

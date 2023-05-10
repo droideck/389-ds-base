@@ -3184,6 +3184,14 @@ int slapi_is_ipv4_addr(const char *ipAddress);
 int slapi_is_ipv6_addr(const char *ipAddress);
 
 /**
+ * Log to Error log the value of a PRNetAddr - IPv4 or IPv6
+ * For debugging purposes only
+ *
+ * \param addr is a PRNetAddr
+ */
+void slapi_log_prnetaddr(const PRNetAddr *addr);
+
+/**
  * Returns the length of a ber-encoded ldap operation
  *
  * \param bv is the berval of the encoded ldap operation

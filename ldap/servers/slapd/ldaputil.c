@@ -1737,6 +1737,25 @@ slapi_is_ipv6_addr(const char *ipAddress)
     return 0;
 }
 
+/* For debug purpose */
+void
+slapi_log_prnetaddr(const PRNetAddr *addr) {
+    char ip_str[INET6_ADDRSTRLEN] = {0};
+    uint16_t port = 0;
+
+    if (addr->inet.family == PR_AF_INET) {
+        PR_NetAddrToString(addr, ip_str, sizeof(ip_str));
+        port = PR_ntohs(addr->inet.port);
+        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "IPv4: %s:%u\n", ip_str, port);
+    } else if (addr->raw.family == PR_AF_INET6) {
+        PR_NetAddrToString(addr, ip_str, sizeof(ip_str));
+        port = PR_ntohs(addr->ipv6.port);
+        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "IPv6: %s:%u\n", ip_str, port);
+    } else {
+        slapi_log_error(SLAPI_LOG_ERR, "log_prnetaddr", "Unknown address family\n");
+    }
+}
+
 /*
  * Get the length of the ber-encoded ldap message.  Note, only the length of
  * the LDAP operation is returned, not the length of the entire berval.

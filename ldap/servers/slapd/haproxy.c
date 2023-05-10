@@ -341,6 +341,23 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 		slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "EOF on haproxy socket\n");
 		return -1;
     }
+	// Allocate a string to hold the hexadecimal representation
+	// Each byte will need 3 characters: two for the hexadecimal digits and one for the space
+	char hex_hdr[HAPROXY_HEADER_MAX_LEN * 3 + 1];
+
+	for (size_t i = 0; i < hdr_len; i++) {
+		sprintf(hex_hdr + i*3, "%02x ", (unsigned char)hdr[i]);
+	}
+
+	hex_hdr[hdr_len*3] = '\0';  // Null-terminate the string
+
+	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
+	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
+
+	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_from: ");
+	slapi_log_prnetaddr(pr_netaddr_from);
+	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_dest: ");
+	slapi_log_prnetaddr(pr_netaddr_dest);
 
     // Null-terminate the header string
 	if (hdr_len < sizeof(hdr)) {
@@ -349,12 +366,41 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 		slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Recieved header is too long: %d\n", hdr_len);
 		return -1;
 	}
+	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header2: %s\n", hdr);
 	// Try to parse the header as a version 1 header. If that fails, try as a version 2 header.
     if (haproxy_parse_v1_hdr(hdr, &hdr_len, proxy_connection, pr_netaddr_from, pr_netaddr_dest) != 0) {
+		// Allocate a string to hold the hexadecimal representation
+		// Each byte will need 3 characters: two for the hexadecimal digits and one for the space
+		char hex_hdr[HAPROXY_HEADER_MAX_LEN * 3 + 1];
+
+		for (size_t i = 0; i < hdr_len; i++) {
+			sprintf(hex_hdr + i*3, "%02x ", (unsigned char)hdr[i]);
+		}
+
+		hex_hdr[hdr_len*3] = '\0';  // Null-terminate the string
+
+		slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
+		slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
 		slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Failed to parse HAProxy v1 header. Trying v2...\n");
 		if (haproxy_parse_v2_hdr(hdr, &hdr_len, proxy_connection, pr_netaddr_from, pr_netaddr_dest) != 0) {
+			// Allocate a string to hold the hexadecimal representation
+			// Each byte will need 3 characters: two for the hexadecimal digits and one for the space
+			char hex_hdr[HAPROXY_HEADER_MAX_LEN * 3 + 1];
+
+			for (size_t i = 0; i < hdr_len; i++) {
+				sprintf(hex_hdr + i*3, "%02x ", (unsigned char)hdr[i]);
+			}
+
+			hex_hdr[hdr_len*3] = '\0';  // Null-terminate the string
+
+			slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
+			slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
 			slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive",
 						  "Failed to parse HAProxy header. Assuming that it's not a proxied connection. \n");
+			slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "2pr_netaddr_from: ");
+			slapi_log_prnetaddr(pr_netaddr_from);
+			slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "2pr_netaddr_dest: ");
+			slapi_log_prnetaddr(pr_netaddr_dest);
 			return -1;
 		}
     }
