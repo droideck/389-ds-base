@@ -271,11 +271,22 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
     char buf_destip[INET6_ADDRSTRLEN + 1] = {0};
     char *str_unknown = "unknown";
     int in_referral_mode = config_check_referral_mode();
+    int proxy_connection = 0;
+    PRNetAddr pr_netaddr_from = {0};
+    PRNetAddr pr_netaddr_dest = {0};
 
     slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "new %sconnection on %d\n", pTmp, conn->c_sd);
 
     /* bump our count of connections and update SNMP stats */
     conn->c_connid = slapi_counter_increment(num_conns);
+
+    if (haproxy_receive(conn->c_sd, &proxy_connection, &pr_netaddr_from, &pr_netaddr_dest) != 0) {
+        slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "new %sconnection on %d\n", pTmp, conn->c_sd);
+    }
+
+    if (proxy_connection) {
+        memcpy(from, &pr_netaddr_from, sizeof(PRNetAddr));
+    }
 
     if (!in_referral_mode) {
         slapi_counter_increment(g_get_per_thread_snmp_vars()->ops_tbl.dsConnectionSeq);
