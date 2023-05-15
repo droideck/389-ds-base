@@ -972,6 +972,7 @@ class SetupDs(object):
         self.log.debug(f"asan_enabled={ds_instance.has_asan()}")
         self.log.debug(f"libfaketime installed ={'libfaketime' in sys.modules}")
         assert_c(not ds_instance.has_asan() or 'libfaketime' not in sys.modules, "libfaketime python module is incompatible with ASAN build.")
+
         ds_instance.start(timeout=60)
         ds_instance.open()
 
