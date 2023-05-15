@@ -1856,7 +1856,6 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
                                    sizeof(from), secure, local, &pr_clonefd)) == SLAPD_INVALID_SOCKET) {
         return -1;
     }
-    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After accept_and_configure\n");
 
     /* get a new Connection from the Connection Table */
     conn = connection_table_get_connection(ct, ns);
@@ -1864,7 +1863,6 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
         PR_Close(pr_acceptfd);
         return -1;
     }
-    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After connection_table_get_connection\n");
     pthread_mutex_lock(&(conn->c_mutex));
 
     /*
@@ -1928,7 +1926,6 @@ handle_new_connection(Connection_Table *ct, int tcps, PRFileDesc *pr_acceptfd, i
     }
 
     connection_reset(conn, ns, &from, sizeof(from), secure);
-    slapi_log_err(SLAPI_LOG_CONNS, "handle_new_connection", "After connection_reset\n");
 
     /* Call the plugin extension constructors */
     conn->c_extension = factory_create_extension(connection_type, conn, NULL /* Parent */);
