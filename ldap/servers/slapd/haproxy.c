@@ -364,11 +364,6 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
 	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
 
-	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_from: ");
-	slapi_log_prnetaddr(pr_netaddr_from);
-	slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_dest: ");
-	slapi_log_prnetaddr(pr_netaddr_dest);
-
     /* Null-terminate the header string */
     if (hdr_len < sizeof(hdr)) {
         hdr[hdr_len] = 0;
@@ -391,10 +386,6 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
         slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
         slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
 
-        slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_from: ");
-        slapi_log_prnetaddr(pr_netaddr_from);
-        slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_dest: ");
-        slapi_log_prnetaddr(pr_netaddr_dest);
         slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive", "Failed to parse HAProxy v1 header. Trying v2...\n");
         if (haproxy_parse_v2_hdr(hdr, &hdr_len, proxy_connection, pr_netaddr_from, pr_netaddr_dest) != 0) {
             // Allocate a string to hold the hexadecimal representation
@@ -409,16 +400,13 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 
             slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
             slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
-
-            slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_from: ");
-            slapi_log_prnetaddr(pr_netaddr_from);
-            slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "pr_netaddr_dest: ");
-            slapi_log_prnetaddr(pr_netaddr_dest);
             slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive",
                           "Failed to parse HAProxy header. Assuming that it's not a proxied connection. \n");
             return -1;
         }
     }
+
+    slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Why are we here?\n");
 
     // Confirm the receipt of the header by reading the parsed number of bytes from the socket
     if (recv(fd, hdr, hdr_len, 0) != hdr_len) {
