@@ -22,7 +22,7 @@ static int haproxy_parse_v2_addr_v4(uint32_t in_addr, unsigned in_port, PRNetAdd
 {
     /* Check if the port is valid */
     if (in_port > 65535) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_addr_v4", "Port number exceeds maximum value.\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_addr_v4", "Port number exceeds maximum value.\n");
         return -1;
     }
 
@@ -34,7 +34,7 @@ static int haproxy_parse_v2_addr_v4(uint32_t in_addr, unsigned in_port, PRNetAdd
     /* Print the address in a human-readable format */
     char addr[INET_ADDRSTRLEN];
     if (inet_ntop(AF_INET, &(pr_netaddr->inet.ip), addr, INET_ADDRSTRLEN) == NULL) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_addr_v4", "Failed to print address.\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_addr_v4", "Failed to print address.\n");
     } else {
         slapi_log_err(SLAPI_LOG_TRACE, "haproxy_parse_v2_addr_v4", "Address: %s\n", addr);
     }
@@ -47,7 +47,7 @@ static int haproxy_parse_v2_addr_v6(uint8_t *in6_addr, unsigned in6_port, PRNetA
 {
     /* Check if the port is valid */
     if (in6_port > 65535) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_addr_v6", "Port number exceeds maximum value.\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_addr_v6", "Port number exceeds maximum value.\n");
         return -1;
     }
 
@@ -64,7 +64,7 @@ static int haproxy_parse_v2_addr_v6(uint8_t *in6_addr, unsigned in6_port, PRNetA
     char addr[INET6_ADDRSTRLEN];
     
     if (inet_ntop(AF_INET6, &(pr_netaddr->ipv6.ip), addr, INET6_ADDRSTRLEN) == NULL) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_addr_v6", "Failed to print address.\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_addr_v6", "Failed to print address.\n");
     } else {
         slapi_log_err(SLAPI_LOG_TRACE, "haproxy_parse_v2_addr_v6", "Address: %s\n", addr);
     }
@@ -79,24 +79,24 @@ int haproxy_parse_v2_hdr(const char *str, size_t *str_len, int *proxy_connection
     int rc = -1;
     /* Check if we received enough bytes to contain the HAProxy v2 header */
     if (*str_len < PP2_HEADER_LEN) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Protocol header is short\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Protocol header is short\n");
         goto done;
     }
     struct proxy_hdr_v2 *hdr_v2 = (struct proxy_hdr_v2 *) str;
     uint16_t hdr_v2_len = ntohs(hdr_v2->len);
 
     if (memcmp(hdr_v2->sig, PP2_SIGNATURE, PP2_SIGNATURE_LEN) != 0) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Protocol header is invalid\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Protocol header is invalid\n");
         goto done;
     }
     /* Check if the header has the correct signature */
     if ((hdr_v2->ver_cmd & 0xF0) != PP2_VERSION) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Protocol version is invalid\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Protocol version is invalid\n");
         goto done;
     }
     /* Check if we received enough bytes to contain the entire HAProxy v2 header, including the address information */
     if (*str_len < PP2_HEADER_LEN + hdr_v2_len) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Protocol header v2 is short\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Protocol header v2 is short\n");
         goto done;
     }
 
@@ -111,36 +111,36 @@ int haproxy_parse_v2_hdr(const char *str, size_t *str_len, int *proxy_connection
             switch (hdr_v2->fam) {
             case PP2_FAM_INET | PP2_TRANS_STREAM:{	/* TCP over IPv4 */
                 if (hdr_v2_len < PP2_ADDR_LEN_INET) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Address field is short\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Address field is short\n");
                     goto done;
                 }
                 if (haproxy_parse_v2_addr_v4(hdr_v2->addr.ip4.src_addr, hdr_v2->addr.ip4.src_port, &parsed_addr_from) < 0) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Client address is invalid\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Client address is invalid\n");
                     goto done;
                 }
                 if (haproxy_parse_v2_addr_v4(hdr_v2->addr.ip4.dst_addr, hdr_v2->addr.ip4.dst_port, &parsed_addr_dest) < 0) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Server address is invalid\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Server address is invalid\n");
                     goto done;
                 }
                 break;
                 }
             case PP2_FAM_INET6 | PP2_TRANS_STREAM:{/* TCP over IPv6 */
                 if (hdr_v2_len < PP2_ADDR_LEN_INET6) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Address field is short\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Address field is short\n");
                     goto done;
                 }
                 if (haproxy_parse_v2_addr_v6(hdr_v2->addr.ip6.src_addr, hdr_v2->addr.ip6.src_port, &parsed_addr_from) < 0) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Client address is invalid\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Client address is invalid\n");
                     goto done;
                 }
                 if (haproxy_parse_v2_addr_v6(hdr_v2->addr.ip6.dst_addr, hdr_v2->addr.ip6.dst_port, &parsed_addr_dest) < 0) {
-                    slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Server address is invalid\n");
+                    slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Server address is invalid\n");
                     goto done;
                 }
                 break;
                 }
             default:
-                slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v2_hdr", "Unsupported address family\n");
+                slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v2_hdr", "Unsupported address family\n");
                 goto done;
             }
             /* Update the received string length to include the address information */
@@ -182,7 +182,7 @@ static int haproxy_parse_v1_fam(const char *str, int *addr_family)
 {
     slapi_log_err(SLAPI_LOG_TRACE, "haproxy_parse_fam", "Address family - %s\n", str ? str : "(null)");
     if (str == 0) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_fam", "Address family is missing\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_fam", "Address family is missing\n");
         return -1;
     }
 
@@ -193,7 +193,7 @@ static int haproxy_parse_v1_fam(const char *str, int *addr_family)
         *addr_family = AF_INET6;
         return 0;
     } else {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_fam", "Address family %s is unsupported\n", str);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_fam", "Address family %s is unsupported\n", str);
         return -1;
     }
 }
@@ -206,7 +206,7 @@ static int haproxy_parse_v1_addr(const char *str, PRNetAddr *pr_netaddr, int add
     slapi_log_err(SLAPI_LOG_TRACE, "haproxy_parse_v1_addr", "addr=%s proto=%d\n", str ? str : "(null)", addr_family);
 
     if (str == 0 || strlen(str) >= sizeof(addrbuf)) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_addr", "incorrect IP address: %s\n", str);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_addr", "incorrect IP address: %s\n", str);
         return -1;
     }
 
@@ -224,12 +224,12 @@ static int haproxy_parse_v1_addr(const char *str, PRNetAddr *pr_netaddr, int add
             }
             break;
         default:
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_addr", "incorrect address family: %d\n", addr_family);
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_addr", "incorrect address family: %d\n", addr_family);
             return -1;
     }
 
     if (PR_StringToNetAddr(str, pr_netaddr) != PR_SUCCESS) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_addr", "Failed to set IP address: %s\n", str);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_addr", "Failed to set IP address: %s\n", str);
         return -1;
     }
 
@@ -249,11 +249,11 @@ static int haproxy_parse_v1_port(const char *str, PRNetAddr *pr_netaddr)
 
     /* Check for conversion errors */
     if (errno == ERANGE || port < 0 || port > 65535) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_port", "Port is out of range: %s\n", str);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_port", "Port is out of range: %s\n", str);
         return -1;
     }
     if (endptr == str || *endptr != '\0') {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_port", "No digits were found: %s\n", str);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_port", "No digits were found: %s\n", str);
         return -1;
     }
 
@@ -285,35 +285,35 @@ int haproxy_parse_v1_hdr(const char *str, size_t *str_len, int *proxy_connection
 
         /* Check if the header is valid */
         if (after_header == 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing protocol header terminator\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing protocol header terminator\n");
             goto done;
         }
         /* Parse the protocol, family, addresses, and ports */
         if (haproxy_parse_v1_protocol(get_next_token(&copied), "PROXY") < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad protocol header\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad protocol header\n");
             goto done;
         }
         /* Parse the family */
         if (haproxy_parse_v1_fam(get_next_token(&copied), &addr_family) < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad protocol type\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad protocol type\n");
             goto done;
         }
         /* Parse the addresses */
         if (haproxy_parse_v1_addr(get_next_token(&copied), &parsed_addr_from, addr_family) < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad client address\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad client address\n");
             goto done;
         }
         if (haproxy_parse_v1_addr(get_next_token(&copied), &parsed_addr_dest, addr_family) < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad server address\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad server address\n");
             goto done;
         }
         /* Parse the ports */
         if (haproxy_parse_v1_port(get_next_token(&copied), &parsed_addr_from) < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad client port\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad client port\n");
             goto done;
         }
         if (haproxy_parse_v1_port(get_next_token(&copied), &parsed_addr_dest) < 0) {
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_parse_v1_hdr", "Missing or bad server port\n");
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_parse_v1_hdr", "Missing or bad server port\n");
             goto done;
         }
         rc = 0;
@@ -346,10 +346,15 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
     size_t hdr_len;
 
     // Attempt to receive the header from the HAProxy server
-    if ((hdr_len = recv(fd, hdr, sizeof(hdr) - 1, MSG_PEEK)) <= 0) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive", "EOF on haproxy socket\n");
+    size_t recv_result = recv(fd, hdr, sizeof(hdr) - 1, MSG_PEEK);
+
+    if (recv_result <= 0) {
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "EOF or error on haproxy socket: %s\n", strerror(errno));
         return -1;
+    } else {
+        hdr_len = recv_result;
     }
+
 
     // Allocate a string to hold the hexadecimal representation
 	// Each byte will need 3 characters: two for the hexadecimal digits and one for the space
@@ -368,7 +373,7 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
     if (hdr_len < sizeof(hdr)) {
         hdr[hdr_len] = 0;
     } else {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive", "Recieved header is too long or an error is returned: %d\n", hdr_len);
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Recieved header is too long or an error is returned: %d\n", hdr_len);
         return -1;
     }
     /* Try to parse the header as a version 1 header. If that fails, try as a version 2 header. */
@@ -386,7 +391,7 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
         slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
         slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
 
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive", "Failed to parse HAProxy v1 header. Trying v2...\n");
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Failed to parse HAProxy v1 header. Trying v2...\n");
         if (haproxy_parse_v2_hdr(hdr, &hdr_len, proxy_connection, pr_netaddr_from, pr_netaddr_dest) != 0) {
             // Allocate a string to hold the hexadecimal representation
             // Each byte will need 3 characters: two for the hexadecimal digits and one for the space
@@ -400,7 +405,7 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 
             slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
             slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
-            slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive",
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive",
                           "Failed to parse HAProxy header. Assuming that it's not a proxied connection. \n");
             return -1;
         }
@@ -409,10 +414,13 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
     slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Why are we here?\n");
 
     // Confirm the receipt of the header by reading the parsed number of bytes from the socket
-    if (recv(fd, hdr, hdr_len, 0) != hdr_len) {
-        slapi_log_err(SLAPI_LOG_CONNS, "haproxy_receive", "Read error: %s\n", hdr);
+    recv_result = recv(fd, hdr, hdr_len, 0);
+
+    if (recv_result != hdr_len) {
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Read error: %s: %s\n", hdr, strerror(errno));
         return -1;
     }
+
 
     return 0;
 }
