@@ -279,9 +279,9 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
     /* bump our count of connections and update SNMP stats */
     conn->c_connid = slapi_counter_increment(num_conns);
 
-    if (haproxy_receive(conn->c_sd, &proxy_connection, from, &pr_netaddr_dest) != 0) {
-        slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "Failed to recieve HAProxy information\n");
-    }
+    // if (haproxy_receive(conn->c_sd, &proxy_connection, from, &pr_netaddr_dest) != 0) {
+    //    slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "Failed to recieve HAProxy information\n");
+    // }
 
     if (!in_referral_mode) {
         slapi_counter_increment(g_get_per_thread_snmp_vars()->ops_tbl.dsConnectionSeq);
