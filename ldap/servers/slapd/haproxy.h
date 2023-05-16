@@ -8,10 +8,8 @@
 
 #include <prnetdb.h>
 
- /*
-  * Begin protocol v2 definitions from haproxy/include/types/connection.h.
-  */
-#define PP2_SIGNATURE		"\r\n\r\n\0\r\nQUIT\n"
+ /* Protocol v2 definitions */
+#define PP2_SIGNATURE		"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
 #define PP2_SIGNATURE_LEN	12
 #define PP2_HEADER_LEN		16
 

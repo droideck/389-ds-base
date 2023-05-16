@@ -272,20 +272,15 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
     char *str_unknown = "unknown";
     int in_referral_mode = config_check_referral_mode();
     int proxy_connection = 0;
-    PRNetAddr pr_netaddr_from = {{0}};
     PRNetAddr pr_netaddr_dest = {{0}};
 
-    slapi_log_err(SLAPI_LOG_ERR, "connection_reset", "new %sconnection on %d\n", pTmp, conn->c_sd);
+    slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "new %sconnection on %d\n", pTmp, conn->c_sd);
 
     /* bump our count of connections and update SNMP stats */
     conn->c_connid = slapi_counter_increment(num_conns);
 
-    if (haproxy_receive(conn->c_sd, &proxy_connection, &pr_netaddr_from, &pr_netaddr_dest) != 0) {
-        slapi_log_err(SLAPI_LOG_ERR, "connection_reset", "Failed to recieve HAProxy information\n");
-    }
-
-    if (proxy_connection) {
-        memcpy(from, &pr_netaddr_from, sizeof(PRNetAddr));
+    if (haproxy_receive(conn->c_sd, &proxy_connection, from, &pr_netaddr_dest) != 0) {
+        slapi_log_err(SLAPI_LOG_CONNS, "connection_reset", "Failed to recieve HAProxy information\n");
     }
 
     if (!in_referral_mode) {
@@ -311,7 +306,8 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
             }
         }
         str_ip = buf_ldapi;
-    } else if (((from->ipv6.ip.pr_s6_addr32[0] != 0) || /* from contains non zeros */
+    } else if ((proxy_connection) ||
+               ((from->ipv6.ip.pr_s6_addr32[0] != 0) || /* from contains non zeros */
                 (from->ipv6.ip.pr_s6_addr32[1] != 0) ||
                 (from->ipv6.ip.pr_s6_addr32[2] != 0) ||
                 (from->ipv6.ip.pr_s6_addr32[3] != 0)) ||
@@ -1091,7 +1087,7 @@ get_next_from_buffer(void *buffer __attribute__((unused)), size_t buffer_size __
         }
         syserr = errno;
         /* Bad stuff happened, like the client sent us some junk */
-        slapi_log_err(SLAPI_LOG_ERR, "get_next_from_buffer",
+        slapi_log_err(SLAPI_LOG_CONNS, "get_next_from_buffer",
                       "ber_get_next failed for connection %" PRIu64 "\n", conn->c_connid);
         /* reset private buffer */
         conn->c_private->c_buffer_bytes = conn->c_private->c_buffer_offset = 0;
@@ -1248,7 +1244,7 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                     } else {
                         /* Otherwise we loop, unless we exceeded the ioblock timeout */
                         if (waits_done > ioblocktimeout_waits) {
-                            slapi_log_err(SLAPI_LOG_ERR, "connection_read_operation",
+                            slapi_log_err(SLAPI_LOG_CONNS, "connection_read_operation",
                                           "ioblocktimeout expired on connection %" PRIu64 "\n", conn->c_connid);
                             disconnect_server_nomutex(conn, conn->c_connid, -1,
                                                       SLAPD_DISCONNECT_IO_TIMEOUT, 0);
@@ -1276,12 +1272,12 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                     ret = CONN_DONE;
                     goto done;
                 }
-                slapi_log_err(SLAPI_LOG_ERR,
+                slapi_log_err(SLAPI_LOG_CONNS,
                               "connection_read_operation", "connection %" PRIu64 " waited %d times for read to be ready\n", conn->c_connid, waits_done);
             } else {
                 /* Some other error, typically meaning bad stuff */
                 syserr = PR_GetOSError();
-                slapi_log_err(SLAPI_LOG_ERR, "connection_read_operation",
+                slapi_log_err(SLAPI_LOG_CONNS, "connection_read_operation",
                               "PR_Recv for connection %" PRIu64 " returns %d (%s)\n", conn->c_connid, err, slapd_pr_strerror(err));
                 /* If this happens we should close the connection */
                 disconnect_server_nomutex(conn, conn->c_connid, -1, err, syserr);
@@ -1301,7 +1297,7 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                     goto done;
                 }
             }
-            slapi_log_err(SLAPI_LOG_ERR,
+            slapi_log_err(SLAPI_LOG_CONNS,
                           "connection_read_operation", "connection %" PRIu64 " read %d bytes\n", conn->c_connid, ret);
 
             new_operation = 0;
@@ -1378,7 +1374,7 @@ void
 connection_make_readable_nolock(Connection *conn)
 {
     conn->c_gettingber = 0;
-    slapi_log_err(SLAPI_LOG_ERR, "connection_make_readable_nolock", "making readable conn %" PRIu64 " fd=%d\n",
+    slapi_log_err(SLAPI_LOG_CONNS, "connection_make_readable_nolock", "making readable conn %" PRIu64 " fd=%d\n",
                   conn->c_connid, conn->c_sd);
 }
 
@@ -1402,7 +1398,7 @@ connection_check_activity_level(Connection *conn)
     /* update the last checked time */
     conn->c_private->previous_count_check_time = slapi_current_rel_time_t();
     pthread_mutex_unlock(&(conn->c_mutex));
-    slapi_log_err(SLAPI_LOG_ERR, "connection_check_activity_level", "conn %" PRIu64 " activity level = %d\n", conn->c_connid, delta_count);
+    slapi_log_err(SLAPI_LOG_CONNS, "connection_check_activity_level", "conn %" PRIu64 " activity level = %d\n", conn->c_connid, delta_count);
 }
 
 typedef struct table_iterate_info_struct
@@ -1467,7 +1463,7 @@ connection_enter_leave_turbo(Connection *conn, int current_turbo_flag, int *new_
     } else {
         double activet = 0.0;
         connection_find_our_rank(conn, &connection_count, &our_rank);
-        slapi_log_err(SLAPI_LOG_ERR, "connection_enter_leave_turbo",
+        slapi_log_err(SLAPI_LOG_CONNS, "connection_enter_leave_turbo",
                       "conn %" PRIu64 " turbo rank = %d out of %d conns\n", conn->c_connid, our_rank, connection_count);
         activet = (double)g_get_active_threadcnt();
         threshold_rank = (int)(activet * ((double)CONN_TURBO_PERCENTILE / 100.0));
@@ -1497,9 +1493,9 @@ connection_enter_leave_turbo(Connection *conn, int current_turbo_flag, int *new_
     pthread_mutex_unlock(&(conn->c_mutex));
     if (current_mode != new_mode) {
         if (current_mode) {
-            slapi_log_err(SLAPI_LOG_ERR, "connection_enter_leave_turbo", "conn %" PRIu64 " leaving turbo mode\n", conn->c_connid);
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_enter_leave_turbo", "conn %" PRIu64 " leaving turbo mode\n", conn->c_connid);
         } else {
-            slapi_log_err(SLAPI_LOG_ERR, "connection_enter_leave_turbo", "conn %" PRIu64 " entering turbo mode\n", conn->c_connid);
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_enter_leave_turbo", "conn %" PRIu64 " entering turbo mode\n", conn->c_connid);
         }
     }
     *new_turbo_flag = new_mode;
@@ -1646,13 +1642,13 @@ connection_threadmain(void *arg)
         more_data = 0;
         ret = connection_read_operation(conn, op, &tag, &more_data);
         if ((ret == CONN_DONE) || (ret == CONN_TIMEDOUT)) {
-            slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain",
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain",
                           "conn %" PRIu64 " read not ready due to %d - thread_turbo_flag %d more_data %d "
                           "ops_initiated %d refcnt %d flags %d\n",
                           conn->c_connid, ret, thread_turbo_flag, more_data,
                           conn->c_opsinitiated, conn->c_refcnt, conn->c_flags);
         } else if (ret == CONN_FOUND_WORK_TO_DO) {
-            slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain",
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain",
                           "conn %" PRIu64 " read operation successfully - thread_turbo_flag %d more_data %d "
                           "ops_initiated %d refcnt %d flags %d\n",
                           conn->c_connid, thread_turbo_flag, more_data,
@@ -1679,7 +1675,7 @@ connection_threadmain(void *arg)
         /* turn off turbo mode immediately if any pb waiting in global queue */
         if (thread_turbo_flag && !WORK_Q_EMPTY) {
             thread_turbo_flag = 0;
-            slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain",
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain",
                           "conn %" PRIu64 " leaving turbo mode - pb_q is not empty %d\n",
                           conn->c_connid, work_q_size);
         }
@@ -1706,7 +1702,7 @@ connection_threadmain(void *arg)
                  * should call connection_make_readable after the op is removed
                  * connection_make_readable(conn);
                  */
-            slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain",
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain",
                           "conn %" PRIu64 " leaving turbo mode due to %d\n",
                           conn->c_connid, ret);
             goto done;
@@ -1760,7 +1756,7 @@ connection_threadmain(void *arg)
                      */
                     conn->c_idlesince = curtime;
                     connection_activity(conn, maxthreads);
-                    slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain", "conn %" PRIu64 " queued because more_data\n",
+                    slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain", "conn %" PRIu64 " queued because more_data\n",
                                   conn->c_connid);
                 } else {
                     /* keep count of how many times maxthreads has blocked an operation */
@@ -1869,7 +1865,7 @@ connection_threadmain(void *arg)
 
             /* If we're in turbo mode, we keep our reference to the connection alive */
             /* can't use the more_data var because connection could have changed in another thread */
-            slapi_log_err(SLAPI_LOG_ERR, "connection_threadmain", "conn %" PRIu64 " check more_data %d thread_turbo_flag %d"
+            slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain", "conn %" PRIu64 " check more_data %d thread_turbo_flag %d"
                           "repl_conn_bef %d, repl_conn_now %d\n",
                           conn->c_connid, more_data, thread_turbo_flag,
                           replication_connection, conn->c_isreplication_session);
@@ -1929,7 +1925,7 @@ connection_activity(Connection *conn, int maxthreads)
     struct Slapi_op_stack *op_stack_obj;
 
     if (connection_acquire_nolock(conn) == -1) {
-        slapi_log_err(SLAPI_LOG_ERR,
+        slapi_log_err(SLAPI_LOG_CONNS,
                       "connection_activity", "Could not acquire lock in connection_activity as conn %" PRIu64 " closing fd=%d\n",
                       conn->c_connid, conn->c_sd);
         /* XXX how to handle this error? */
@@ -2292,7 +2288,7 @@ disconnect_server_nomutex_ext(Connection *conn, PRUint64 opconnid, int opid, PRE
          conn->c_connid == opconnid) &&
         !(conn->c_flags & CONN_FLAG_CLOSING))
     {
-        slapi_log_err(SLAPI_LOG_ERR, "disconnect_server_nomutex_ext",
+        slapi_log_err(SLAPI_LOG_CONNS, "disconnect_server_nomutex_ext",
                 "Setting conn %" PRIu64 " fd=%d to be disconnected: reason %d\n",
                 conn->c_connid, conn->c_sd, reason);
         /*
@@ -2356,7 +2352,7 @@ disconnect_server_nomutex_ext(Connection *conn, PRUint64 opconnid, int opid, PRE
         }
 
     } else {
-        slapi_log_err(SLAPI_LOG_ERR, "disconnect_server_nomutex_ext",
+        slapi_log_err(SLAPI_LOG_CONNS, "disconnect_server_nomutex_ext",
                 "Not setting conn %d to be disconnected: %s\n",
                 conn->c_sd,
                 (conn->c_sd == SLAPD_INVALID_SOCKET) ? "socket is invalid" :
