@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
 #include "slap.h"
 
 
@@ -344,9 +345,37 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
     /* Buffer to store the header received from the HAProxy server */
     char hdr[HAPROXY_HEADER_MAX_LEN + 1];
     size_t hdr_len;
+    int flags;
+    ssize_t recv_result = 0;
+ 
+    // Get the current flags
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error getting socket flags: %s\n", strerror(errno));
+        return -1;
+    }
 
-    // Attempt to receive the header from the HAProxy server
-    size_t recv_result = recv(fd, hdr, sizeof(hdr) - 1, MSG_PEEK);
+    // Check if the socket is in blocking mode
+    if (!(flags & O_NONBLOCK)) {
+        // The socket is in blocking mode, set it to non-blocking mode
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error setting socket to non-blocking mode: %s\n", strerror(errno));
+            return -1;
+        }
+
+        // Attempt to receive the header from the HAProxy server
+        recv_result = recv(fd, hdr, sizeof(hdr) - 1, MSG_PEEK);
+
+        // Set the socket back to blocking mode
+        if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error setting socket back to blocking mode: %s\n", strerror(errno));
+            return -1;
+        }
+    } else {
+        // The socket is already in non-blocking mode
+        // Attempt to receive the header from the HAProxy server
+        recv_result = recv(fd, hdr, sizeof(hdr) - 1, MSG_PEEK);
+    }
 
     if (recv_result <= 0) {
         slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "EOF or error on haproxy socket: %s\n", strerror(errno));
@@ -354,7 +383,6 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
     } else {
         hdr_len = recv_result;
     }
-
 
     // Allocate a string to hold the hexadecimal representation
 	// Each byte will need 3 characters: two for the hexadecimal digits and one for the space
@@ -413,14 +441,39 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
 
     slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Why are we here?\n");
 
-    // Confirm the receipt of the header by reading the parsed number of bytes from the socket
-    recv_result = recv(fd, hdr, hdr_len, 0);
+    // Get the current flags
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error getting socket flags: %s\n", strerror(errno));
+        return -1;
+    }
+
+    // Check if the socket is in blocking mode
+    if (!(flags & O_NONBLOCK)) {
+        // The socket is in blocking mode, set it to non-blocking mode
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error setting socket to non-blocking mode: %s\n", strerror(errno));
+            return -1;
+        }
+
+        // Confirm the receipt of the header by reading the parsed number of bytes from the socket
+        recv_result = recv(fd, hdr, hdr_len, 0);
+
+        // Set the socket back to blocking mode
+        if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+            slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Error setting socket back to blocking mode: %s\n", strerror(errno));
+            return -1;
+        }
+    } else {
+        // The socket is already in non-blocking mode
+        // Confirm the receipt of the header by reading the parsed number of bytes from the socket
+        recv_result = recv(fd, hdr, hdr_len, 0);
+    }
 
     if (recv_result != hdr_len) {
         slapi_log_err(SLAPI_LOG_ERR, "haproxy_receive", "Read error: %s: %s\n", hdr, strerror(errno));
         return -1;
     }
-
 
     return 0;
 }
