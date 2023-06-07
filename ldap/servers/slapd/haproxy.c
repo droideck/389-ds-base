@@ -364,6 +364,17 @@ int haproxy_receive(int fd, int *proxy_connection, PRNetAddr *pr_netaddr_from, P
         hdr_len = recv_result;
     }
 
+    char hex_hdr[HAPROXY_HEADER_MAX_LEN * 3 + 1];
+
+    for (size_t i = 0; i < hdr_len; i++) {
+            sprintf(hex_hdr + i*3, "%02x ", (unsigned char)hdr[i]);
+    }
+    hex_hdr[hdr_len*3] = '\0';  // Null-terminate the string
+
+    slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header (hex): %s\n", hex_hdr);
+    slapi_log_error(SLAPI_LOG_ERR, "haproxy_receive", "Received header length: %d\n", hdr_len);
+
+
     /* Null-terminate the header string */
     if (hdr_len < sizeof(hdr)) {
         hdr[hdr_len] = 0;
