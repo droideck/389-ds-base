@@ -11,11 +11,14 @@ import logging
 import ldap
 import pytest
 from ldif import LDIFParser
-from lib389.replica import Replicas
+from lib389.cli_base import LogCapture
+from lib389.dbgen import dbgen_users
+from lib389.replica import Replicas, ReplicationManager
 from lib389.backend import Backends
 from lib389.idm.domain import Domain
 from lib389.idm.user import UserAccounts
-from lib389.topologies import topology_m2 as topo
+from lib389.tasks import ImportTask
+from lib389.topologies import create_topology
 from lib389._constants import *
 
 pytestmark = pytest.mark.tier1
@@ -40,6 +43,16 @@ if DEBUGGING:
 else:
     logging.getLogger(__name__).setLevel(logging.INFO)
 log = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="function")
+def topo(request):
+    """Create Replication Deployment with two suppliers"""
+
+    topology = create_topology({ReplicaRole.SUPPLIER: 2}, request=request)
+
+    topology.logcap = LogCapture()
+    return topology
 
 
 class MyLDIF(LDIFParser):
@@ -189,6 +202,51 @@ def test_ruv_after_reindex(topo):
     # to be written and quickly exposes the error
     inst.stop()
     assert not inst.searchErrorsLog("entryrdn_insert_key")
+
+
+def test_ruv_after_import(topo):
+    """Test that 
+
+    :id: 
+    :setup: 2 suppliers
+    :steps:
+        1. 
+    :expectedresults:
+        1. 
+    """
+
+    s1 = topo.ms['supplier1']
+    s2 = topo.ms['supplier2']
+
+    ldif_dir = s1.get_ldif_dir()
+    export_ldif = ldif_dir + '/export.ldif'
+    export_task = Backends(s1).export_ldif(be_names=DEFAULT_BENAME, ldif=export_ldif, replication=True)
+    export_task.wait()
+
+    import_ldif = ldif_dir + '/basic_import.ldif'
+    dbgen_users(s1, 100000, import_ldif, DEFAULT_SUFFIX)
+
+    r = ImportTask(s1)
+    r.import_suffix_from_ldif(ldiffile=import_ldif, suffix=DEFAULT_SUFFIX)
+    r.wait()
+
+    repl = ReplicationManager(DEFAULT_SUFFIX)
+    repl.wait_for_replication(s1, s2)
+
+    topo.pause_all_replicas()
+
+    log.info("Importing LDIF online...")
+    import_task = ImportTask(s1)
+    import_task.import_suffix_from_ldif(ldiffile=export_ldif, suffix=DEFAULT_SUFFIX)
+    import_task.wait()
+
+    topo.resume_all_replicas()
+
+    # Do some updates
+    suffix = Domain(s1, "ou=people," + DEFAULT_SUFFIX)
+    for idx in range(0, 5):
+        suffix.replace('description', str(idx))
+
 
 
 if __name__ == '__main__':
