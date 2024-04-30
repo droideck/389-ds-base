@@ -485,7 +485,7 @@ def create_dummy_db_files(inst, backend_type):
     # Define the sets of dummy files for each backend type
     mdb_files = ['data.mdb', 'lock.mdb', 'INFO.mdb']
     bdb_files = ['__db.001', 'DBVERSION', '__db.003', 'userRoot', 'log.0000000001', '__db.002']
-    
+
     # Determine the target file list based on the backend type
     if backend_type == 'mdb':
         target_files = mdb_files
@@ -494,7 +494,7 @@ def create_dummy_db_files(inst, backend_type):
 
     # Get the database directory paths from the instance
     db_dir = inst.ds_paths.db_dir
-    
+
     # Create dummy files in the primary database directory
     for filename in target_files:
         filepath = os.path.join(db_dir, filename)
@@ -529,7 +529,7 @@ def test_lint_backend_implementation_wrong_files(topology_st):
 
 
 @pytest.mark.skipif(get_default_db_lib() == "mdb", reason="Not needed for mdb")
-def test_lint_backend_implementation(create_custom_db_instance):
+def test_lint_backend_implementation(topology_st):
     """Test the lint for backend implementation mismatch
 
     :id: eff607de-768a-4cf4-bcde-48d4c7368934
