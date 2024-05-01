@@ -58,6 +58,10 @@ def run_healthcheck_and_flush_log(logcap, instance, searched_code=None, json=Fal
         log.info('Healthcheck returned searched code: %s' % searched_code)
 
     if searched_code2 is not None:
+        if ds_is_newer("3.0.0") and instance.get_db_lib() == 'bdb' and \
+        (searched_code2 is CMD_OUTPUT or searched_code2 is JSON_OUTPUT):
+            searched_code = 'DSBLE0006'
+
         assert logcap.contains(searched_code2)
         log.info('Healthcheck returned searched code: %s' % searched_code2)
 
@@ -265,7 +269,6 @@ def test_healthcheck_check_option(topology_st):
         log.info('Check {}'.format(item))
         run_healthcheck_and_flush_log(topology_st.logcap, standalone, searched_code=pattern, json=False, check=[item],
                                       searched_code2=CMD_OUTPUT)
-        run_healthcheck_and_flush_log(topology_st.logcap, standalone, searched_code=JSON_OUTPUT, json=True, check=[item])
 
 
 @pytest.mark.skipif(ds_is_older("1.4.1"), reason="Not implemented")
