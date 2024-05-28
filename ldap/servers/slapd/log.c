@@ -2417,17 +2417,34 @@ auditfail_log_openf(char *pathname, int locked)
 static int
 vslapd_log_audit(const char *log_data)
 {
+    LogBufferInfo *lbi = loginfo.log_audit_buffer;
     char buffer[SLAPI_LOG_BUFSIZ];
-    time_t tnl;
+    time_t tnl = slapi_current_utc_time();
     int32_t blen = TBUFSIZE;
     int32_t rc = LDAP_SUCCESS;
+    int32_t msg_len = strlen(log_data);
 
 #ifdef SYSTEMTAP
     STAP_PROBE(ns-slapd, vslapd_log_audit__entry);
 #endif
 
+    /*
+     * An audit entry can be larger than the buffer, flush the current buffer
+     * and write new audit entry directly to the file
+     */
+    if (msg_len > SLAPI_LOG_BUFSIZ) {
+        PR_Lock(lbi->lock);
+        log_flush_buffer(lbi, SLAPD_AUDIT_LOG, 0 /* do not sync to disk */);
+        PR_Unlock(lbi->lock);
+        /* Now directly write the entire message to disk */
+        LOG_AUDIT_LOCK_WRITE();
+        LOG_WRITE_NOW_NO_ERR(loginfo.log_audit_fdes, (char *)log_data, msg_len, 0);
+        LOG_AUDIT_UNLOCK_WRITE();
+        return 0;
+    }
+
     /* We do this sooner, because that we can use the message in other calls */
-    if ((blen = PR_snprintf(buffer, SLAPI_LOG_BUFSIZ, "%s\n", log_data)) == -1) {
+    if ((blen = PR_snprintf(buffer, SLAPI_LOG_BUFSIZ, "%s", log_data)) == -1) {
         log__error_emergency("vslapd_log_audit, Unable to format message", 1, 0);
         return -1;
     }
@@ -2435,7 +2452,6 @@ vslapd_log_audit(const char *log_data)
 #ifdef SYSTEMTAP
     STAP_PROBE(ns-slapd, vslapd_log_audit__prepared);
 #endif
-    tnl = slapi_current_utc_time();
     log_append_audit_buffer(tnl, loginfo.log_audit_buffer, buffer, blen);
 
 #ifdef SYSTEMTAP
@@ -2516,17 +2532,35 @@ log_append_audit_buffer(time_t tnl, LogBufferInfo *lbi, char *msg, size_t size)
 static int
 vslapd_log_auditfail(const char *log_data)
 {
+    LogBufferInfo *lbi = loginfo.log_auditfail_buffer;
     char buffer[SLAPI_LOG_BUFSIZ];
-    time_t tnl;
+    time_t tnl = slapi_current_utc_time();;
     int32_t blen = TBUFSIZE;
     int32_t rc = LDAP_SUCCESS;
+    int32_t msg_len = strlen(log_data);
 
 #ifdef SYSTEMTAP
     STAP_PROBE(ns-slapd, vslapd_log_auditfail__entry);
 #endif
 
+    /*
+     * An audit entry can be larger than the buffer, flush the current buffer
+     * and write new audit entry directly to the file
+     */
+    if (msg_len > SLAPI_LOG_BUFSIZ) {
+        PR_Lock(lbi->lock);
+        log_flush_buffer(lbi, SLAPD_AUDITFAIL_LOG, 0 /* do not sync to disk */);
+        PR_Unlock(lbi->lock);
+
+        /* Now directly write the entire message to disk */
+        LOG_AUDITFAIL_LOCK_WRITE();
+        LOG_WRITE_NOW_NO_ERR(loginfo.log_auditfail_fdes, (char *)log_data, msg_len, 0);
+        LOG_AUDITFAIL_UNLOCK_WRITE();
+        return 0;
+    }
+
     /* We do this sooner, because that we can use the message in other calls */
-    if ((blen = PR_snprintf(buffer, SLAPI_LOG_BUFSIZ, "%s\n", log_data)) == -1) {
+    if ((blen = PR_snprintf(buffer, SLAPI_LOG_BUFSIZ, "%s", log_data)) == -1) {
         log__error_emergency("vslapd_log_auditfail, Unable to format message", 1, 0);
         return -1;
     }
@@ -2534,7 +2568,6 @@ vslapd_log_auditfail(const char *log_data)
 #ifdef SYSTEMTAP
     STAP_PROBE(ns-slapd, vslapd_log_auditfail__prepared);
 #endif
-    tnl = slapi_current_utc_time();
     log_append_auditfail_buffer(tnl, loginfo.log_auditfail_buffer, buffer, blen);
 
 #ifdef SYSTEMTAP
