@@ -36,24 +36,14 @@ def test_origins_with_extra_parenthesis(topo):
     schema = Schema(topo.standalone)
 
     # Add new attribute
-    parameters = {
-        'names': [ATTR_NAME],
+    parameters = OBJECT_MODEL_PARAMS[AttributeType].copy()
+    parameters.update({
+        'names': (ATTR_NAME,),
         'oid': '1.1.1.1.1.1.1.22222',
         'desc': 'Test extra parenthesis in X-ORIGIN',
-        'x_origin': [X_ORG_VAL],
         'syntax': '1.3.6.1.4.1.1466.115.121.1.15',
-        'syntax_len': None,
-        'x_ordered': None,
-        'collective': None,
-        'obsolete': None,
-        'single_value': None,
-        'no_user_mod': None,
-        'equality': None,
-        'substr': None,
-        'ordering': None,
-        'usage': None,
-        'sup': None
-    }
+        'x_origin': (X_ORG_VAL,),
+    })
     schema.add_attributetype(parameters)
 
     # Search for attribute with JSON option
@@ -84,24 +74,14 @@ def test_origins(topo, name, oid, xorg):
     schema = Schema(topo.standalone)
 
     # Add new attribute
-    parameters = {
-        'names': [name],
+    parameters = OBJECT_MODEL_PARAMS[AttributeType].copy()
+    parameters.update({
+        'names': (name,),
         'oid': oid,
         'desc': 'Test X-ORIGIN',
-        'x_origin': xorg,
         'syntax': '1.3.6.1.4.1.1466.115.121.1.15',
-        'syntax_len': None,
-        'x_ordered': None,
-        'collective': None,
-        'obsolete': None,
-        'single_value': None,
-        'no_user_mod': None,
-        'equality': None,
-        'substr': None,
-        'ordering': None,
-        'usage': None,
-        'sup': None
-    }
+        'x_origin': xorg,
+    })
     schema.add_attributetype(parameters)
 
 
@@ -118,23 +98,14 @@ def test_mrs(topo):
     schema = Schema(topo.standalone)
 
     # Add new attribute
-    parameters = {
-        'names': ['test-mr'],
+    parameters = OBJECT_MODEL_PARAMS[AttributeType].copy()
+    parameters.update({
+        'names': ('test-mr',),
         'oid': '99999999',
         'desc': 'Test matching rule',
         'syntax': '1.3.6.1.4.1.1466.115.121.1.15',
-        'syntax_len': None,
-        'x_ordered': None,
-        'collective': None,
-        'obsolete': None,
-        'single_value': None,
-        'no_user_mod': None,
-        'equality': None,
         'substr': 'numericstringsubstringsmatch',
-        'ordering': None,
-        'usage': None,
-        'sup': None
-    }
+    })
     schema.add_attributetype(parameters)
 
 
