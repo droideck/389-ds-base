@@ -336,10 +336,6 @@ class AccountPolicy extends React.Component {
                             configEntry.stateattrname === undefined
                                 ? "lastLoginTime"
                                 : configEntry.stateattrname[0],
-                            checkAllStateAttrs: !(
-                                configEntry.checkallstateattrs === undefined ||
-                            configEntry.checkallstateattrs[0] === "no"
-                            ),
                             // original values
                             _altStateAttrName:
                             configEntry.altstateattrname === undefined
@@ -365,10 +361,6 @@ class AccountPolicy extends React.Component {
                             configEntry.stateattrname === undefined
                                 ? "lastLoginTime"
                                 : configEntry.stateattrname[0],
-                            _checkAllStateAttrs: !(
-                                configEntry.checkallstateattrs === undefined ||
-                            configEntry.checkallstateattrs[0] === "no"
-                            ),
                         });
                     })
                     .fail(_ => {
@@ -874,32 +866,6 @@ class AccountPolicy extends React.Component {
                                     {this.props.attributes.map((attr) => (
                                         <SelectOption
                                             key={attr}
-                                            value={attr}
-                                        />
-                                    ))}
-                                </Select>
-                            </GridItem>
-                        </Grid>
-                        <Grid title={_("Specifies the primary time attribute used to evaluate an account policy (stateAttrName)")}>
-                            <GridItem span={4} className="ds-label">
-                                {_("Limit Attribute")}
-                            </GridItem>
-                            <GridItem span={8}>
-                                <Select
-                                    variant={SelectVariant.typeahead}
-                                    typeAheadAriaLabel="Type an attribute name"
-                                    onToggle={this.handleLimitAttrToggle}
-                                    onSelect={this.handleLimitAttrSelect}
-                                    onClear={this.handleLimitAttrClear}
-                                    selections={limitAttrName}
-                                    isOpen={this.state.isLimitAttrOpen}
-                                    aria-labelledby="typeAhead-limit-attr"
-                                    placeholderText={_("Type an attribute name ...")}
-                                    noResultsFoundText={_("There are no matching entries")}
-                                >
-                                    {this.props.attributes.map((attr, index) => (
-                                        <SelectOption
-                                            key={index}
                                             value={attr}
                                         />
                                     ))}
