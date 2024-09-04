@@ -497,7 +497,7 @@ def test_login_history_valid_values(topology_st, setup_test_user, setup_account_
 
     inst = topology_st[0]
     user = setup_test_user
-    ap_config = setup_account_policy_plugin
+    ap_configs = setup_account_policy_plugin
 
     # Bind as test user more times than lastLoginHistorySize
     user_binds(user, USER_PW, LOGIN_HIST_NUM_BINDS_SEVEN)
@@ -505,7 +505,12 @@ def test_login_history_valid_values(topology_st, setup_test_user, setup_account_
     # Verify lastLoginTimeHistory attribute returns the correct number of entries in chronological order
     verify_last_login_entries(inst, USER_DN, LOGIN_HIST_SIZE_FIVE)
 
-    ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_TWO))
+    # Reduce the lastLoginHistorySize to LOGIN_HIST_SIZE_TWO
+    try:
+        ap_config = ap_configs.create(properties={'cn': 'config', 'lastLoginHistorySize': str(LOGIN_HIST_SIZE_TWO)})
+    except ldap.ALREADY_EXISTS:
+        ap_config = ap_configs.get('config')
+        ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_TWO))
 
     # Bind as test user more times than lastLoginHistorySize
     user_binds(user, USER_PW, LOGIN_HIST_NUM_BINDS_SEVEN)
@@ -514,7 +519,11 @@ def test_login_history_valid_values(topology_st, setup_test_user, setup_account_
     verify_last_login_entries(inst, USER_DN, LOGIN_HIST_SIZE_TWO)
 
     # Increase the lastLoginHistorySize to LOGIN_HIST_SIZE_FIVE
-    ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_FIVE))
+    try:
+        ap_config = ap_configs.create(properties={'cn': 'config', 'lastLoginHistorySize': str(LOGIN_HIST_SIZE_FIVE)})
+    except ldap.ALREADY_EXISTS:
+        ap_config = ap_configs.get('config')
+        ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_FIVE))
 
     # Bind as test user more times than lastLoginHistorySize
     user_binds(user, USER_PW, LOGIN_HIST_NUM_BINDS_SEVEN)
@@ -546,10 +555,14 @@ def test_lastlogin_history_size_zero(topology_st, setup_test_user, setup_account
 
     inst = topology_st[0]
     user = setup_test_user
-    ap_config = setup_account_policy_plugin
+    ap_configs = setup_account_policy_plugin
 
     # Set lastLoginHistorySize to 0
-    ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_ZERO))
+    try:
+        ap_configs.create(properties={'cn': 'config', 'lastLoginHistorySize': str(LOGIN_HIST_SIZE_ZERO)})
+    except ldap.ALREADY_EXISTS:
+        ap_config = ap_configs.get('config')
+        ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_ZERO))
 
     # Bind as test user more times than lastLoginHistorySize
     user_binds(user, USER_PW, LOGIN_HIST_NUM_BINDS_THREE)
@@ -567,19 +580,19 @@ def test_lastlogin_history_size_negative(topology_st, setup_account_policy_plugi
     :steps:
         1. Try to set the lastLoginHistorySize to a negative number.
     :expectedresults:
-        1. A warning messge has been written to the error logs.
+        1. An ldap.INVALID_SYNTAX error is raised.
     """
 
     LOGIN_HIST_SIZE_NEGATIVE = -1
-    AC_POL_CFG_DN = "cn=config,cn=Account Policy Plugin,cn=plugins,cn=config"
+    ap_configs = setup_account_policy_plugin
 
-    inst = topology_st[0]
-    ap_config = setup_account_policy_plugin
-
-    # Try to set lastLoginHistorySize to negative
-    ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_NEGATIVE))
-
-    assert inst.searchErrorsLog("Invalid value for login-history-size: -1")
+    with pytest.raises(ldap.INVALID_SYNTAX):
+        # Try to set lastLoginHistorySize to negative
+        try:
+            ap_configs.create(properties={'cn': 'config', 'lastLoginHistorySize': str(LOGIN_HIST_SIZE_NEGATIVE)})
+        except ldap.ALREADY_EXISTS:
+            ap_config = ap_configs.get('config')
+            ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_NEGATIVE))
 
 
 def test_lastlogin_history_size_non_integer(topology_st, setup_account_policy_plugin):
@@ -595,11 +608,15 @@ def test_lastlogin_history_size_non_integer(topology_st, setup_account_policy_pl
     """
 
     LOGIN_HIST_SIZE_NON_INTEGER = 'five'
-    ap_config = setup_account_policy_plugin
+    ap_configs = setup_account_policy_plugin
 
-    # Try to set lastLoginHistorySize to a non-integer
     with pytest.raises(ldap.INVALID_SYNTAX):
-        ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_NON_INTEGER))
+        # Try to set lastLoginHistorySize to a non-integer
+        try:
+            ap_configs.create(properties={'cn': 'config', 'lastLoginHistorySize': str(LOGIN_HIST_SIZE_NON_INTEGER)})
+        except ldap.ALREADY_EXISTS:
+            ap_config = ap_configs.get('config')
+            ap_config.replace('lastLoginHistorySize', str(LOGIN_HIST_SIZE_NON_INTEGER))
 
 
 def test_glact_login(topology_st, accpol_global):
