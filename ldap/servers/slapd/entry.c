@@ -775,6 +775,7 @@ str2entry_dupcheck(const char *rawdn, const char *s, int flags, int read_statein
     char *normdn = NULL;
     int strict = 0;
     struct berval bval = {0};
+    int dn_set_from_rawdn = 0;
 
     /* Check if we should be performing strict validation. */
     strict = config_get_dn_validate_strict();
@@ -854,6 +855,7 @@ str2entry_dupcheck(const char *rawdn, const char *s, int flags, int read_statein
                 }
                 /* normdn is consumed in e */
                 slapi_entry_set_normdn(e, normdn);
+                dn_set_from_rawdn = 1;
             }
             if (NULL == slapi_entry_get_rdn_const(e)) {
                 if (normdn) {
@@ -886,15 +888,21 @@ str2entry_dupcheck(const char *rawdn, const char *s, int flags, int read_statein
         }
         if (strcasecmp(type, "dn") == 0) {
             if (slapi_entry_get_dn_const(e) != NULL) {
-                char ebuf[BUFSIZ];
-                slapi_log_err(SLAPI_LOG_TRACE, "str2entry_dupcheck"
-                                               "Entry has multiple dns \"%s\" and \"%s\" (second ignored)\n",
-                              (char *)slapi_entry_get_dn_const(e),
-                              escape_string(valuecharptr, ebuf));
-                /* the memory below was not allocated by the slapi_ch_ functions */
-                if (freeval)
-                    slapi_ch_free_string(&bvvalue.bv_val);
-                continue;
+                if (dn_set_from_rawdn) {
+                    /* We reset it so that we can see the duplicate DN message
+                     * if it'll happen later in the entry */
+                    dn_set_from_rawdn = 0;
+                } else {
+                    char ebuf[BUFSIZ];
+                    slapi_log_err(SLAPI_LOG_TRACE, "str2entry_dupcheck"
+                                                "Entry has multiple dns \"%s\" and \"%s\" (second ignored)\n",
+                                (char *)slapi_entry_get_dn_const(e),
+                                escape_string(valuecharptr, ebuf));
+                    /* the memory below was not allocated by the slapi_ch_ functions */
+                    if (freeval)
+                        slapi_ch_free_string(&bvvalue.bv_val);
+                    continue;
+                }
             }
             normdn = slapi_create_dn_string("%s", valuecharptr);
             if (NULL == normdn) {
