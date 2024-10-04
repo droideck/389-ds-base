@@ -6899,7 +6899,6 @@ bdb_public_private_open(backend *be, const char *db_filename, int rw, dbi_env_t 
     bdb_config *conf = (bdb_config *)li->li_dblayer_config;
     bdb_db_env **ppEnv = (bdb_db_env**)&priv->dblayer_env;
     char dbhome[MAXPATHLEN];
-    bdb_db_env *pEnv = NULL;
     DB_ENV *bdb_env = NULL;
     DB *bdb_db = NULL;
     struct stat st = {0};
@@ -6949,13 +6948,7 @@ bdb_public_private_open(backend *be, const char *db_filename, int rw, dbi_env_t 
         conf->bdb_tx_max = 50;
         rc = bdb_start(li, DBLAYER_NORMAL_MODE);
         if (rc == 0) {
-            pEnv = (bdb_db_env *)priv->dblayer_env;
-            if (pEnv == NULL) {
-                fprintf(stderr, "bdb_public_private_open: dbenv is not available (0x%p) for database %s\n",
-                        (void *)pEnv, db_filename ? db_filename : "unknown");
-                return EINVAL;
-            }
-            bdb_env = pEnv->bdb_DB_ENV;
+            bdb_env = ((struct bdb_db_env*)(priv->dblayer_env))->bdb_DB_ENV;
         }
     } else {
         /* Setup minimal environment */
