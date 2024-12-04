@@ -1,6 +1,7 @@
 use crate::PwdChanCrypto;
 use slapi_r_plugin::prelude::*;
 use std::os::raw::c_char;
+use std::convert::TryInto;
 
 /*
  *                    /---- plugin ident
@@ -15,13 +16,21 @@ impl SlapiPlugin3 for PwdChanPbkdf2Sha256 {
     // We require a newer rust for default associated types.
     type TaskData = ();
 
-    fn start(_pb: &mut PblockRef) -> Result<(), PluginError> {
-        log_error!(ErrorLevel::Trace, "plugin start");
+    fn start(pb: &mut PblockRef) -> Result<(), PluginError> {
+        log_error!(ErrorLevel::Trace, "PBKDF2-SHA256 plugin starting");
+
+        // Handle initial configuration
+        Self::handle_pbkdf2_rounds_config(pb)?;
+
+        log_error!(
+            ErrorLevel::Info,
+            "PBKDF2-SHA256 plugin started successfully"
+        );
         Ok(())
     }
 
     fn close(_pb: &mut PblockRef) -> Result<(), PluginError> {
-        log_error!(ErrorLevel::Trace, "plugin close");
+        log_error!(ErrorLevel::Trace, "PBKDF2-SHA256 plugin closing");
         Ok(())
     }
 
@@ -39,5 +48,45 @@ impl SlapiPlugin3 for PwdChanPbkdf2Sha256 {
 
     fn pwd_storage_compare(cleartext: &str, encrypted: &str) -> Result<bool, PluginError> {
         PwdChanCrypto::pbkdf2_sha256_compare(cleartext, encrypted)
+    }
+
+    fn handle_pbkdf2_rounds_config(pb: &mut PblockRef) -> Result<(), PluginError> {
+        const PBKDF2_ROUNDS_ATTR: &str = "passwordPBKDF2Rounds";
+
+        if let Ok(entry) = pb.get_op_add_entryref() {
+            if let Some(value_array) = entry.get_attr(PBKDF2_ROUNDS_ATTR) {
+                if let Some(value) = value_array.first() {
+                    let rounds_str: String = value
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| {
+                            log_error!(
+                                ErrorLevel::Error,
+                                "Failed to parse passwordPBKDF2Rounds value"
+                            );
+                            PluginError::InvalidConfiguration
+                        })?;
+
+                    let rounds = rounds_str.parse::<usize>().map_err(|e| {
+                        log_error!(
+                            ErrorLevel::Error,
+                            "Invalid PBKDF2 rounds value '{}': {}",
+                            rounds_str,
+                            e
+                        );
+                        PluginError::InvalidConfiguration
+                    })?;
+
+                    PwdChanCrypto::set_pbkdf2_rounds(rounds)?;
+                    
+                    log_error!(
+                        ErrorLevel::Info,
+                        "PBKDF2 rounds configured to {} from entry attribute",
+                        rounds
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -24,6 +24,8 @@ pub enum PluginError {
     InvalidBase64 = 1009,
     OpenSSL = 1010,
     Format = 1011,
+    LockError,
+    InvalidConfiguration,
 }
 
 #[derive(Debug)]

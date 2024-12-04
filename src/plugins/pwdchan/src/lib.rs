@@ -4,9 +4,16 @@ extern crate slapi_r_plugin;
 use base64;
 use openssl::{hash::MessageDigest, pkcs5::pbkdf2_hmac, rand::rand_bytes};
 use slapi_r_plugin::prelude::*;
-use std::fmt;
+use std::fmt::Write;
+use once_cell::sync::Lazy;
+use std::sync::RwLock;
 
-const PBKDF2_ROUNDS: usize = 10_000;
+const DEFAULT_PBKDF2_ROUNDS: usize = 10_000;
+const MIN_PBKDF2_ROUNDS: usize = 10_000;
+const MAX_PBKDF2_ROUNDS: usize = 100_000;
+
+static PBKDF2_ROUNDS: Lazy<RwLock<usize>> = Lazy::new(|| RwLock::new(DEFAULT_PBKDF2_ROUNDS));
+
 const PBKDF2_SALT_LEN: usize = 24;
 const PBKDF2_SHA1_EXTRACT: usize = 20;
 const PBKDF2_SHA256_EXTRACT: usize = 32;
@@ -131,10 +138,12 @@ impl PwdChanCrypto {
 
         let mut hash_input: Vec<u8> = (0..hash_length).map(|_| 0).collect();
 
+        let rounds = Self::get_pbkdf2_rounds()?;
+
         pbkdf2_hmac(
             cleartext.as_bytes(),
             &salt,
-            PBKDF2_ROUNDS,
+            rounds,
             digest,
             hash_input.as_mut_slice(),
         )
@@ -147,14 +156,14 @@ impl PwdChanCrypto {
         // Write the header
         output.push_str(header);
         // The iter + delim
-        fmt::write(&mut output, format_args!("{}$", PBKDF2_ROUNDS)).map_err(|e| {
+        write!(&mut output, "{}$", rounds).map_err(|e| {
             log_error!(ErrorLevel::Error, "Format Error -> {:?}", e);
             PluginError::Format
         })?;
         // the base64 salt
         base64::encode_config_buf(&salt, base64::STANDARD, &mut output);
         // Push the delim
-        output.push_str("$");
+        output.push('$');
         // Finally the base64 hash
         base64::encode_config_buf(&hash_input, base64::STANDARD, &mut output);
         // Return it
@@ -191,10 +200,57 @@ impl PwdChanCrypto {
     fn pbkdf2_sha512_encrypt(cleartext: &str) -> Result<String, PluginError> {
         Self::pbkdf2_encrypt(cleartext, MessageDigest::sha512())
     }
+
+    pub fn set_pbkdf2_rounds(rounds: usize) -> Result<(), PluginError> {
+        if rounds < MIN_PBKDF2_ROUNDS || rounds > MAX_PBKDF2_ROUNDS {
+            log_error!(
+                ErrorLevel::Error,
+                "Invalid PBKDF2 rounds {}, must be between {} and {}",
+                rounds,
+                MIN_PBKDF2_ROUNDS,
+                MAX_PBKDF2_ROUNDS
+            );
+            return Err(PluginError::InvalidConfiguration);
+        }
+        match PBKDF2_ROUNDS.write() {
+            Ok(mut rounds_guard) => {
+                *rounds_guard = rounds;
+                log_error!(
+                    ErrorLevel::Info,
+                    "PBKDF2 rounds successfully configured to: {}",
+                    rounds
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log_error!(
+                    ErrorLevel::Error,
+                    "Failed to acquire write lock for PBKDF2 rounds: {}",
+                    e
+                );
+                Err(PluginError::LockError)
+            }
+        }
+    }
+
+    fn get_pbkdf2_rounds() -> Result<usize, PluginError> {
+        match PBKDF2_ROUNDS.read() {
+            Ok(rounds_guard) => Ok(*rounds_guard),
+            Err(e) => {
+                log_error!(
+                    ErrorLevel::Error,
+                    "Failed to acquire read lock for PBKDF2 rounds: {}",
+                    e
+                );
+                Err(PluginError::LockError)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::PwdChanCrypto;
     /*
      * '{PBKDF2}10000$IlfapjA351LuDSwYC0IQ8Q$saHqQTuYnjJN/tmAndT.8mJt.6w'
@@ -203,6 +259,90 @@ mod tests {
      * '{PBKDF2-SHA512}10000$Je1Uw19Bfv5lArzZ6V3EPw$g4T/1sqBUYWl9o93MVnyQ/8zKGSkPbKaXXsT8WmysXQJhWy8MRP2JFudSL.N9RklQYgDPxPjnfum/F2f/TrppA'
      * '{ARGON2}$argon2id$v=19$m=65536,t=2,p=1$IyTQMsvzB2JHDiWx8fq7Ew$VhYOA7AL0kbRXI5g2kOyyp8St1epkNj7WZyUY4pAIQQ'
      */
+
+    #[test]
+    fn test_pbkdf2_rounds_configuration() {
+        // Test valid rounds configuration
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(15000).is_ok());
+        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds().unwrap(), 15000);
+
+        // Test invalid rounds - too low
+        assert!(matches!(
+            PwdChanCrypto::set_pbkdf2_rounds(5000),
+            Err(PluginError::InvalidConfiguration)
+        ));
+
+        // Test invalid rounds - too high
+        assert!(matches!(
+            PwdChanCrypto::set_pbkdf2_rounds(200000),
+            Err(PluginError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn test_pbkdf2_encrypt_with_rounds() {
+        // Set a specific number of rounds
+        PwdChanCrypto::set_pbkdf2_rounds(15000).unwrap();
+
+        // Test each hash type
+        let test_password = "test_password";
+
+        // SHA-1
+        let result = PwdChanCrypto::pbkdf2_sha1_encrypt(test_password).unwrap();
+        assert!(result.contains("15000$"));
+        assert!(PwdChanCrypto::pbkdf2_sha1_compare(
+            test_password,
+            &result.replace("{PBKDF2-SHA1}", "")
+        ).unwrap());
+
+        // SHA-256
+        let result = PwdChanCrypto::pbkdf2_sha256_encrypt(test_password).unwrap();
+        assert!(result.contains("15000$"));
+        assert!(PwdChanCrypto::pbkdf2_sha256_compare(
+            test_password,
+            &result.replace("{PBKDF2-SHA256}", "")
+        ).unwrap());
+
+        // SHA-512
+        let result = PwdChanCrypto::pbkdf2_sha512_encrypt(test_password).unwrap();
+        assert!(result.contains("15000$"));
+        assert!(PwdChanCrypto::pbkdf2_sha512_compare(
+            test_password,
+            &result.replace("{PBKDF2-SHA512}", "")
+        ).unwrap());
+    }
+
+    #[test]
+    fn test_set_pbkdf2_rounds() {
+        // Test valid rounds
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(15_000).is_ok());
+        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds().unwrap(), 15_000);
+
+        // Test invalid rounds - too low
+        assert!(matches!(
+            PwdChanCrypto::set_pbkdf2_rounds(5_000),
+            Err(PluginError::InvalidConfiguration)
+        ));
+
+        // Test invalid rounds - too high
+        assert!(matches!(
+            PwdChanCrypto::set_pbkdf2_rounds(200_000),
+            Err(PluginError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn test_pbkdf2_decompose() {
+        let valid_hash = "10000$salt123$hash456";
+        let result = PwdChanCrypto::pbkdf2_decompose(valid_hash);
+        assert!(result.is_ok());
+        let (iter, salt, hash) = result.unwrap();
+        assert_eq!(iter, 10000);
+
+        // Test invalid format
+        let invalid_hash = "invalid";
+        assert!(PwdChanCrypto::pbkdf2_decompose(invalid_hash).is_err());
+    }
 
     #[test]
     fn pwdchan_pbkdf2_sha1_basic() {
