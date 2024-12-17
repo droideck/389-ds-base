@@ -130,8 +130,4 @@ pub trait SlapiPlugin3 {
     fn pwd_storage_compare(_cleartext: &str, _encrypted: &str) -> Result<bool, PluginError> {
         Err(PluginError::Unimplemented)
     }
-
-    fn handle_pbkdf2_rounds_config(_pb: &mut PblockRef) -> Result<(), PluginError> {
-        Err(PluginError::Unimplemented)
-    }
 }

@@ -5,8 +5,7 @@ use base64;
 use openssl::{hash::MessageDigest, pkcs5::pbkdf2_hmac, rand::rand_bytes};
 use slapi_r_plugin::prelude::*;
 use std::fmt::Write;
-use once_cell::sync::Lazy;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::convert::TryInto;
 use std::os::raw::c_char;
 
@@ -15,7 +14,11 @@ const MIN_PBKDF2_ROUNDS: usize = 10_000;
 const MAX_PBKDF2_ROUNDS: usize = 1_000_000;
 
 const PBKDF2_ROUNDS_ATTR: &str = "nsslapd-pwdPBKDF2Rounds";
-static PBKDF2_ROUNDS: Lazy<RwLock<usize>> = Lazy::new(|| RwLock::new(DEFAULT_PBKDF2_ROUNDS));
+// Each algorithm gets its own atomic counter for thread-safe round configuration
+static PBKDF2_ROUNDS: AtomicUsize = AtomicUsize::new(DEFAULT_PBKDF2_ROUNDS);
+static PBKDF2_ROUNDS_SHA1: AtomicUsize = AtomicUsize::new(DEFAULT_PBKDF2_ROUNDS);
+static PBKDF2_ROUNDS_SHA256: AtomicUsize = AtomicUsize::new(DEFAULT_PBKDF2_ROUNDS);
+static PBKDF2_ROUNDS_SHA512: AtomicUsize = AtomicUsize::new(DEFAULT_PBKDF2_ROUNDS);
 
 const PBKDF2_SALT_LEN: usize = 24;
 const PBKDF2_SHA1_EXTRACT: usize = 20;
@@ -48,7 +51,7 @@ macro_rules! ab64_to_b64 {
 }
 
 // Create a module for each plugin type to avoid name conflicts
-mod pbkdf2_default {
+mod pbkdf2 {
     use super::*;
     
     pub struct PwdChanPbkdf2;
@@ -110,7 +113,7 @@ macro_rules! impl_slapi_pbkdf2_plugin {
 
             fn start(pb: &mut PblockRef) -> Result<(), PluginError> {
                 log_error!(ErrorLevel::Trace, "{} plugin start", Self::scheme_name());
-                PwdChanCrypto::handle_pbkdf2_rounds_config(pb)?;
+                PwdChanCrypto::handle_pbkdf2_rounds_config(pb, Self::digest_type())?;
                 Ok(())
             }
 
@@ -139,7 +142,7 @@ macro_rules! impl_slapi_pbkdf2_plugin {
 }
 
 // Apply the implementation to all plugin types
-impl_slapi_pbkdf2_plugin!(pbkdf2_default::PwdChanPbkdf2);
+impl_slapi_pbkdf2_plugin!(pbkdf2::PwdChanPbkdf2);
 impl_slapi_pbkdf2_plugin!(pbkdf2_sha1::PwdChanPbkdf2Sha1);
 impl_slapi_pbkdf2_plugin!(pbkdf2_sha256::PwdChanPbkdf2Sha256);
 impl_slapi_pbkdf2_plugin!(pbkdf2_sha512::PwdChanPbkdf2Sha512);
@@ -214,6 +217,8 @@ impl PwdChanCrypto {
     }
 
     fn pbkdf2_encrypt(cleartext: &str, digest: MessageDigest) -> Result<String, PluginError> {
+        let rounds = Self::get_pbkdf2_rounds(digest)?;
+
         let (hash_length, str_length, header) = if digest == MessageDigest::sha1() {
             (PBKDF2_SHA1_EXTRACT, 80, "{PBKDF2-SHA1}")
         } else if digest == MessageDigest::sha256() {
@@ -232,8 +237,6 @@ impl PwdChanCrypto {
         })?;
 
         let mut hash_input: Vec<u8> = (0..hash_length).map(|_| 0).collect();
-
-        let rounds = Self::get_pbkdf2_rounds()?;
 
         pbkdf2_hmac(
             cleartext.as_bytes(),
@@ -265,7 +268,17 @@ impl PwdChanCrypto {
         Ok(output)
     }
 
-    pub fn handle_pbkdf2_rounds_config(pb: &mut PblockRef) -> Result<(), PluginError> {
+    // Private helper method to get the appropriate AtomicUsize reference
+    fn get_rounds_atomic(digest: MessageDigest) -> &'static AtomicUsize {
+        match digest {
+            d if d == MessageDigest::sha1() => &PBKDF2_ROUNDS_SHA1,
+            d if d == MessageDigest::sha256() => &PBKDF2_ROUNDS_SHA256,
+            d if d == MessageDigest::sha512() => &PBKDF2_ROUNDS_SHA512,
+            _ => &PBKDF2_ROUNDS,
+        }
+    }
+
+    fn handle_pbkdf2_rounds_config(pb: &mut PblockRef, digest: MessageDigest) -> Result<(), PluginError> {
         let mut rounds = DEFAULT_PBKDF2_ROUNDS;
         let mut source = "default";
 
@@ -301,19 +314,29 @@ impl PwdChanCrypto {
             }
         }
 
-        // Use the existing set_pbkdf2_rounds function to validate and set the rounds
-        Self::set_pbkdf2_rounds(rounds)?;
-        
+        Self::set_pbkdf2_rounds(digest, rounds)?;
+
+        let digest_name = if digest == MessageDigest::sha1() {
+            "SHA1"
+        } else if digest == MessageDigest::sha256() {
+            "SHA256"
+        } else if digest == MessageDigest::sha512() {
+            "SHA512"
+        } else {
+            "Unknown"
+        };
+
         log_error!(
-            ErrorLevel::Plugin,
-            "handle_pbkdf2_rounds_config -> PBKDF2 rounds set to {} from {}",
+            ErrorLevel::Error,
+            "handle_pbkdf2_rounds_config -> Rounds for PBKDF2-{} password scheme set to {} from {}",
+            digest_name,
             rounds,
             source
         );
         Ok(())
     }
 
-    pub fn set_pbkdf2_rounds(rounds: usize) -> Result<(), PluginError> {
+    fn set_pbkdf2_rounds(digest: MessageDigest, rounds: usize) -> Result<(), PluginError> {
         if rounds < MIN_PBKDF2_ROUNDS || rounds > MAX_PBKDF2_ROUNDS {
             log_error!(
                 ErrorLevel::Error,
@@ -325,34 +348,30 @@ impl PwdChanCrypto {
             return Err(PluginError::InvalidConfiguration);
         }
 
-        match PBKDF2_ROUNDS.write() {
-            Ok(mut rounds_guard) => {
-                *rounds_guard = rounds;
-                Ok(())
-            }
-            Err(e) => {
-                log_error!(
-                    ErrorLevel::Error,
-                    "Failed to acquire write lock for PBKDF2 rounds: {}",
-                    e
-                );
-                Err(PluginError::LockError)
-            }
-        }
+        Self::get_rounds_atomic(digest).store(rounds, Ordering::Relaxed);
+        Ok(())
     }
 
-    fn get_pbkdf2_rounds() -> Result<usize, PluginError> {
-        match PBKDF2_ROUNDS.read() {
-            Ok(rounds_guard) => Ok(*rounds_guard),
-            Err(e) => {
-                log_error!(
-                    ErrorLevel::Error,
-                    "Failed to acquire read lock for PBKDF2 rounds: {}",
-                    e
-                );
-                Err(PluginError::LockError)
-            }
-        }
+    fn get_pbkdf2_rounds(digest: MessageDigest) -> Result<usize, PluginError> {
+        let rounds = Self::get_rounds_atomic(digest).load(Ordering::Relaxed);
+        let digest_name = if digest == MessageDigest::sha1() {
+            "SHA1"
+        } else if digest == MessageDigest::sha256() {
+            "SHA256"
+        } else if digest == MessageDigest::sha512() {
+            "SHA512"
+        } else {
+            "Unknown"
+        };
+
+        log_error!(
+            ErrorLevel::Error,
+            "get_pbkdf2_rounds -> PBKDF2 rounds for {} is {}",
+            digest_name,
+            rounds
+        );
+        Ok(rounds)
+        // Ok(Self::get_rounds_atomic(digest).load(Ordering::Relaxed))
     }
 }
 
@@ -367,17 +386,17 @@ mod tests {
 
     impl Pbkdf2Plugin for TestPbkdf2Sha1 {
         fn digest_type() -> MessageDigest { MessageDigest::sha1() }
-        fn scheme_suffix() -> &'static str { "-SHA1" }
+        fn scheme_name() -> &'static str { "PBKDF2-SHA1" }
     }
 
     impl Pbkdf2Plugin for TestPbkdf2Sha256 {
         fn digest_type() -> MessageDigest { MessageDigest::sha256() }
-        fn scheme_suffix() -> &'static str { "-SHA256" }
+        fn scheme_name() -> &'static str { "PBKDF2-SHA256" }
     }
 
     impl Pbkdf2Plugin for TestPbkdf2Sha512 {
         fn digest_type() -> MessageDigest { MessageDigest::sha512() }
-        fn scheme_suffix() -> &'static str { "-SHA512" }
+        fn scheme_name() -> &'static str { "PBKDF2-SHA512" }
     }
 
     /*
@@ -390,62 +409,79 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_rounds_configuration() {
-        // Test valid rounds configuration
-        assert!(PwdChanCrypto::set_pbkdf2_rounds(15000).is_ok());
-        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds().unwrap(), 15000);
+        // Test different rounds for each algorithm
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha1(), 15000).is_ok());
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha256(), 20000).is_ok());
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha512(), 25000).is_ok());
+
+        // Verify each algorithm has its own rounds setting
+        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds(MessageDigest::sha1()).unwrap(), 15000);
+        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds(MessageDigest::sha256()).unwrap(), 20000);
+        assert_eq!(PwdChanCrypto::get_pbkdf2_rounds(MessageDigest::sha512()).unwrap(), 25000);
     }
 
     #[test]
     fn test_pbkdf2_rounds_limits() {
-        // Test maximum rounds
+        // Test limits for SHA1
         assert!(matches!(
-            PwdChanCrypto::set_pbkdf2_rounds(MAX_PBKDF2_ROUNDS + 1),
+            PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha1(), MAX_PBKDF2_ROUNDS + 1),
             Err(PluginError::InvalidConfiguration)
         ));
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha1(), MIN_PBKDF2_ROUNDS).is_ok());
 
-        // Test valid minimum
-        assert!(PwdChanCrypto::set_pbkdf2_rounds(MIN_PBKDF2_ROUNDS).is_ok());
-
-        // Test valid maximum
-        assert!(PwdChanCrypto::set_pbkdf2_rounds(MAX_PBKDF2_ROUNDS).is_ok());
-
-        // Test invalid rounds - too low
+        // Test invalid rounds for SHA256 - too low
         assert!(matches!(
-            PwdChanCrypto::set_pbkdf2_rounds(5000),
+            PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha256(), 5000),
             Err(PluginError::InvalidConfiguration)
         ));
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha256(), MAX_PBKDF2_ROUNDS).is_ok());
 
-        // Test invalid rounds - too high
+        // Test invalid rounds for SHA512 - too high
         assert!(matches!(
-            PwdChanCrypto::set_pbkdf2_rounds(2_000_000),
+            PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha512(), 2_000_000),
             Err(PluginError::InvalidConfiguration)
         ));
+        assert!(PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha512(), MIN_PBKDF2_ROUNDS).is_ok());
     }
 
     #[test]
-    fn test_pbkdf2_encrypt_with_rounds() {
-        // Set a specific number of rounds
-        PwdChanCrypto::set_pbkdf2_rounds(15000).unwrap();
+    fn test_pbkdf2_encrypt_with_different_rounds() {
+        // Set different rounds for each algorithm
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha1(), 15000).unwrap();
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha256(), 20000).unwrap();
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha512(), 25000).unwrap();
 
-        // Test each hash type
         let test_password = "test_password";
 
-        // Test using generic functions through traits
-        for (plugin_type, header) in [
-            (TestPbkdf2Sha1::digest_type(), "{PBKDF2-SHA1}"),
-            (TestPbkdf2Sha256::digest_type(), "{PBKDF2-SHA256}"),
-            (TestPbkdf2Sha512::digest_type(), "{PBKDF2-SHA512}")
-        ] {
-            let result = PwdChanCrypto::pbkdf2_encrypt(test_password, plugin_type).unwrap();
-            assert!(result.contains("15000$"));
-            
-            let encrypted = result.replace(header, "");
-            assert!(PwdChanCrypto::pbkdf2_compare(
-                test_password,
-                &encrypted,
-                plugin_type
-            ).unwrap());
-        }
+        // Test SHA1
+        let result = PwdChanCrypto::pbkdf2_encrypt(test_password, MessageDigest::sha1()).unwrap();
+        assert!(result.contains("15000$"));
+        let encrypted = result.replace("{PBKDF2-SHA1}", "");
+        assert!(PwdChanCrypto::pbkdf2_compare(
+            test_password,
+            &encrypted,
+            MessageDigest::sha1()
+        ).unwrap());
+
+        // Test SHA256
+        let result = PwdChanCrypto::pbkdf2_encrypt(test_password, MessageDigest::sha256()).unwrap();
+        assert!(result.contains("20000$"));
+        let encrypted = result.replace("{PBKDF2-SHA256}", "");
+        assert!(PwdChanCrypto::pbkdf2_compare(
+            test_password,
+            &encrypted,
+            MessageDigest::sha256()
+        ).unwrap());
+
+        // Test SHA512
+        let result = PwdChanCrypto::pbkdf2_encrypt(test_password, MessageDigest::sha512()).unwrap();
+        assert!(result.contains("25000$"));
+        let encrypted = result.replace("{PBKDF2-SHA512}", "");
+        assert!(PwdChanCrypto::pbkdf2_compare(
+            test_password,
+            &encrypted,
+            MessageDigest::sha512()
+        ).unwrap());
     }
 
     #[test]
@@ -463,6 +499,8 @@ mod tests {
 
     #[test]
     fn pwdchan_pbkdf2_sha1_basic() {
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha1(), 10000).unwrap();
+
         let encrypted = "10000$IlfapjA351LuDSwYC0IQ8Q$saHqQTuYnjJN/tmAndT.8mJt.6w";
         assert!(PwdChanCrypto::pbkdf2_compare("password", encrypted, MessageDigest::sha1()) == Ok(true));
         assert!(PwdChanCrypto::pbkdf2_compare("password!", encrypted, MessageDigest::sha1()) == Ok(false));
@@ -480,6 +518,8 @@ mod tests {
 
     #[test]
     fn pwdchan_pbkdf2_sha256_basic() {
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha256(), 10000).unwrap();
+
         let encrypted = "10000$henZGfPWw79Cs8ORDeVNrQ$1dTJy73v6n3bnTmTZFghxHXHLsAzKaAy8SksDfZBPIw";
         assert!(PwdChanCrypto::pbkdf2_compare("password", encrypted, MessageDigest::sha256()) == Ok(true));
         assert!(PwdChanCrypto::pbkdf2_compare("password!", encrypted, MessageDigest::sha256()) == Ok(false));
@@ -505,6 +545,8 @@ mod tests {
 
     #[test]
     fn pwdchan_pbkdf2_sha512_basic() {
+        PwdChanCrypto::set_pbkdf2_rounds(MessageDigest::sha512(), 10000).unwrap();
+
         let encrypted = "10000$Je1Uw19Bfv5lArzZ6V3EPw$g4T/1sqBUYWl9o93MVnyQ/8zKGSkPbKaXXsT8WmysXQJhWy8MRP2JFudSL.N9RklQYgDPxPjnfum/F2f/TrppA";
         assert!(PwdChanCrypto::pbkdf2_compare("password", encrypted, MessageDigest::sha512()) == Ok(true));
         assert!(PwdChanCrypto::pbkdf2_compare("password!", encrypted, MessageDigest::sha512()) == Ok(false));

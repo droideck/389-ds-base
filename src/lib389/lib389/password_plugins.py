@@ -31,10 +31,6 @@ class PasswordPlugin(Plugin):
         # We'll mark this protected, and people can just disable the plugins.
         self._protected = True
 
-class PBKDF2Plugin(PasswordPlugin):
-    def __init__(self, instance, dn="cn=PBKDF2-SHA256,cn=Password Storage Schemes,cn=plugins,cn=config"):
-        super(PBKDF2Plugin, self).__init__(instance, dn)
-
 
 class SSHA512Plugin(PasswordPlugin):
     def __init__(self, instance, dn=f'cn=SSHA512,{DN_PWDSTORAGE_SCHEMES}'):
@@ -54,6 +50,60 @@ class CRYPTPlugin(PasswordPlugin):
 class SSHAPlugin(PasswordPlugin):
     def __init__(self, instance, dn=f'cn=SSHA,{DN_PWDSTORAGE_SCHEMES}'):
         super(SSHAPlugin, self).__init__(instance, dn)
+
+
+class PBKDF2BasePlugin(PasswordPlugin):
+    """Base class for all PBKDF2 variants"""
+    def __init__(self, instance, dn):
+        super(PBKDF2BasePlugin, self).__init__(instance, dn)
+        self._create_objectclasses.append('pwdPBKDF2PluginConfig')
+        
+    def set_rounds(self, rounds):
+        """Set the number of rounds for PBKDF2 hashing (requires restart)
+        
+        :param rounds: Number of rounds (10000-1000000)
+        :type rounds: int
+        """
+        rounds = int(rounds)
+        if rounds < 10000 or rounds > 1000000:
+            raise ValueError("PBKDF2 rounds must be between 10000 and 1000000")
+        self.replace('nsslapd-pwdPBKDF2Rounds', str(rounds))
+        
+    def get_rounds(self):
+        """Get the current number of rounds
+        
+        :returns: Current rounds setting or 10000 if not set
+        :rtype: int
+        """
+        rounds = self.get_attr_val_utf8('nsslapd-pwdPBKDF2Rounds')
+        return int(rounds) if rounds else 10000
+
+
+class PBKDF2SHA1Plugin(PBKDF2BasePlugin):
+    """PBKDF2-SHA1 password storage scheme"""
+    def __init__(self, instance, dn=f'cn=PBKDF2-SHA1,{DN_PWDSTORAGE_SCHEMES}'):
+        super(PBKDF2SHA1Plugin, self).__init__(instance, dn)
+        self._plugin_properties.update({
+            'nsslapd-pluginInitfunc': 'pwdchan_pbkdf2_sha1_init'
+        })
+
+
+class PBKDF2SHA256Plugin(PBKDF2BasePlugin):
+    """PBKDF2-SHA256 password storage scheme"""
+    def __init__(self, instance, dn=f'cn=PBKDF2-SHA256,{DN_PWDSTORAGE_SCHEMES}'):
+        super(PBKDF2SHA256Plugin, self).__init__(instance, dn)
+        self._plugin_properties.update({
+            'nsslapd-pluginInitfunc': 'pwdchan_pbkdf2_sha256_init'
+        })
+
+
+class PBKDF2SHA512Plugin(PBKDF2BasePlugin):
+    """PBKDF2-SHA512 password storage scheme"""
+    def __init__(self, instance, dn=f'cn=PBKDF2-SHA512,{DN_PWDSTORAGE_SCHEMES}'):
+        super(PBKDF2SHA512Plugin, self).__init__(instance, dn)
+        self._plugin_properties.update({
+            'nsslapd-pluginInitfunc': 'pwdchan_pbkdf2_sha512_init'
+        })
 
 
 class PasswordPlugins(Plugins):
