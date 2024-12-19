@@ -22,7 +22,6 @@ from lib389._constants import DEFAULT_SUFFIX, DN_DM, PASSWORD, ErrorLog
 from lib389.config import Config
 from lib389.password_plugins import (
     SSHA512Plugin,
-    PBKDF2Plugin,
     PBKDF2SHA1Plugin,
     PBKDF2SHA256Plugin,
     PBKDF2SHA512Plugin
@@ -32,7 +31,6 @@ from lib389.utils import ds_is_older
 pytestmark = pytest.mark.tier1
 
 PBKDF2_SCHEMES = [
-    ('PBKDF2', PBKDF2Plugin, 70000),
     ('PBKDF2-SHA1', PBKDF2SHA1Plugin, 70000),
     ('PBKDF2-SHA256', PBKDF2SHA256Plugin, 30000),
     ('PBKDF2-SHA512', PBKDF2SHA512Plugin, 10000),
