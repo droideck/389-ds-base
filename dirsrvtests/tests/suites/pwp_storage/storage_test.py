@@ -31,6 +31,13 @@ from lib389.utils import ds_is_older
 
 pytestmark = pytest.mark.tier1
 
+PBKDF2_SCHEMES = [
+    ('PBKDF2', PBKDF2Plugin, 70000),
+    ('PBKDF2-SHA1', PBKDF2SHA1Plugin, 70000),
+    ('PBKDF2-SHA256', PBKDF2SHA256Plugin, 30000),
+    ('PBKDF2-SHA512', PBKDF2SHA512Plugin, 10000),
+]
+
 
 @pytest.fixture(scope="function")
 def test_user(request, topo):
@@ -96,6 +103,248 @@ def test_check_password_scheme(topo, value):
     assert '{' + f'{value.lower()}' + '}' in \
            UserAccount(topo.standalone, user.dn).get_attr_val_utf8('userpassword').lower()
     user.delete()
+
+
+@pytest.mark.parametrize('scheme_name,plugin_class,default_rounds', PBKDF2_SCHEMES)
+def test_pbkdf2_default_rounds(topo, test_user, scheme_name, plugin_class, default_rounds):
+    """Test PBKDF2 schemes with default iteration rounds.
+
+    :id: bd58cd76-14f9-4d54-9793-ee7bba8e5369
+    :parametrized: yes
+    :setup: Standalone
+    :steps:
+        1. Remove any existing rounds configuration
+        2. Verify default rounds are used
+        3. Set password and verify hash format
+        4. Test authentication
+    :expectedresults:
+        1. Pass
+        2. Pass
+        3. Pass
+        4. Pass
+    """
+    try:
+        # Flush logs
+        topo.standalone.restart()
+        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
+        topo.standalone.deleteErrorLogs()
+        
+        plugin = plugin_class(topo.standalone)
+        plugin.remove_all('nsslapd-pwdpbkdf2numiterations')
+        topo.standalone.restart()
+        
+        topo.standalone.config.replace('passwordStorageScheme', scheme_name)
+        
+        current_rounds = plugin.get_rounds()
+        assert current_rounds == default_rounds, \
+            f"Expected default {default_rounds} rounds, got {current_rounds}"
+        
+        test_user.set('userPassword', 'Secret123')
+        pwd_hash = test_user.get_attr_val_utf8('userPassword')
+        assert pwd_hash.startswith('{' + scheme_name.upper() + '}')
+        assert str(default_rounds) in pwd_hash
+        
+        topo.standalone.simple_bind_s(test_user.dn, 'Secret123')
+        
+        assert topo.standalone.searchErrorsLog(
+            f'Number of iterations for {scheme_name} password scheme set to {default_rounds} from default'
+        )
+    finally:
+        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
+
+
+@pytest.mark.parametrize('scheme_name,plugin_class,default_rounds', PBKDF2_SCHEMES)
+def test_pbkdf2_rounds_reset(topo, test_user, scheme_name, plugin_class, default_rounds):
+    """Test PBKDF2 schemes rounds reset to defaults.
+
+    :id: 59bf95c5-6a07-4db1-81eb-d59b54436826
+    :parametrized: yes
+    :setup: Standalone
+    :steps:
+        1. Set custom rounds for PBKDF2 plugin
+        2. Verify custom rounds are used
+        3. Remove rounds configuration
+        4. Verify defaults are restored
+        5. Test password operations with default rounds
+    :expectedresults:
+        1. Pass
+        2. Pass
+        3. Pass
+        4. Pass
+        5. Pass
+    """
+    try:
+        # Flush logs
+        topo.standalone.restart()
+        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
+        topo.standalone.deleteErrorLogs()
+        
+        test_rounds = 25000
+        plugin = plugin_class(topo.standalone)
+        plugin.set_rounds(test_rounds)
+        topo.standalone.restart()
+        
+        current_rounds = plugin.get_rounds()
+        assert current_rounds == test_rounds, \
+            f"Expected {test_rounds} rounds, got {current_rounds}"
+        
+        plugin.remove_all('nsslapd-pwdpbkdf2numiterations')
+        topo.standalone.restart()
+        
+        current_rounds = plugin.get_rounds()
+        assert current_rounds == default_rounds, \
+            f"Expected default {default_rounds} rounds after reset, got {current_rounds}"
+        
+        topo.standalone.config.replace('passwordStorageScheme', scheme_name)
+        
+        test_user.set('userPassword', 'Secret123')
+        pwd_hash = test_user.get_attr_val_utf8('userPassword')
+        assert pwd_hash.startswith('{' + scheme_name.upper() + '}')
+        assert str(default_rounds) in pwd_hash
+        
+        topo.standalone.simple_bind_s(test_user.dn, 'Secret123')
+        
+        assert topo.standalone.searchErrorsLog(
+            f'Number of iterations for {scheme_name} password scheme set to {default_rounds} from default'
+        )
+    finally:
+        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
+
+
+@pytest.mark.parametrize('scheme_name,plugin_class,_', PBKDF2_SCHEMES)
+@pytest.mark.parametrize('rounds', [10000, 20000, 50000])
+def test_pbkdf2_custom_rounds(topo, test_user, scheme_name, plugin_class, _, rounds):
+    """Test PBKDF2 schemes with custom iteration rounds.
+
+    :id: 6bec6542-ed8d-4a0e-89d6-e047757767c2
+    :parametrized: yes
+    :setup: Standalone
+    :steps:
+        1. Set custom rounds for PBKDF2 plugin
+        2. Verify rounds are set correctly
+        3. Set password and verify hash format
+        4. Test authentication
+        5. Verify rounds in password hash
+    :expectedresults:
+        1. Pass
+        2. Pass
+        3. Pass
+        4. Pass
+        5. Pass
+    """
+    try:
+        # Flush logs
+        topo.standalone.restart()
+        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
+        topo.standalone.deleteErrorLogs()
+
+        plugin = plugin_class(topo.standalone)
+        plugin.set_rounds(rounds)
+        topo.standalone.restart()
+        
+        current_rounds = plugin.get_rounds()
+        assert current_rounds == rounds, \
+            f"Expected {rounds} rounds, got {current_rounds}"
+        
+        topo.standalone.config.replace('passwordStorageScheme', scheme_name)
+        
+        test_user.set('userPassword', 'Secret123')
+        pwd_hash = test_user.get_attr_val_utf8('userPassword')
+        assert pwd_hash.startswith('{' + scheme_name.upper() + '}')
+        assert str(rounds) in pwd_hash
+        
+        topo.standalone.simple_bind_s(test_user.dn, 'Secret123')
+        
+        assert topo.standalone.searchErrorsLog(
+            f'Number of iterations for {scheme_name}'
+        )
+    finally:
+        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
+
+
+@pytest.mark.parametrize('scheme_name,plugin_class,_', PBKDF2_SCHEMES)
+def test_pbkdf2_invalid_rounds(topo, scheme_name, plugin_class, _):
+    """Test PBKDF2 schemes with invalid iteration rounds.
+
+    :id: 4e5b4f37-c97b-4f58-b5c5-726495d9fa4e
+    :parametrized: yes
+    :setup: Standalone
+    :steps:
+        1. Try to set invalid rounds (too low and too high)
+        2. Verify appropriate errors are raised
+        3. Verify original rounds are maintained
+    :expectedresults:
+        1. Pass
+        2. Pass
+        3. Pass
+    """
+    # Flush logs
+    topo.standalone.restart()
+    topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
+    topo.standalone.deleteErrorLogs()
+
+    plugin = plugin_class(topo.standalone)
+    plugin.enable()
+    
+    original_rounds = plugin.get_rounds()
+    
+    with pytest.raises(ValueError) as excinfo:
+        plugin.set_rounds(5000)
+    assert "rounds must be between 10,000 and 10,000,000" in str(excinfo.value)
+    
+    with pytest.raises(ValueError) as excinfo:
+        plugin.set_rounds(20000000)
+    assert "rounds must be between 10,000 and 10,000,000" in str(excinfo.value)
+    
+    current_rounds = plugin.get_rounds()
+    assert current_rounds == original_rounds, \
+        f"Rounds changed from {original_rounds} to {current_rounds}"
+
+
+@pytest.mark.parametrize('scheme_name,plugin_class,_', PBKDF2_SCHEMES)
+def test_pbkdf2_rounds_persistence(topo, test_user, scheme_name, plugin_class, _):
+    """Test PBKDF2 rounds persistence across server restarts.
+
+    :id: b15de1ae-53ac-429f-991b-cea5e6a7b383
+    :parametrized: yes
+    :setup: Standalone
+    :steps:
+        1. Set custom rounds for PBKDF2 plugin
+        2. Restart server
+        3. Verify rounds are maintained
+        4. Set password and verify hash
+        5. Test authentication
+    :expectedresults:
+        1. Pass
+        2. Pass
+        3. Pass
+        4. Pass
+        5. Pass
+    """
+    try:
+        # Flush logs
+        topo.standalone.restart()
+        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
+        topo.standalone.deleteErrorLogs()
+
+        test_rounds = 15000
+        plugin = plugin_class(topo.standalone)
+        plugin.set_rounds(test_rounds)
+        topo.standalone.restart()
+        
+        current_rounds = plugin.get_rounds()
+        assert current_rounds == test_rounds, \
+            f"Expected {test_rounds} rounds after restart, got {current_rounds}"
+        
+        topo.standalone.config.replace('passwordStorageScheme', scheme_name)
+        
+        test_user.set('userPassword', 'Secret123')
+        pwd_hash = test_user.get_attr_val_utf8('userPassword')
+        assert str(test_rounds) in pwd_hash
+        
+        topo.standalone.simple_bind_s(test_user.dn, 'Secret123')
+    finally:
+        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
 
 
 def test_clear_scheme(topo):
@@ -195,125 +444,6 @@ def test_check_ssha512(topo):
     topo.standalone.restart()
     user.delete()
 
-
-@pytest.mark.parametrize('plugin_class,plugin_name', [
-    (PBKDF2Plugin, 'PBKDF2'),
-    (PBKDF2SHA1Plugin, 'PBKDF2-SHA1'),
-    (PBKDF2SHA256Plugin, 'PBKDF2-SHA256'),
-    (PBKDF2SHA512Plugin, 'PBKDF2-SHA512')
-])
-def test_pbkdf2_rounds_configuration(topo, test_user, plugin_class, plugin_name):
-    """Test PBKDF2 rounds configuration for different variants"""
-    try:
-        # Enable plugin logging
-        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
-
-        # Configure plugin
-        plugin = plugin_class(topo.standalone)
-        plugin.enable()
-        
-        # Test rounds configuration
-        test_rounds = 20000
-        plugin.set_rounds(test_rounds)
-        # Restart after changing rounds
-        topo.standalone.restart()
-        assert plugin.get_rounds() == test_rounds
-        
-        # Verify invalid rounds are rejected
-        with pytest.raises(ValueError):
-            plugin.set_rounds(5000)  # Too low
-        with pytest.raises(ValueError):
-            plugin.set_rounds(2000000)  # Too high
-        
-        # Configure as password storage scheme
-        topo.standalone.config.replace('passwordStorageScheme', plugin_name)
-        topo.standalone.deleteErrorLogs()
-
-        # PBKDF2-SHA1 is the actual digest used for PBKDF2
-        plugin_name = 'PBKDF2-SHA1' if plugin_name == 'PBKDF2' else plugin_name
-        digest_name = plugin_name.split('-')[1] if '-' in plugin_name else 'SHA1'
-        
-        TEST_PASSWORD = 'Secret123'
-        test_user.set('userPassword', TEST_PASSWORD)
-        
-        # Verify password hash format
-        pwd_hash = test_user.get_attr_val_utf8('userPassword')
-        assert pwd_hash.startswith('{' + plugin_name.upper() + '}')
-        
-        # Test authentication
-        topo.standalone.simple_bind_s(test_user.dn, TEST_PASSWORD)
-        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
-        
-        # Restart to flush logs
-        topo.standalone.restart()
-        
-        # Verify logs for configuration message
-        assert topo.standalone.searchErrorsLog(
-            f'handle_pbkdf2_rounds_config -> Number of iterations for PBKDF2-{digest_name} password scheme set to {test_rounds}'
-        )
-    
-    finally:
-        # Always rebind as Directory Manager
-        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
-
-
-@pytest.mark.parametrize('plugin_class,plugin_name', [
-    (PBKDF2Plugin, 'PBKDF2'),
-    (PBKDF2SHA1Plugin, 'PBKDF2-SHA1'),
-    (PBKDF2SHA256Plugin, 'PBKDF2-SHA256'),
-    (PBKDF2SHA512Plugin, 'PBKDF2-SHA512')
-])
-def test_pbkdf2_rounds_modification(topo, test_user, plugin_class, plugin_name):
-    """Test PBKDF2 rounds modification behavior"""
-    try:
-        # Enable plugin logging
-        topo.standalone.config.loglevel((ErrorLog.DEFAULT, ErrorLog.PLUGIN))
-        
-        plugin = plugin_class(topo.standalone)
-        plugin.enable()
-        
-        # Set initial rounds and restart
-        initial_rounds = 15000
-        plugin.set_rounds(initial_rounds)
-        topo.standalone.restart()
-        
-        # Configure as password storage scheme
-        topo.standalone.config.replace('passwordStorageScheme', plugin_name)
-        topo.standalone.deleteErrorLogs()
-
-        # PBKDF2-SHA1 is the actual digest used for PBKDF2
-        plugin_name = 'PBKDF2-SHA1' if plugin_name == 'PBKDF2' else plugin_name
-        digest_name = plugin_name.split('-')[1] if '-' in plugin_name else 'SHA1'
-        
-        INITIAL_PASSWORD = 'Initial123'
-        NEW_PASSWORD = 'New123'
-        
-        test_user.set('userPassword', INITIAL_PASSWORD)
-        
-        # Modify rounds and restart
-        new_rounds = 25000
-        plugin.set_rounds(new_rounds)
-        topo.standalone.restart()
-        
-        # Verify old password still works
-        topo.standalone.simple_bind_s(test_user.dn, INITIAL_PASSWORD)
-        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
-        
-        # Set new password
-        test_user.set('userPassword', NEW_PASSWORD)
-        
-        # Verify new password works
-        topo.standalone.simple_bind_s(test_user.dn, NEW_PASSWORD)
-        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
-        
-        # Verify logs for configuration message
-        assert topo.standalone.searchErrorsLog(
-            f'handle_pbkdf2_rounds_config -> Number of iterations for PBKDF2-{digest_name} password scheme set to {new_rounds}'
-        )
-
-    finally:
-        # Always rebind as Directory Manager
-        topo.standalone.simple_bind_s(DN_DM, PASSWORD)
 
 if __name__ == "__main__":
     CURRENT_FILE = os.path.realpath(__file__)
