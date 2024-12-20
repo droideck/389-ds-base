@@ -22,6 +22,7 @@ from lib389._constants import DEFAULT_SUFFIX, DN_DM, PASSWORD, ErrorLog
 from lib389.config import Config
 from lib389.password_plugins import (
     SSHA512Plugin,
+    PBKDF2SHA256NSSPlugin,
     PBKDF2SHA1Plugin,
     PBKDF2SHA256Plugin,
     PBKDF2SHA512Plugin
@@ -389,27 +390,27 @@ def test_check_two_scheme(topo):
     user.delete()
 
 @pytest.mark.skipif(ds_is_older('1.4'), reason="Not implemented")
-def test_check_pbkdf2_sha512(topo):
-    """Check password scheme PBKDF2-SHA512.
+def test_check_pbkdf2_sha256(topo):
+    """Check password scheme PBKDF2_SHA256.
 
     :id: 31612e7e-33a6-11ea-a750-8c16451d917b
     :setup: Standalone
     :steps:
-        1. Try to delete PBKDF2-SHA512.
-        2. Should not deleted PBKDF2-SHA512 and server should up.
+        1. Try to delete PBKDF2_SHA256.
+        2. Should not deleted PBKDF2_SHA256 and server should up.
     :expectedresults:
         1. Pass
         2. Pass
     """
-    value = 'PBKDF2-SHA512'
+    value = 'PBKDF2_SHA256'
     user = user_config(topo, value)
     assert '{' + f'{value.lower()}' + '}' in \
            UserAccount(topo.standalone, user.dn).get_attr_val_utf8('userpassword').lower()
-    plg = PBKDF2SHA512Plugin(topo.standalone)
+    plg = PBKDF2SHA256NSSPlugin(topo.standalone)
     plg._protected = False
     plg.delete()
     topo.standalone.restart()
-    assert Config(topo.standalone).get_attr_val_utf8('passwordStorageScheme') == 'PBKDF2-SHA512'
+    assert Config(topo.standalone).get_attr_val_utf8('passwordStorageScheme') == 'PBKDF2_SHA256'
     assert topo.standalone.status()
     user.delete()
 

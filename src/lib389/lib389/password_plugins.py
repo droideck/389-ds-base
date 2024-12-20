@@ -52,6 +52,11 @@ class SSHAPlugin(PasswordPlugin):
         super(SSHAPlugin, self).__init__(instance, dn)
 
 
+class PBKDF2SHA256NSSPlugin(PasswordPlugin):
+    def __init__(self, instance, dn=f'cn=PBKDF2_SHA256,{DN_PWDSTORAGE_SCHEMES}'):
+        super(SSHAPlugin, self).__init__(instance, dn)
+
+
 class PBKDF2BasePlugin(PasswordPlugin):
     """Base class for all PBKDF2 variants"""
     DEFAULT_ROUNDS = 70000  # Fallback default if not specified by subclass
