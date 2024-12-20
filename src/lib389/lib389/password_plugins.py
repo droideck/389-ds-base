@@ -54,7 +54,7 @@ class SSHAPlugin(PasswordPlugin):
 
 class PBKDF2SHA256NSSPlugin(PasswordPlugin):
     def __init__(self, instance, dn=f'cn=PBKDF2_SHA256,{DN_PWDSTORAGE_SCHEMES}'):
-        super(SSHAPlugin, self).__init__(instance, dn)
+        super(PBKDF2SHA256NSSPlugin, self).__init__(instance, dn)
 
 
 class PBKDF2BasePlugin(PasswordPlugin):
