@@ -40,6 +40,9 @@ jobs:
         id: set-matrix
         run: echo "matrix=$(python3 .github/scripts/generate_matrix.py ${{ github.event.inputs.pytest_tests }})" >>$GITHUB_OUTPUT
 
+      - name: Install python3 additional packages
+        run: dnf install -y python3-numpy python3-plotly python3-matplotlib
+
       - name: Build RPMs
         run: SKIP_AUDIT_CI=1 make -f rpm.mk dist-bz2 rpms
 
