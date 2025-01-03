@@ -1,5 +1,5 @@
 # --- BEGIN COPYRIGHT BLOCK ---
-# Copyright (C) 2021 Red Hat, Inc.
+# Copyright (C) 2025 Red Hat, Inc.
 # All rights reserved.
 #
 # License: GPL (version 3 or any later version).
@@ -329,6 +329,7 @@ class DSLogParser:
             self.vars: Dict[str, str] = {}
             self.raw: Any = None
             self.timestamp: Optional[str] = None
+            self.target_dn: Optional[str] = None
 
     def __init__(self, logname: str):
         """Initialize the parser
@@ -340,6 +341,7 @@ class DSLogParser:
         self.lineno = 0
         self.line: Optional[str] = None
         self._logger = logging.getLogger(__name__)
+        self.op_context: Dict[Tuple[str, str], str] = {}  # (conn, op) -> dn
 
     def parse_timestamp(self, ts: str) -> datetime.datetime:
         """Parse a log's timestamp and convert it to a datetime object
@@ -395,6 +397,19 @@ class DSLogParser:
                 r.vars[key] = value
             if keyword:
                 r.keywords.append(keyword)
+
+        # Track operation context
+        if 'conn' in r.vars and 'op' in r.vars:
+            conn_op = (r.vars['conn'], r.vars['op'])
+            
+            # Store DN if present
+            if 'dn' in r.vars:
+                self.op_context[conn_op] = r.vars['dn']
+                
+            # Associate DN with CSN on result
+            if 'csn' in r.vars and conn_op in self.op_context:
+                r.target_dn = self.op_context[conn_op]
+
         return r
 
     def parse_file(self) -> None:
@@ -530,9 +545,8 @@ class ReplLag:
 
 
 class CsnInfo:
-    """Represents CSN (Change Sequence Number) information for replication analysis.
-    Tracks replication timing and server propagation for a single CSN.
-    """
+    """Represents CSN information for replication analysis"""
+    
     def __init__(self, csn: str, tz: datetime.timezone):
         """Initialize CSN tracking
         
@@ -548,15 +562,18 @@ class CsnInfo:
         self.etime = None        # [duration, server_idx]
         self.replicated_on = {}  # {server_idx: record}
         self.csn_history = []    # [(server_name, timestamp)]
+        self.suffix = None       # Matched suffix
+        self.target_dn = None    # Target DN from operation
 
     def add_replication_data(self, server_idx: int, server_name: str, 
-                           logtime: float, etime: str) -> None:
+                           logtime: float, etime: str, target_dn: Optional[str] = None) -> None:
         """Add replication data from a server
         
         :param server_idx: Index identifying the server
         :param server_name: Name of the server
         :param logtime: Unix timestamp of the log entry
         :param etime: Elapsed time as string
+        :param target_dn: Target DN from operation
         """
         record = {
             "logtime": logtime,
@@ -566,6 +583,8 @@ class CsnInfo:
         self.replicated_on[server_idx] = record
         self._update_times(logtime, float(etime), server_idx)
         self.csn_history.append((server_name, logtime))
+        if target_dn:
+            self.target_dn = target_dn
 
     def _update_times(self, logtime: float, etime: float, idx: int) -> None:
         """Update timing information
@@ -597,7 +616,9 @@ class CsnInfo:
             'lag_time': self.lag_time[0] if self.lag_time else None,
             'etime': self.etime[0] if self.etime else None,
             'replicated_on': self.replicated_on,
-            'history': self.csn_history
+            'history': self.csn_history,
+            'suffix': self.suffix,
+            'target_dn': self.target_dn
         }
 
     def describe_csn(self) -> str:
@@ -619,14 +640,18 @@ class CsnInfo:
         except Exception as e:
             return f"Failed to describe CSN: {e}"
 
+
 class LagInfo:
-    """Analyzes replication lag across multiple servers.
-    Compatible with ReplicationLogAnalyzer for detailed lag analysis.
-    """
+    """Analyzes replication lag across multiple servers"""
+    
     def __init__(self, config: Dict):
         """Initialize lag analysis
         
-        :param config: Configuration dictionary
+        :param config: Configuration dictionary containing:
+                      - start_time: Optional start time filter
+                      - end_time: Optional end time filter
+                      - suffixes: List of suffixes to track
+                      - utc_offset: UTC offset in seconds
         :type config: dict
         """
         self.utc_offset = config.get('utc_offset')
@@ -636,6 +661,7 @@ class LagInfo:
         self.end_time = self._parse_time(config.get('end_time'))
         self.lag = []  # List[CsnInfo]
         self.servers = set()
+        self.suffix_processor = SuffixProcessor(config.get('suffixes', []))
         self._logger = logging.getLogger(__name__)
 
     def _parse_time(self, time_str: Optional[str]) -> Optional[datetime.datetime]:
@@ -655,10 +681,20 @@ class LagInfo:
             self._logger.warning(f"Invalid time format: {e}")
             return None
 
-    def get_statistics(self) -> Dict:
-        """Calculate replication statistics
+    def add_csn_data(self, csn_info: CsnInfo) -> None:
+        """Add CSN data with suffix matching
         
-        :returns: Dictionary of statistics
+        :param csn_info: CSN information object
+        :type csn_info: CsnInfo
+        """
+        if csn_info.target_dn:
+            csn_info.suffix = self.suffix_processor.match_suffix(csn_info.target_dn)
+        self.lag.append(csn_info)
+
+    def get_statistics(self) -> Dict[str, Union[float, int]]:
+        """Calculate replication lag statistics
+        
+        :returns: Dictionary containing lag statistics
         """
         self.resolve_all()
         lag_times = [info.lag_time[0] for info in self.lag 
@@ -666,19 +702,25 @@ class LagInfo:
         
         if not lag_times:
             return {
-                'min_lag': 0,
-                'max_lag': 0,
-                'avg_lag': 0,
+                'min_lag': 0.0,
+                'max_lag': 0.0,
+                'avg_lag': 0.0,
                 'total_updates': 0,
-                'server_count': len(self.servers)
+                'updates_by_suffix': {}
             }
+            
+        # Group updates by suffix
+        suffix_updates = {}
+        for info in self.lag:
+            suffix = info.suffix or 'unknown'
+            suffix_updates[suffix] = suffix_updates.get(suffix, 0) + 1
             
         return {
             'min_lag': min(lag_times),
             'max_lag': max(lag_times),
             'avg_lag': sum(lag_times) / len(lag_times),
             'total_updates': len(lag_times),
-            'server_count': len(self.servers)
+            'updates_by_suffix': suffix_updates
         }
 
     def resolve_all(self) -> None:
@@ -686,128 +728,70 @@ class LagInfo:
         for csn_info in self.lag:
             csn_info.resolve()
 
-    def plot_lag_csv(self, output_path: str) -> None:
-        """Generate CSV report of replication lag
+
+class SuffixProcessor:
+    """Handles suffix normalization and matching for replication analysis"""
+    
+    def __init__(self, suffixes: List[str]):
+        """Initialize suffix processor
         
-        :param output_path: Path to output CSV file
-        :type output_path: str
-        :raises: IOError if file cannot be written
+        :param suffixes: List of suffix DNs
+        :type suffixes: list
         """
-        self.resolve_all()
-        try:
-            with open(output_path, "w", encoding="utf-8") as csv_file:
-                csv_file.write("timestamp,server_name,csn,lag_time,etime,description\n")
-                for csn_info in sorted(self.lag, key=lambda x: x.oldest_time[0] if x.oldest_time else 0):
-                    base_time = csn_info.oldest_time[0] if csn_info.oldest_time else 0
-                    desc = csn_info.describe_csn()
-                    
-                    for server_name, timestamp in csn_info.csn_history:
-                        lag_time = timestamp - base_time if base_time else 0
-                        record = csn_info.replicated_on.get(list(self.servers).index(server_name), {})
-                        etime = record.get('etime', 0)
-                        
-                        csv_file.write(f"{datetime.datetime.fromtimestamp(timestamp, self.tz).strftime('%Y-%m-%d %H:%M:%S')},"
-                                     f"{server_name},{csn_info.csn},{lag_time},{etime},{desc}\n")
-        except IOError as e:
-            raise IOError(f"Failed to write CSV file: {e}")
-
-    def plot_interactive_html(self, output_path: str) -> None:
-        """Generate interactive HTML plot of replication lag
+        self.suffixes = self._normalize_suffixes(suffixes)
+        self._logger = logging.getLogger(__name__)
         
-        :param output_path: Path to output HTML file
-        :type output_path: str
-        :raises: ImportError if plotly not available
-                IOError if file cannot be written
+    def _normalize_suffixes(self, suffixes: List[str]) -> List[str]:
+        """Normalize and sort suffixes by length (longest first)
+        
+        :param suffixes: List of suffix DNs
+        :returns: Normalized and sorted suffix list
         """
-        try:
-            import plotly.graph_objs as go
-            import plotly.io as pio
-        except ImportError:
-            raise ImportError("plotly is required for interactive HTML plot generation")
-
-        self.resolve_all()
-
-        # Prepare data
-        data = []
-        for server in self.servers:
-            server_times = []
-            server_lags = []
-            server_etimes = []
-            hover_texts = []
+        normalized = [dn.lower().replace(' ', '') for dn in suffixes if dn]
+        return sorted(normalized, key=len, reverse=True)
+        
+    def match_suffix(self, dn: str) -> Optional[str]:
+        """Find matching suffix for given DN
+        
+        :param dn: Entry DN to match
+        :returns: Matching suffix or None
+        """
+        if not dn:
+            return None
             
-            for csn_info in sorted(self.lag, key=lambda x: x.oldest_time[0] if x.oldest_time else 0):
-                server_idx = list(self.servers).index(server)
-                if server_idx in csn_info.replicated_on:
-                    record = csn_info.replicated_on[server_idx]
-                    timestamp = datetime.datetime.fromtimestamp(record['logtime'], self.tz)
-                    lag_time = record['logtime'] - csn_info.oldest_time[0] if csn_info.oldest_time else 0
-                    
-                    server_times.append(timestamp)
-                    server_lags.append(lag_time)
-                    server_etimes.append(record['etime'])
-                    hover_texts.append(
-                        f"CSN: {csn_info.csn}<br>"
-                        f"Description: {csn_info.describe_csn()}<br>"
-                        f"Lag Time: {lag_time:.2f}s<br>"
-                        f"Elapsed Time: {record['etime']:.2f}s"
-                    )
-
-            # Add traces for this server
-            data.extend([
-                go.Scatter(
-                    x=server_times,
-                    y=server_lags,
-                    name=f'{server} - Lag',
-                    mode='lines+markers',
-                    text=hover_texts,
-                    hoverinfo='text+x+y'
-                ),
-                go.Scatter(
-                    x=server_times,
-                    y=server_etimes,
-                    name=f'{server} - Elapsed Time',
-                    mode='lines+markers',
-                    text=hover_texts,
-                    hoverinfo='text+x+y'
-                )
-            ])
-
-        # Create layout
-        layout = go.Layout(
-            title='Replication Lag Analysis',
-            xaxis=dict(title='Time'),
-            yaxis=dict(title='Seconds'),
-            hovermode='closest',
-            showlegend=True
-        )
-
-        # Create figure and save
-        fig = go.Figure(data=data, layout=layout)
         try:
-            pio.write_html(fig, output_path)
+            normalized_dn = dn.lower().replace(' ', '')
+            for suffix in self.suffixes:
+                if normalized_dn.endswith(suffix):
+                    return suffix
         except Exception as e:
-            raise IOError(f"Failed to write HTML file: {e}")
+            self._logger.warning(f"Error matching suffix for DN {dn}: {e}")
+        return None
+
 
 
 class ReplicationLogAnalyzer:
-    """Analyzes replication logs across multiple servers in a topology."""
+    """Analyzes replication logs across multiple servers"""
     
-    def __init__(self, log_dirs: List[str], anonymous: bool = False):
+    def __init__(self, log_dirs: List[str], suffixes: Optional[List[str]] = None,
+                 anonymous: bool = False):
         """Initialize the replication log analyzer
         
         :param log_dirs: List of directories containing server logs
         :type log_dirs: list
+        :param suffixes: Optional list of suffixes to track
+        :type suffixes: list
         :param anonymous: Whether to anonymize server names
         :type anonymous: bool
-        :raises: ValueError if log_dirs is empty
         """
         if not log_dirs:
             raise ValueError("No log directories provided")
             
         self.log_dirs = log_dirs
         self.anonymous = anonymous
+        self.suffixes = suffixes or []
         self.servers_data = {}
-        self._log = logging.getLogger(__name__)
+        self._logger = logging.getLogger(__name__)
 
     def _validate_formats(self, formats: List[str]) -> None:
         """Validate output format specifications
@@ -835,7 +819,7 @@ class ReplicationLogAnalyzer:
             log_files = self._get_log_files(log_dir)
             
             if not log_files:
-                self._log.warning(f"No valid log files found in {log_dir}")
+                self._logger.warning(f"No valid log files found in {log_dir}")
                 continue
 
             try:
@@ -847,7 +831,7 @@ class ReplicationLogAnalyzer:
                 parser.parse_files()
                 self.servers_data[server_name] = parser.build_result()
             except Exception as e:
-                self._log.error(f"Failed to process logs for {server_name}: {e}")
+                self._logger.error(f"Failed to process logs for {server_name}: {e}")
                 raise
 
         if not self.servers_data:
@@ -873,7 +857,7 @@ class ReplicationLogAnalyzer:
                 if os.path.isfile(full_path) and os.access(full_path, os.R_OK):
                     log_files.append(full_path)
                 else:
-                    self._log.warning(f"Cannot access log file: {full_path}")
+                    self._logger.warning(f"Cannot access log file: {full_path}")
         
         return sorted(log_files)
 
@@ -893,7 +877,8 @@ class ReplicationLogAnalyzer:
             'metadata': {
                 'analyzed_at': datetime.datetime.now().isoformat(),
                 'server_count': len(self.servers_data),
-                'anonymous': self.anonymous
+                'anonymous': self.anonymous,
+                'suffixes': self.suffixes
             }
         }
 
@@ -908,12 +893,12 @@ class ReplicationLogAnalyzer:
         return merged
 
     def generate_report(self, 
-                        output_dir: str, 
-                        formats: List[str] = ['html'],
-                        start_time: Optional[str] = None,
-                        end_time: Optional[str] = None,
-                        repl_lag_threshold: float = 0,
-                        report_name: str = 'replication_analysis') -> Dict[str, str]:
+                       output_dir: str, 
+                       formats: List[str] = ['html'],
+                       start_time: Optional[str] = None,
+                       end_time: Optional[str] = None,
+                       repl_lag_threshold: float = 0,
+                       report_name: str = 'replication_analysis') -> Dict[str, str]:
         """Generate replication analysis report in specified formats
         
         :param output_dir: Directory for output files
@@ -929,15 +914,12 @@ class ReplicationLogAnalyzer:
         :param report_name: Base name for report files
         :type report_name: str
         :returns: Dictionary mapping formats to generated file paths
-        :raises: OSError if output directory cannot be created
-                ValueError if invalid formats specified
-                Exception if report generation fails
         """
         # Validate output directory
         if not os.path.exists(output_dir):
             try:
                 os.makedirs(output_dir)
-                self._log.info(f"Created output directory: {output_dir}")
+                self._logger.info(f"Created output directory: {output_dir}")
             except OSError as e:
                 raise OSError(f"Failed to create output directory: {e}")
         elif not os.path.isdir(output_dir):
@@ -945,20 +927,17 @@ class ReplicationLogAnalyzer:
         elif not os.access(output_dir, os.W_OK):
             raise ValueError(f"Output directory is not writable: {output_dir}")
 
-        # Process the logs and get the data
-        data = self.process_logs()
-        
-        # Create LagInfo instance with processed data
+        # Initialize lag analysis
         lag_info = LagInfo({
             'start_time': start_time,
             'end_time': end_time,
             'repl_lag_threshold': repl_lag_threshold,
-            'only_fully_replicated': False,
-            'only_not_replicated': False,
-            'utc_offset': None  # We'll calculate this from the data
+            'suffixes': self.suffixes,
+            'utc_offset': None
         })
 
-        # Add the replication data
+        # Process data with suffix matching
+        data = self.process_logs()
         for csn, server_data in data['lag'].items():
             for _, records in server_data.items():
                 for record_idx, record in records.items():
@@ -967,26 +946,26 @@ class ReplicationLogAnalyzer:
                         int(record_idx),
                         record['server_name'],
                         record['logtime'],
-                        record['etime']
+                        record['etime'],
+                        record.get('target_dn')
                     )
-                    lag_info.lag.append(csn_info)
+                    lag_info.add_csn_data(csn_info)
                     lag_info.servers.add(record['server_name'].lower())
-        
-        # Generate reports in specified formats
+
+        # Generate reports
+        generated_files = {}
         self._validate_formats(formats)
 
-        generated_files = {}
-        
         for fmt in formats:
             output_path = os.path.join(output_dir, f'{report_name}.{fmt}')
             try:
                 if fmt == 'csv':
-                    lag_info.plot_lag_csv(output_path)
+                    self._generate_csv_report(lag_info, output_path)
                 elif fmt == 'html':
-                    lag_info.plot_interactive_html(output_path)
+                    self._generate_html_report(lag_info, output_path)
                 generated_files[fmt] = output_path
             except Exception as e:
-                self._log.error(f"Failed to generate {fmt} report: {e}")
+                self._logger.error(f"Failed to generate {fmt} report: {e}")
                 raise
 
         # Generate summary JSON
@@ -1002,21 +981,168 @@ class ReplicationLogAnalyzer:
                         'average_lag': stats['avg_lag'],
                         'maximum_lag': stats['max_lag'],
                         'minimum_lag': stats['min_lag'],
+                        'updates_by_suffix': stats['updates_by_suffix'],
                         'time_range': {
                             'start': data.get('start-time'),
                             'end': end_time or 'current'
                         },
                         'lag_threshold': repl_lag_threshold,
                         'generated_files': generated_files,
-                        'servers': data['servers']
+                        'servers': data['servers'],
+                        'suffixes': self.suffixes
                     }
                 }, f, indent=2)
             generated_files['summary'] = summary_path
         except Exception as e:
-            self._log.error(f"Failed to write summary JSON: {e}")
+            self._logger.error(f"Failed to write summary JSON: {e}")
             raise
 
         return generated_files
+
+    def _generate_csv_report(self, lag_info: LagInfo, output_path: str) -> None:
+        """Generate CSV report of replication lag
+        
+        :param lag_info: Lag analysis information
+        :param output_path: Output file path
+        """
+        with open(output_path, "w", encoding="utf-8") as csv_file:
+            csv_file.write("timestamp,server_name,csn,lag_time,etime,suffix,target_dn,description\n")
+            for csn_info in sorted(lag_info.lag, 
+                                 key=lambda x: x.oldest_time[0] if x.oldest_time else 0):
+                base_time = csn_info.oldest_time[0] if csn_info.oldest_time else 0
+                desc = csn_info.describe_csn()
+                
+                for server_name, timestamp in csn_info.csn_history:
+                    lag_time = timestamp - base_time if base_time else 0
+                    record = csn_info.replicated_on.get(
+                        list(lag_info.servers).index(server_name), {}
+                    )
+                    etime = record.get('etime', 0)
+                    
+                    csv_file.write(
+                        f"{datetime.datetime.fromtimestamp(timestamp, lag_info.tz).strftime('%Y-%m-%d %H:%M:%S')},"
+                        f"{server_name},{csn_info.csn},{lag_time},{etime},"
+                        f"{csn_info.suffix or ''},"
+                        f"{csn_info.target_dn or ''},"
+                        f"{desc}\n"
+                    )
+
+    def _generate_html_report(self, lag_info: LagInfo, output_path: str) -> None:
+        """Generate interactive HTML report of replication lag
+        
+        :param lag_info: Lag analysis information
+        :param output_path: Output file path
+        :raises: ImportError if plotly not available
+        """
+        try:
+            import plotly.graph_objs as go
+            import plotly.io as pio
+        except ImportError:
+            raise ImportError("plotly is required for interactive HTML plot generation")
+
+        # Prepare data by suffix
+        data = []
+        for suffix in lag_info.suffix_processor.suffixes + ['unknown']:
+            for server in lag_info.servers:
+                suffix_times = []
+                suffix_lags = []
+                suffix_etimes = []
+                hover_texts = []
+                
+                for csn_info in sorted(
+                    [info for info in lag_info.lag 
+                     if (info.suffix or 'unknown') == suffix],
+                    key=lambda x: x.oldest_time[0] if x.oldest_time else 0
+                ):
+                    server_idx = list(lag_info.servers).index(server)
+                    if server_idx in csn_info.replicated_on:
+                        record = csn_info.replicated_on[server_idx]
+                        timestamp = datetime.datetime.fromtimestamp(
+                            record['logtime'], 
+                            lag_info.tz
+                        )
+                        lag_time = (record['logtime'] - csn_info.oldest_time[0] 
+                                  if csn_info.oldest_time else 0)
+                        
+                        suffix_times.append(timestamp)
+                        suffix_lags.append(lag_time)
+                        suffix_etimes.append(record['etime'])
+                        hover_texts.append(
+                            f"CSN: {csn_info.csn}<br>"
+                            f"Description: {csn_info.describe_csn()}<br>"
+                            f"Lag Time: {lag_time:.2f}s<br>"
+                            f"Elapsed Time: {record['etime']:.2f}s<br>"
+                            f"Target DN: {csn_info.target_dn or 'unknown'}"
+                        )
+
+                if suffix_times:  # Only add traces if we have data
+                    suffix_name = suffix or 'unknown'
+                    data.extend([
+                        go.Scatter(
+                            x=suffix_times,
+                            y=suffix_lags,
+                            name=f'{suffix_name} - {server} - Lag',
+                            mode='lines+markers',
+                            text=hover_texts,
+                            hoverinfo='text+x+y'
+                        ),
+                        go.Scatter(
+                            x=suffix_times,
+                            y=suffix_etimes,
+                            name=f'{suffix_name} - {server} - Elapsed Time',
+                            mode='lines+markers',
+                            text=hover_texts,
+                            hoverinfo='text+x+y'
+                        )
+                    ])
+
+        # Create layout with suffix filtering buttons
+        suffix_buttons = [
+            dict(
+                args=[{"visible": [True] * len(data)}],
+                label="All Suffixes",
+                method="restyle"
+            )
+        ]
+
+        for suffix in lag_info.suffix_processor.suffixes + ['unknown']:
+            visible = [
+                suffix in trace.name 
+                for trace in data
+            ]
+            suffix_buttons.append(
+                dict(
+                    args=[{"visible": visible}],
+                    label=suffix or "Unknown",
+                    method="restyle"
+                )
+            )
+
+        layout = go.Layout(
+            title='Replication Lag Analysis by Suffix',
+            xaxis=dict(title='Time'),
+            yaxis=dict(title='Seconds'),
+            hovermode='closest',
+            showlegend=True,
+            updatemenus=[
+                dict(
+                    buttons=suffix_buttons,
+                    direction="down",
+                    showactive=True,
+                    x=0.1,
+                    y=1.1,
+                    xanchor="left",
+                    yanchor="top"
+                )
+            ]
+        )
+
+        # Create figure and save
+        fig = go.Figure(data=data, layout=layout)
+        try:
+            pio.write_html(fig, output_path)
+        except Exception as e:
+            raise IOError(f"Failed to write HTML file: {e}")
 
     def get_lag_statistics(self) -> Dict[str, Union[float, int]]:
         """Calculate replication lag statistics across all servers
