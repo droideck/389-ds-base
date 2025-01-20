@@ -202,7 +202,7 @@ def test_replication_log_monitoring_basic(topo_m4):
 
 def test_replication_log_monitoring_advanced(topo_m4):
     """Test advanced replication monitoring features
-    
+
     :id: 5bb8fd9f-c3ed-4118-a2f9-fd5d733230c7
     :setup: Four suppliers replication setup
     :steps:
@@ -263,12 +263,22 @@ def test_replication_log_monitoring_advanced(topo_m4):
         repl_monitor.parse_logs()
         results1 = repl_monitor.build_result()
         
-        # Verify lag filtering
+        # Verify lag filtering:
+        # Only consider dict values, skip the special "__hop_lags__" (if present)
         for csn, server_map in results1['lag'].items():
-            t_list = [d['logtime'] for d in server_map.values()]
+            t_list = [
+                record['logtime']
+                for key, record in server_map.items()
+                if isinstance(record, dict) and key != '__hop_lags__'
+            ]
+            if not t_list:
+                # If no normal records exist, just skip
+                continue
+
             lag_time = max(t_list) - min(t_list)
-            assert lag_time > 1.0
-        
+            # Must be greater than the threshold (1.0)
+            assert lag_time > 1.0, f"Expected lag_time > 1.0, got {lag_time}"
+
         # Test 2: Time range filtering
         repl_monitor = ReplicationLogAnalyzer(
             log_dirs=log_dirs,
@@ -278,8 +288,11 @@ def test_replication_log_monitoring_advanced(topo_m4):
         repl_monitor.parse_logs()
         results2 = repl_monitor.build_result()
         
-        # Verify time range
-        assert datetime.fromtimestamp(results2['utc-start-time'], timezone.utc) >= start_time
+        # Verify the 'start-time' in results is within or after our start_time
+        utc_start_time = datetime.fromtimestamp(results2['utc-start-time'], timezone.utc)
+        assert utc_start_time >= start_time, (
+            f"Expected start time >= {start_time}, got {utc_start_time}"
+        )
         
         # Test 3: Anonymization
         repl_monitor = ReplicationLogAnalyzer(
@@ -298,11 +311,16 @@ def test_replication_log_monitoring_advanced(topo_m4):
         with open(generated_files['csv'], 'r') as f:
             content = f.read()
             for supplier in suppliers:
-                assert supplier.serverid not in content
-            assert 'server_0' in content
+                # Original supplier.serverid should NOT appear
+                assert supplier.serverid not in content, (
+                    f"Found real server name {supplier.serverid} in CSV"
+                )
+            # Instead, placeholders like 'server_0' should exist
+            assert 'server_0' in content, "Expected 'server_0' placeholder not found in CSV"
             
     finally:
         _cleanup_test_data(test_users, tmp_dir)
+
 
 def test_replication_log_monitoring_multi_suffix(topo_m4):
     """Test multi-suffix replication monitoring
