@@ -1077,14 +1077,19 @@ class ReplicationLogAnalyzer:
         if not PLOTLY_AVAILABLE:
             raise ImportError("Plotly is required for figure creation")
 
-        # Create figure with 3 subplots
+        # Create figure with 3 subplots: we still generate all 3 for HTML usage
         fig = make_subplots(
             rows=3, cols=1,
-            subplot_titles=('Replication Lag Times', 'Operation Durations', 'Per-Hop Lags'),
-            vertical_spacing=0.15
+            subplot_titles=(
+                "Global Replication Lag Over Time",
+                "Operation Duration Over Time",
+                "Per-Hop Replication Lags"
+            ),
+            vertical_spacing=0.10,   # spacing between subplots
+            shared_xaxes=True
         )
 
-        # Collect all (suffix, server_name) pairs
+        # Collect all (suffix, server_name) pairs to color consistently
         server_suffix_pairs = set()
         for csn, server_map in self.csns.items():
             for key, rec in server_map.items():
@@ -1097,19 +1102,18 @@ class ReplicationLogAnalyzer:
 
         # Generate colors
         colors = VisualizationHelper.generate_color_palette(len(server_suffix_pairs))
-        
-        # Prepare chart data for row=1 (global lag) & row=2 (duration)
+
+        # Prepare chart data for the first two subplots
         chart_data = VisualizationHelper.prepare_chart_data(self.csns)
 
-        # (A) Plot Per-Hop Lags in row=3
+        # Plot Per-Hop Lags in row=3 (for HTML usage)
         for csn, server_map in self.csns.items():
             hop_list = server_map.get('__hop_lags__', [])
             for hop in hop_list:
-                consumer_ts = hop.get('arrival_consumer', 0.0)
+                consumer_ts = hop.get("arrival_consumer", 0.0)
                 consumer_dt = datetime.fromtimestamp(consumer_ts)
-                hop_lag = hop.get('hop_lag', 0.0)
+                hop_lag = hop.get("hop_lag", 0.0)
 
-                # Build hover text
                 hover_text = (
                     f"Supplier: {hop.get('supplier','unknown')}<br>"
                     f"Consumer: {hop.get('consumer','unknown')}<br>"
@@ -1117,13 +1121,13 @@ class ReplicationLogAnalyzer:
                     f"Arrival Time: {consumer_dt}"
                 )
 
-                # Add a scatter point for each hop
+                # showlegend=False means these hop-lag traces won't crowd the legend
                 fig.add_trace(
                     go.Scatter(
                         x=[consumer_dt],
                         y=[hop_lag],
                         mode='markers',
-                        marker=dict(size=8),
+                        marker=dict(size=7, symbol='circle'),
                         name=f"{hop.get('supplier','?')}→{hop.get('consumer','?')}",
                         text=[hover_text],
                         hoverinfo='text+x+y',
@@ -1132,11 +1136,11 @@ class ReplicationLogAnalyzer:
                     row=3, col=1
                 )
 
-        # (B) Plot Global Lag (row=1) and Durations (row=2)
+        # Plot Global Lag (row=1) and Durations (row=2)
         for idx, ((sfx, srv), data) in enumerate(sorted(chart_data.items())):
             color = colors[idx % len(colors)]
-            
-            # Row=1: Global lag line
+
+            # Row=1: Global Replication Lag
             fig.add_trace(
                 go.Scatter(
                     x=data.times,
@@ -1145,13 +1149,14 @@ class ReplicationLogAnalyzer:
                     name=f"{sfx} - {srv}",
                     text=data.hover,
                     hoverinfo='text+x+y',
-                    line=dict(color=color),
+                    line=dict(color=color, width=2),
+                    marker=dict(size=6),
                     showlegend=True
                 ),
                 row=1, col=1
             )
-            
-            # Row=2: Duration line
+
+            # Row=2: Operation Durations
             fig.add_trace(
                 go.Scatter(
                     x=data.times,
@@ -1160,43 +1165,58 @@ class ReplicationLogAnalyzer:
                     name=f"{sfx} - {srv}",
                     text=data.hover,
                     hoverinfo='text+x+y',
-                    line=dict(color=color),
+                    line=dict(color=color, width=2, dash='solid'),
+                    marker=dict(size=6),
                     showlegend=False
                 ),
                 row=2, col=1
             )
 
-        # Layout / Axis updates
+        # Add a horizontal threshold line to the Replication Lag subplot
+        if self.repl_lag_threshold is not None:
+            fig.add_hline(
+                y=self.repl_lag_threshold,
+                line=dict(color='red', width=2, dash='dash'),
+                annotation=dict(
+                    text=f"Lag Threshold = {self.repl_lag_threshold}s",
+                    font=dict(color='red'),
+                    showarrow=False,
+                    x=1,
+                    xanchor='left',
+                    y=self.repl_lag_threshold
+                ),
+                row=1, col=1
+            )
+
+        # Figure layout settings
         fig.update_layout(
             title={
                 'text': 'Replication Analysis Report',
-                'y': 0.95,
+                'y': 0.96,
                 'x': 0.5,
                 'xanchor': 'center',
                 'yanchor': 'top'
             },
+            template='plotly_white',
+            hovermode='closest',
             showlegend=True,
             legend=dict(
+                title="Suffix / Server",
                 yanchor="top",
                 y=0.99,
-                xanchor="left",
-                x=1.05,
+                xanchor="right",
+                x=1.15,
                 bgcolor='rgba(255, 255, 255, 0.8)'
             ),
-            height=1000,
-            margin=dict(t=100, r=200)
+            height=900,
+            margin=dict(t=100, r=200, l=80)
         )
 
+        # X-axis styling
         fig.update_xaxes(title_text="Time", gridcolor='lightgray', row=1, col=1)
-        fig.update_xaxes(title_text="Time", gridcolor='lightgray', rangeslider_visible=True, row=2, col=1)
-        fig.update_xaxes(title_text="Time", gridcolor='lightgray', row=3, col=1)
-
-        fig.update_yaxes(title_text="Lag Time (seconds)", gridcolor='lightgray', row=1, col=1)
-        fig.update_yaxes(title_text="Duration (seconds)", gridcolor='lightgray', row=2, col=1)
-        fig.update_yaxes(title_text="Hop Lag (seconds)", gridcolor='lightgray', row=3, col=1)
-
-        # Range selector on the bottom subplot (row=2 here)
         fig.update_xaxes(
+            title_text="Time",
+            gridcolor='lightgray',
             rangeslider_visible=True,
             rangeselector=dict(
                 buttons=list([
@@ -1210,24 +1230,41 @@ class ReplicationLogAnalyzer:
             ),
             row=2, col=1
         )
+        fig.update_xaxes(title_text="Time", gridcolor='lightgray', row=3, col=1)
+
+        # Y-axis styling
+        fig.update_yaxes(title_text="Lag Time (seconds)", gridcolor='lightgray', row=1, col=1)
+        fig.update_yaxes(title_text="Duration (seconds)", gridcolor='lightgray', row=2, col=1)
+        fig.update_yaxes(title_text="Hop Lag (seconds)", gridcolor='lightgray', row=3, col=1)
 
         return fig
 
     def _generate_png(self, fig: go.Figure, outfile: str) -> None:
-        """Generate PNG snapshot of the plotly figure using matplotlib."""
+        """Generate PNG snapshot of the plotly figure using matplotlib.
+        For PNG, we deliberately omit the hop-lag (3rd subplot) data.
+        """
         try:
-            # Create matplotlib figure
+            # Create a matplotlib figure with 2 subplots
             plt.figure(figsize=(12, 8))
-            
-            # Extract data from plotly figure
+
+            # Extract data from the Plotly figure.
+            # We'll plot only the first two subplots (y-axis = 'y' or 'y2').
             for trace in fig.data:
-                if trace.yaxis == 'y1':  # first subplot (global lag)
+                # Check which y-axis the trace belongs to.
+                # 'y'  => subplot row=1
+                # 'y2' => subplot row=2
+                # 'y3' => subplot row=3 (hop-lags) - skip those
+                if trace.yaxis == 'y':  # Global Lag subplot
                     plt.subplot(2, 1, 1)
                     plt.plot(trace.x, trace.y, label=trace.name)
-                else:  # second subplot (duration) - (Note: for PNG we don't show hop-lags)
+                elif trace.yaxis == 'y2':  # Duration subplot
                     plt.subplot(2, 1, 2)
                     plt.plot(trace.x, trace.y, label=trace.name)
+                else:
+                    # This is likely the hop-lag data on subplot row=3, so skip it
+                    continue
 
+            # Format each subplot
             for idx, title in enumerate(['Replication Lag Times', 'Operation Durations']):
                 plt.subplot(2, 1, idx + 1)
                 plt.title(title)
@@ -1235,6 +1272,7 @@ class ReplicationLogAnalyzer:
                 plt.ylabel('Seconds')
                 plt.grid(True)
                 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                # Format x-axis as date/time
                 plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
                 plt.gcf().autofmt_xdate()
 
@@ -1246,7 +1284,7 @@ class ReplicationLogAnalyzer:
             raise IOError(f"Failed to generate PNG report: {e}")
 
     def _generate_html(self, fig: go.Figure, outfile: str) -> None:
-        """Generate HTML report from plotly figure."""
+        """Generate HTML report from the plotly figure."""
         try:
             pio.write_html(
                 fig,
