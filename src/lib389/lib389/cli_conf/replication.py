@@ -1542,13 +1542,14 @@ def create_parser(subparsers):
         formatter_class=CustomHelpFormatter)
     repl_lag_report_parser.set_defaults(func=generate_lag_report)
     
-    # Input options
-    repl_lag_report_parser.add_argument('--log-dirs', nargs='+', required=True,
+    # Input options group
+    input_group = repl_lag_report_parser.add_argument_group('Input options')
+    input_group.add_argument('--log-dirs', nargs='+', required=True,
         help='List of log directories to analyze')
-    repl_lag_report_parser.add_argument('--suffixes', nargs='+', required=True,
+    input_group.add_argument('--suffixes', nargs='+', required=True,
         help='List of suffixes to analyze')
-    
-    # Output options
+
+    # Output options group
     output_group = repl_lag_report_parser.add_argument_group('Output options')
     output_group.add_argument('--output-dir', required=True,
         help='Directory for report output files')
@@ -1558,29 +1559,39 @@ def create_parser(subparsers):
         help='Generate CSV report')
     output_group.add_argument('--png', action='store_true',
         help='Generate PNG report (default if no format specified)')
-    
-    # Filtering options - TODO: add as group
-    repl_lag_report_parser.add_argument('--only-fully-replicated', action='store_true',
+
+    # Filtering options group
+    filter_group = repl_lag_report_parser.add_argument_group('Filtering options')
+
+    # Create mutually exclusive group for replication filters
+    repl_filter_group = filter_group.add_mutually_exclusive_group()
+    repl_filter_group.add_argument('--only-fully-replicated', action='store_true',
         help='Show only fully replicated entries')
-    repl_lag_report_parser.add_argument('--only-not-replicated', action='store_true',
+    repl_filter_group.add_argument('--only-not-replicated', action='store_true',
         help='Show only entries that failed to replicate')
-    repl_lag_report_parser.add_argument('--lag-time-lowest', type=float,
+
+    # Other filtering options
+    filter_group.add_argument('--lag-time-lowest', type=float,
         help='Filter entries with lag time above this threshold (seconds)')
-    repl_lag_report_parser.add_argument('--etime-lowest', type=float,
+    filter_group.add_argument('--etime-lowest', type=float,
         help='Filter entries with etime above this threshold (seconds)')
-    repl_lag_report_parser.add_argument('--repl-lag-threshold', type=float,
+    filter_group.add_argument('--repl-lag-threshold', type=float,
         help='Replication lag threshold for highlighting (seconds)')
-    repl_lag_report_parser.add_argument('--start-time',
+
+    # Time range options subgroup
+    time_group = repl_lag_report_parser.add_argument_group('Time range options')
+    time_group.add_argument('--start-time',
         default='1970-01-01 00:00:00',
         help='Start time for analysis (YYYY-MM-DD HH:MM:SS)')
-    repl_lag_report_parser.add_argument('--end-time',
+    time_group.add_argument('--end-time',
         default='9999-12-31 23:59:59',
         help='End time for analysis (YYYY-MM-DD HH:MM:SS)')
-    
-    # Additional options - TODO: add as group
-    repl_lag_report_parser.add_argument('--utc-offset',
+
+    # Additional options group
+    additional_group = repl_lag_report_parser.add_argument_group('Additional options')
+    additional_group.add_argument('--utc-offset',
         help='UTC offset in ±HHMM format (e.g., -0400, +0530)')
-    repl_lag_report_parser.add_argument('--anonymous', action='store_true',
+    additional_group.add_argument('--anonymous', action='store_true',
         help='Anonymize server names in the report')
 
     ############################################
