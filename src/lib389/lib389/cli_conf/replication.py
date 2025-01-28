@@ -514,7 +514,7 @@ def generate_lag_report(inst, basedn, log, args):
     # Validate input parameters
     if not args.log_dirs:
         raise ValueError("No log directories specified")
-    
+
     # Validate log directories
     for log_dir in args.log_dirs:
         if not os.path.isdir(log_dir):
@@ -1537,11 +1537,11 @@ def create_parser(subparsers):
                                      help="Enables displaying an alias instead of host:port, if an alias is "
                                           "assigned to a host:port combination. The format: alias=host:port")
 
-    repl_lag_report_parser = repl_subcommands.add_parser('lag-report', 
+    repl_lag_report_parser = repl_subcommands.add_parser('lag-report',
         help='Generate detailed replication lag monitoring report',
         formatter_class=CustomHelpFormatter)
     repl_lag_report_parser.set_defaults(func=generate_lag_report)
-    
+
     # Input options group
     input_group = repl_lag_report_parser.add_argument_group('Input options')
     input_group.add_argument('--log-dirs', nargs='+', required=True,

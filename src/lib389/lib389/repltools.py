@@ -350,13 +350,13 @@ class DSLogParser:
             self.timestamp: Optional[str] = None
             self.line: Optional[str] = None
 
-    def __init__(self, logname: str, suffixes: List[str], 
+    def __init__(self, logname: str, suffixes: List[str],
                 tz: tzinfo = timezone.utc,
                 start_time: Optional[datetime] = None,
                 end_time: Optional[datetime] = None,
                 batch_size: int = 1000):
         """Initialize the parser with time range filtering.
-        
+
         :param logname: Path to the log file
         :param suffixes: Suffixes that should be tracked
         :param tz: Timezone to interpret log timestamps
@@ -369,7 +369,7 @@ class DSLogParser:
         self.line: Optional[str] = None
         self.tz = tz
         self._suffixes = self._normalize_suffixes(suffixes)
-        
+
         # Ensure start_time and end_time are timezone-aware
         self.start_time = self._ensure_timezone_aware(start_time) if start_time else None
         self.end_time = self._ensure_timezone_aware(end_time) if end_time else None
@@ -390,7 +390,7 @@ class DSLogParser:
         """Parse a timestamp into a datetime object."""
         if isinstance(ts, datetime):
             return ts
-            
+
         match = DSLogParser.REGEX_TIMESTAMP.match(ts)
         if not match:
             raise ValueError(f"Invalid timestamp format: {ts}")
@@ -409,18 +409,18 @@ class DSLogParser:
 
         # Create timezone-aware datetime
         dt = datetime.fromisoformat(iso_ts)
-        
+
         # Handle nanoseconds if present
         if parsed['nanosecond']:
             dt = dt.replace(microsecond=int(parsed['nanosecond']) // 1000)
-        
+
         return dt
 
     def _is_in_time_range(self, timestamp: datetime) -> bool:
         """Check if timestamp is within configured time range."""
         # Ensure timestamp is timezone-aware and in the same timezone
         aware_timestamp = self._ensure_timezone_aware(timestamp)
-        
+
         if self.start_time and aware_timestamp < self.start_time:
             return False
         if self.end_time and aware_timestamp > self.end_time:
@@ -489,11 +489,11 @@ class DSLogParser:
                             record = self._process_operation(result)
                             if record:
                                 self._current_batch.append(record)
-                                
+
                                 # Yield batch if full
                                 if len(self._current_batch) >= self.batch_size:
                                     yield from self._process_batch()
-                            
+
                     except Exception as e:
                         self._logger.warning(
                             f"Error parsing line {self.lineno} in {self.logname}: {e}"
@@ -575,10 +575,10 @@ class DSLogParser:
 
                 if not self._is_in_time_range(timestamp):
                     continue
-                    
+
                 record['timestamp'] = timestamp
                 yield record
-                
+
             except ValueError as e:
                 self._logger.warning(
                     f"Error processing timestamp in batch: {e}"
@@ -659,7 +659,7 @@ class DSLogParser:
             finally:
                 self.pending_ops.pop((conn, op), None)
 
-    def _calculate_duration(self, start: Union[str, datetime], 
+    def _calculate_duration(self, start: Union[str, datetime],
                         end: Union[str, datetime]) -> float:
         """Compute duration between two timestamps. """
         try:
@@ -667,12 +667,12 @@ class DSLogParser:
                 st = self.parse_timestamp(start)
             else:
                 st = start
-                
+
             if isinstance(end, str):
                 et = self.parse_timestamp(end)
             else:
                 et = end
-                
+
             return (et - st).total_seconds()
         except (ValueError, TypeError):
             return 0.0
@@ -687,11 +687,11 @@ class ChartData(NamedTuple):
 
 class VisualizationHelper:
     """Helper class for visualization-related functionality."""
-    
+
     @staticmethod
     def generate_color_palette(num_colors: int) -> List[str]:
         """Generate a visually pleasing color palette.
-        
+
         :param num_colors: Number of colors needed
         :returns: List of rgba color strings
         """
@@ -700,12 +700,12 @@ class VisualizationHelper:
             hue = i / num_colors
             saturation = 0.7
             value = 0.9
-            
+
             # Convert HSV to RGB
             c = value * saturation
             x = c * (1 - abs((hue * 6) % 2 - 1))
             m = value - c
-            
+
             h_sector = int(hue * 6)
             if h_sector == 0:
                 r, g, b = c, x, 0
@@ -719,11 +719,11 @@ class VisualizationHelper:
                 r, g, b = x, 0, c
             else:
                 r, g, b = c, 0, x
-                
+
             # Convert to RGB values
             rgb = [int((val + m) * 255) for val in (r, g, b)]
             colors.append(f'rgba({rgb[0]},{rgb[1]},{rgb[2]},0.8)')
-            
+
         return colors
 
     @staticmethod
@@ -732,35 +732,35 @@ class VisualizationHelper:
         chart_data = defaultdict(lambda: {
             'times': [], 'lags': [], 'durations': [], 'hover': []
         })
-        
+
         for csn, server_map in csns.items():
             # Gather only valid records (dict, not '__hop_lags__', must have 'logtime')
             valid_records = [
                 rec for key, rec in server_map.items()
-                if isinstance(rec, dict) 
+                if isinstance(rec, dict)
                    and key != '__hop_lags__'
                    and 'logtime' in rec
             ]
             if not valid_records:
                 continue
-            
+
             # Compute global lag for this CSN (earliest vs. latest among valid records)
             t_list = [rec['logtime'] for rec in valid_records]
             earliest = min(t_list)
             latest = max(t_list)
             lag_val = latest - earliest
-            
+
             # Populate chart data for each server record
             for rec in valid_records:
                 suffix_val = rec.get('suffix', 'unknown')
                 server_val = rec.get('server_name', 'unknown')
-                
+
                 # Convert numeric UTC to a datetime
                 ts_dt = datetime.fromtimestamp(rec['logtime'])
-                
+
                 # Operation duration, defaulting to 0.0 if missing
                 duration_val = float(rec.get('duration', 0.0))
-                
+
                 # Build the ChartData slot
                 data_slot = chart_data[(suffix_val, server_val)]
                 data_slot['times'].append(ts_dt)
@@ -774,7 +774,7 @@ class VisualizationHelper:
                     f"Lag Time: {lag_val:.3f}s<br>"
                     f"Duration: {duration_val:.3f}s"
                 )
-        
+
         # Convert the dict-of-lists into your namedtuple-based ChartData
         return {
             key: ChartData(
@@ -803,7 +803,7 @@ class ReplicationLogAnalyzer:
                 utc_offset: Optional[int] = None, time_range: Optional[Dict[str, datetime]] = None):
         if not log_dirs:
             raise ValueError("No log directories provided for analysis.")
-        
+
         self.log_dirs = log_dirs
         self.suffixes = suffixes or []
         self.anonymous = anonymous
@@ -821,7 +821,7 @@ class ReplicationLogAnalyzer:
                 raise ValueError(f"Invalid UTC offset: {e}")
         else:
             self.tz = timezone.utc
-            
+
         self.time_range = time_range or {}
         self.csns: Dict[str, Dict[Union[int, str], Dict[str, Any]]] = {}
 
@@ -836,7 +836,7 @@ class ReplicationLogAnalyzer:
             return False
         if self.only_not_replicated and len(server_map) == len(self.log_dirs):
             return False
-            
+
         # Check lag time threshold
         if self.lag_time_lowest is not None:
             # Only consider dict items, skipping the '__hop_lags__' entry
@@ -850,7 +850,7 @@ class ReplicationLogAnalyzer:
             lag_time = max(t_list) - min(t_list)
             if lag_time <= self.lag_time_lowest:
                 return False
-                
+
         # Check etime threshold
         if self.etime_lowest is not None:
             for key, record in server_map.items():
@@ -858,7 +858,7 @@ class ReplicationLogAnalyzer:
                     continue
                 if float(record.get('etime', 0)) <= self.etime_lowest:
                     return False
-                    
+
         return True
 
     def _collect_logs(self) -> List[Tuple[str, List[str]]]:
@@ -891,22 +891,22 @@ class ReplicationLogAnalyzer:
         """Parse timezone offset string in ±HHMM format."""
         if not isinstance(offset_str, str):
             raise ValueError("Timezone offset must be a string in ±HHMM format")
-            
+
         match = re.match(r'^([+-])(\d{2})(\d{2})$', offset_str)
         if not match:
             raise ValueError("Invalid timezone offset format. Use ±HHMM (e.g., -0400, +0530)")
-            
+
         sign, hours, minutes = match.groups()
         hours = int(hours)
         minutes = int(minutes)
-        
+
         if hours > 12 or minutes >= 60:
             raise ValueError("Invalid timezone offset. Hours must be ≤12, minutes <60")
-            
+
         total_minutes = hours * 60 + minutes
         if sign == '-':
             total_minutes = -total_minutes
-            
+
         return timezone(timedelta(minutes=total_minutes))
 
     def _compute_hop_lags(self, server_map: Dict[Union[int, str], Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -963,7 +963,7 @@ class ReplicationLogAnalyzer:
                     start_time=self.time_range.get('start'),
                     end_time=self.time_range.get('end')
                 )
-                
+
                 for record in parser.parse_file():
                     # If there's no CSN or no suffix, skip
                     if not record.get('csn') or not record.get('suffix'):
@@ -1046,11 +1046,11 @@ class ReplicationLogAnalyzer:
         for fmt in formats:
             fmt = fmt.lower()
             outfile = os.path.join(output_dir, f"{report_name}.{fmt}")
-            
+
             if fmt == 'csv':
                 self._generate_csv(results, outfile)
                 generated_files["csv"] = outfile
-            
+
             elif fmt == 'html':
                 if not PLOTLY_AVAILABLE:
                     self._logger.warning("Plotly not installed. Skipping HTML report.")
@@ -1058,7 +1058,7 @@ class ReplicationLogAnalyzer:
                 fig = self._create_plotly_figure(results)
                 self._generate_html(fig, outfile)
                 generated_files["html"] = outfile
-            
+
             elif fmt == 'png':
                 if not MATPLOTLIB_AVAILABLE:
                     self._logger.warning("Matplotlib not installed. Skipping PNG report.")
@@ -1066,7 +1066,7 @@ class ReplicationLogAnalyzer:
                 fig = self._create_plotly_figure(results)
                 self._generate_png(fig, outfile)
                 generated_files["png"] = outfile
-            
+
             else:
                 self._logger.warning(f"Unknown report format requested: {fmt}")
 
@@ -1313,7 +1313,7 @@ class ReplicationLogAnalyzer:
         try:
             with open(outfile, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
-                
+
                 # Global-lag rows
                 writer.writerow([
                     'Timestamp', 'Server', 'CSN', 'Suffix', 'Target DN',
