@@ -1,6 +1,6 @@
 // This exposes C-FFI capable bindings for the concread concurrently readable cache.
+use concread::arcache::stats::{ReadCountStat, WriteCountStat};
 use concread::arcache::{ARCache, ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn};
-use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -9,16 +9,21 @@ pub struct ARCacheChar {
 }
 
 pub struct ARCacheCharRead<'a> {
-    inner: ARCacheReadTxn<'a, CString, CString>,
+    inner: ARCacheReadTxn<'a, CString, CString, ()>,
+    cache: &'a ARCacheChar, // Store reference to cache for quiescing
 }
 
 pub struct ARCacheCharWrite<'a> {
-    inner: ARCacheWriteTxn<'a, CString, CString>,
+    inner: ARCacheWriteTxn<'a, CString, CString, ()>,
 }
 
 #[no_mangle]
 pub extern "C" fn cache_char_create(max: usize, read_max: usize) -> *mut ARCacheChar {
-    let inner = if let Some(cache) = ARCacheBuilder::new().set_size(max, read_max).build() {
+    let inner = if let Some(cache) = ARCacheBuilder::new()
+        .set_size(max, read_max)
+        .set_reader_quiesce(false) // Disable automatic quiescing
+        .build()
+    {
         cache
     } else {
         return std::ptr::null_mut();
@@ -53,22 +58,28 @@ pub extern "C" fn cache_char_stats(
 ) {
     let cache_ref = unsafe {
         debug_assert!(!cache.is_null());
-        &(*cache) as &ARCacheChar
+        &(*cache)
     };
-    let stats = cache_ref.inner.view_stats();
-    *reader_hits = stats.reader_hits.try_into().unwrap();
-    *reader_includes = stats.reader_includes.try_into().unwrap();
-    *write_hits = stats.write_hits.try_into().unwrap();
-    *write_inc_or_mod = (stats.write_includes + stats.write_modifies)
-        .try_into()
-        .unwrap();
-    *shared_max = stats.shared_max.try_into().unwrap();
-    *freq = stats.freq.try_into().unwrap();
-    *recent = stats.recent.try_into().unwrap();
-    *freq_evicts = stats.freq_evicts.try_into().unwrap();
-    *recent_evicts = stats.recent_evicts.try_into().unwrap();
-    *p_weight = stats.p_weight.try_into().unwrap();
-    *all_seen_keys = stats.all_seen_keys.try_into().unwrap();
+
+    let read_txn = cache_ref.inner.read_stats(ReadCountStat::default());
+    let read_stats = read_txn.finish();
+
+    let write_txn = cache_ref.inner.write_stats(WriteCountStat::default());
+    let write_stats = write_txn.commit();
+
+    *reader_hits = read_stats.main_hit + read_stats.local_hit;
+    *reader_includes = read_stats.include + read_stats.local_include;
+    *write_hits = write_stats.read_hits;
+    *write_inc_or_mod = write_stats.read_hits;
+
+    *shared_max = write_stats.shared_max;
+    *freq = write_stats.freq;
+    *recent = write_stats.recent;
+    *p_weight = write_stats.p_weight;
+    *all_seen_keys = write_stats.all_seen_keys;
+
+    *freq_evicts = 0;
+    *recent_evicts = 0;
 }
 
 // start read
@@ -80,6 +91,7 @@ pub extern "C" fn cache_char_read_begin(cache: *mut ARCacheChar) -> *mut ARCache
     };
     let read_txn = Box::new(ARCacheCharRead {
         inner: cache_ref.inner.read(),
+        cache: cache_ref,
     });
     Box::into_raw(read_txn)
 }
@@ -88,7 +100,10 @@ pub extern "C" fn cache_char_read_begin(cache: *mut ARCacheChar) -> *mut ARCache
 pub extern "C" fn cache_char_read_complete(read_txn: *mut ARCacheCharRead) {
     debug_assert!(!read_txn.is_null());
     unsafe {
-        let _drop = Box::from_raw(read_txn);
+        let read_txn = Box::from_raw(read_txn);
+
+        // After completing read operation, manually quiesce
+        read_txn.cache.inner.try_quiesce();
     }
 }
 
@@ -150,7 +165,7 @@ pub extern "C" fn cache_char_write_begin(
 pub extern "C" fn cache_char_write_commit(write_txn: *mut ARCacheCharWrite) {
     debug_assert!(!write_txn.is_null());
     let wr = unsafe { Box::from_raw(write_txn) };
-    (*wr).inner.commit();
+    let _stats = (*wr).inner.commit();
 }
 
 #[no_mangle]
@@ -197,6 +212,45 @@ mod tests {
         assert!(!cache_char_read_get(read_txn, k1.as_ptr()).is_null());
 
         cache_char_read_complete(read_txn);
+        cache_char_free(cache_ptr);
+    }
+
+    #[test]
+    fn test_cache_stats() {
+        let cache_ptr = cache_char_create(1024, 8);
+
+        let mut reader_hits = 0;
+        let mut reader_includes = 0;
+        let mut write_hits = 0;
+        let mut write_inc_or_mod = 0;
+        let mut shared_max = 0;
+        let mut freq = 0;
+        let mut recent = 0;
+        let mut freq_evicts = 0;
+        let mut recent_evicts = 0;
+        let mut p_weight = 0;
+        let mut all_seen_keys = 0;
+
+        cache_char_stats(
+            cache_ptr,
+            &mut reader_hits,
+            &mut reader_includes,
+            &mut write_hits,
+            &mut write_inc_or_mod,
+            &mut shared_max,
+            &mut freq,
+            &mut recent,
+            &mut freq_evicts,
+            &mut recent_evicts,
+            &mut p_weight,
+            &mut all_seen_keys,
+        );
+
+        // Basic sanity checks
+        assert_eq!(shared_max, 1024);
+        assert_eq!(freq, 0);
+        assert_eq!(recent, 0);
+
         cache_char_free(cache_ptr);
     }
 }
