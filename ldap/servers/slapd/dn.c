@@ -58,7 +58,7 @@ struct ndn_cache {
 
 /*
  * This means we need 1 MB minimum per thread
- * 
+ *
  */
 #define NDN_CACHE_MINIMUM_CAPACITY 1048576
 /*
@@ -2870,6 +2870,8 @@ int32_t
 ndn_cache_init()
 {
     ndn_enabled = config_get_ndn_cache_enabled();
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_init",
+                      "Initializing NDN cache - enabled: %d\n", ndn_enabled);
     if (ndn_enabled == 0) {
         /*
          * Don't configure the keys or anything, need a restart
@@ -2891,6 +2893,11 @@ ndn_cache_init()
     uintptr_t max_thread_read = 0;
     /* Setup the main cache which all other caches will inherit. */
     cache = cache_char_create(max_estimate, max_thread_read);
+    if (cache) {
+            slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_init",
+                          "Cache created with max_estimate: %lu, max_thread_read: %lu\n",
+                          max_estimate, max_thread_read);
+    }
 
     return 0;
 }
@@ -2938,12 +2945,18 @@ ndn_cache_lookup(char *dn, size_t dn_len, char **ndn, char **udn, int32_t *rc)
         *rc = 0;
         return 1;
     }
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_lookup",
+                          "Looking up DN (len: %zu) - enabled: %d, import_tasks: %d\n",
+                          dn_len, ndn_enabled, ndn_import_task_count);
 
     /* Look for it */
     ARCacheCharRead *read_txn = cache_char_read_begin(cache);
     PR_ASSERT(read_txn);
 
     const char *cache_ndn = cache_char_read_get(read_txn, dn);
+    // After cache lookup
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_lookup",
+                    "Lookup result - found: %d\n", (cache_ndn != NULL));
     if (cache_ndn != NULL) {
         *ndn = slapi_ch_strdup(cache_ndn);
         /*
@@ -2975,11 +2988,14 @@ ndn_cache_add(char *dn, size_t dn_len, char *ndn, size_t ndn_len)
         /* we need to null terminate the ndn */
         *(ndn + ndn_len) = '\0';
     }
-
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_add",
+                      "Adding DN (len: %zu) - enabled: %d, import_tasks: %d\n",
+                      dn_len, ndn_enabled, ndn_import_task_count);
     ARCacheCharRead *read_txn = cache_char_read_begin(cache);
     PR_ASSERT(read_txn);
     cache_char_read_include(read_txn, dn, ndn);
     cache_char_read_complete(read_txn);
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_add", "DN added to cache\n");
     /*
      * We need to free dn - in the original ndn cache, the dn is added to the
      * hashmap, but in the rust one, it's cloned to a cstring, so we no longer
@@ -2999,6 +3015,12 @@ ndn_cache_get_stats(uint64_t *hits, uint64_t *tries, uint64_t *size, uint64_t *m
      * not really accurate to begin with anyway, but you know, this is a best
      * effort for stats for the user to see.
      */
+
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_get_stats",
+                    "Getting stats - cache enabled: %d\n", ndn_enabled);
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_get_stats",
+                    "Reading raw stats from cache\n");
+
     uint64_t reader_hits;
     uint64_t reader_includes;
     uint64_t write_hits;
@@ -3008,7 +3030,7 @@ ndn_cache_get_stats(uint64_t *hits, uint64_t *tries, uint64_t *size, uint64_t *m
     uint64_t freq_evicts;
     uint64_t recent_evicts;
     uint64_t p_weight;
-    cache_char_stats(cache, 
+    cache_char_stats(cache,
         &reader_hits,
         &reader_includes,
         &write_hits,
@@ -3021,6 +3043,10 @@ ndn_cache_get_stats(uint64_t *hits, uint64_t *tries, uint64_t *size, uint64_t *m
         &p_weight,
         slots
     );
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_get_stats",
+                        "Raw stats: reader_hits=%lu reader_includes=%lu write_hits=%lu write_inc=%lu\n",
+                        reader_hits, reader_includes, write_hits, write_inc_or_mod);
+
     /* ARCache stores by key count not size, so we recombine with the avg entry size */
     *max_size = *max_size * NDN_ENTRY_AVG_SIZE;
     *thread_size = 0;
@@ -3029,6 +3055,9 @@ ndn_cache_get_stats(uint64_t *hits, uint64_t *tries, uint64_t *size, uint64_t *m
     *tries = *hits + reader_includes + write_inc_or_mod;
     *size = (freq + recent) * NDN_ENTRY_AVG_SIZE;
     *count = (freq + recent);
+    slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_get_stats",
+                        "Final stats: hits=%lu tries=%lu size=%lu count=%lu evicts=%lu\n",
+                        *hits, *tries, *size, *count, *evicts);
 }
 
 /* Common ancestor sdn is allocated.

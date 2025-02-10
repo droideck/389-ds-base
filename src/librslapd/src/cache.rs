@@ -60,12 +60,28 @@ pub extern "C" fn cache_char_stats(
         debug_assert!(!cache.is_null());
         &(*cache)
     };
+    println!("DEBUG: Reading cache stats...");
 
     let read_txn = cache_ref.inner.read_stats(ReadCountStat::default());
     let read_stats = read_txn.finish();
+    println!(
+        "DEBUG: Read stats - hits: {}, includes: {}",
+        read_stats.main_hit + read_stats.local_hit,
+        read_stats.include + read_stats.local_include
+    );
 
     let write_txn = cache_ref.inner.write_stats(WriteCountStat::default());
     let write_stats = write_txn.commit();
+    println!(
+        "DEBUG: Write stats - hits: {}, includes: {}",
+        write_stats.read_hits, write_stats.read_hits
+    );
+    println!("DEBUG: Write stats - shared_max: {}, freq: {}, recent: {}, p_weight: {}, all_seen_keys: {}",
+                 write_stats.shared_max,
+                 write_stats.freq,
+                 write_stats.recent,
+                 write_stats.p_weight,
+                 write_stats.all_seen_keys);
 
     *reader_hits = read_stats.main_hit + read_stats.local_hit;
     *reader_includes = read_stats.include + read_stats.local_include;
@@ -78,6 +94,7 @@ pub extern "C" fn cache_char_stats(
     *p_weight = write_stats.p_weight;
     *all_seen_keys = write_stats.all_seen_keys;
 
+    // TODO: Implement these stats
     *freq_evicts = 0;
     *recent_evicts = 0;
 }
@@ -89,10 +106,12 @@ pub extern "C" fn cache_char_read_begin(cache: *mut ARCacheChar) -> *mut ARCache
         debug_assert!(!cache.is_null());
         &(*cache) as &ARCacheChar
     };
+    println!("DEBUG: Starting read txn...");
     let read_txn = Box::new(ARCacheCharRead {
         inner: cache_ref.inner.read(),
         cache: cache_ref,
     });
+    println!("DEBUG: Started read txn");
     Box::into_raw(read_txn)
 }
 
@@ -100,10 +119,12 @@ pub extern "C" fn cache_char_read_begin(cache: *mut ARCacheChar) -> *mut ARCache
 pub extern "C" fn cache_char_read_complete(read_txn: *mut ARCacheCharRead) {
     debug_assert!(!read_txn.is_null());
     unsafe {
+        println!("DEBUG: Completing read txn...");
         let read_txn = Box::from_raw(read_txn);
 
         // After completing read operation, manually quiesce
         read_txn.cache.inner.try_quiesce();
+        println!("DEBUG: Quiescing cache...");
     }
 }
 
@@ -112,6 +133,7 @@ pub extern "C" fn cache_char_read_get(
     read_txn: *mut ARCacheCharRead,
     key: *const c_char,
 ) -> *const c_char {
+    println!("DEBUG: Reading from cache...");
     let read_txn_ref = unsafe {
         debug_assert!(!read_txn.is_null());
         &mut (*read_txn) as &mut ARCacheCharRead
@@ -119,6 +141,7 @@ pub extern "C" fn cache_char_read_get(
 
     let key_ref = unsafe { CStr::from_ptr(key) };
     let key_dup = CString::from(key_ref);
+    println!("DEBUG: Key: {:?}", key_dup);
 
     // Return a null pointer on miss.
     read_txn_ref
@@ -134,6 +157,7 @@ pub extern "C" fn cache_char_read_include(
     key: *const c_char,
     val: *const c_char,
 ) {
+    println!("DEBUG: Adding to read cache...");
     let read_txn_ref = unsafe {
         debug_assert!(!read_txn.is_null());
         &mut (*read_txn) as &mut ARCacheCharRead
@@ -145,12 +169,14 @@ pub extern "C" fn cache_char_read_include(
     let val_ref = unsafe { CStr::from_ptr(val) };
     let val_dup = CString::from(val_ref);
     read_txn_ref.inner.insert(key_dup, val_dup);
+    println!("DEBUG: Added to read cache");
 }
 
 #[no_mangle]
 pub extern "C" fn cache_char_write_begin(
     cache: *mut ARCacheChar,
 ) -> *mut ARCacheCharWrite<'static> {
+    println!("DEBUG: Starting write txn...");
     let cache_ref = unsafe {
         debug_assert!(!cache.is_null());
         &(*cache) as &ARCacheChar
@@ -158,14 +184,17 @@ pub extern "C" fn cache_char_write_begin(
     let write_txn = Box::new(ARCacheCharWrite {
         inner: cache_ref.inner.write(),
     });
+    println!("DEBUG: Started write txn");
     Box::into_raw(write_txn)
 }
 
 #[no_mangle]
 pub extern "C" fn cache_char_write_commit(write_txn: *mut ARCacheCharWrite) {
     debug_assert!(!write_txn.is_null());
+    println!("DEBUG: Committing write txn...");
     let wr = unsafe { Box::from_raw(write_txn) };
     let _stats = (*wr).inner.commit();
+    println!("DEBUG: Committed write txn");
 }
 
 #[no_mangle]
@@ -182,6 +211,7 @@ pub extern "C" fn cache_char_write_include(
     key: *const c_char,
     val: *const c_char,
 ) {
+    println!("DEBUG: Adding to write cache...");
     let write_txn_ref = unsafe {
         debug_assert!(!write_txn.is_null());
         &mut (*write_txn) as &mut ARCacheCharWrite
@@ -193,6 +223,7 @@ pub extern "C" fn cache_char_write_include(
     let val_ref = unsafe { CStr::from_ptr(val) };
     let val_dup = CString::from(val_ref);
     write_txn_ref.inner.insert(key_dup, val_dup);
+    println!("DEBUG: Added to write cache");
 }
 
 #[cfg(test)]
