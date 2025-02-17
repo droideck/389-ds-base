@@ -1,47 +1,8 @@
 // This exposes C-FFI capable bindings for the concread concurrently readable cache.
-use concread::arcache::stats::{ARCacheWriteStat, ReadCountStat};
+use concread::arcache::stats::ARCacheWriteStat;
 use concread::arcache::{ARCache, ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn};
-use concread::cowcell::CowCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-
-#[derive(Clone, Debug, Default)]
-struct CacheStats {
-    p_weight: u64,
-    shared_max: u64,
-    freq: u64,
-    recent: u64,
-    all_seen_keys: u64,
-    reader_hits: u64,      // Hits from read transactions (main + local)
-    reader_includes: u64,  // Number of includes from read transactions
-    write_hits: u64,       // Hits from write transactions
-    write_inc_or_mod: u64, // Number of includes/modifications from write transactions
-    freq_evicts: u64,      // Number of evictions from frequent set
-    recent_evicts: u64,    // Number of evictions from recent set
-}
-
-impl CacheStats {
-    fn new() -> Self {
-        CacheStats::default()
-    }
-
-    fn update_from_read_stat(&mut self, stat: ReadCountStat) {
-        self.reader_hits += stat.main_hit + stat.local_hit;
-        self.reader_includes += stat.include + stat.local_include;
-    }
-
-    fn update_from_write_stat(&mut self, stat: &FFIWriteStat) {
-        self.write_hits += stat.read_hits;
-        self.write_inc_or_mod += stat.includes + stat.modifications;
-        self.freq_evicts += stat.freq_evictions;
-        self.recent_evicts += stat.recent_evictions;
-        self.p_weight = stat.p_weight;
-        self.shared_max = stat.shared_max;
-        self.freq = stat.freq;
-        self.recent = stat.recent;
-        self.all_seen_keys = stat.all_seen_keys;
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct FFIWriteStat {
@@ -126,29 +87,23 @@ impl<K> ARCacheWriteStat<K> for FFIWriteStat {
 
 pub struct ARCacheChar {
     inner: ARCache<CString, CString>,
-    stats: CowCell<CacheStats>,
 }
 
 pub struct ARCacheCharRead<'a> {
-    inner: ARCacheReadTxn<'a, CString, CString, ReadCountStat>,
-    cache: &'a ARCacheChar,
+    inner: ARCacheReadTxn<'a, CString, CString, ()>,
 }
 
 pub struct ARCacheCharWrite<'a> {
-    inner: ARCacheWriteTxn<'a, CString, CString, FFIWriteStat>,
-    cache: &'a ARCacheChar,
+    inner: ARCacheWriteTxn<'a, CString, CString, ()>,
 }
 
 impl ARCacheChar {
     fn new(max: usize, read_max: usize) -> Option<Self> {
         ARCacheBuilder::new()
             .set_size(max, read_max)
-            .set_reader_quiesce(false)
+            .set_reader_quiesce(true)
             .build()
-            .map(|inner| Self {
-                inner,
-                stats: CowCell::new(CacheStats::new()),
-            })
+            .map(|inner| Self { inner })
     }
 }
 
@@ -184,24 +139,22 @@ pub extern "C" fn cache_char_stats(
     p_weight: &mut u64,
     all_seen_keys: &mut u64,
 ) {
-    let cache_ref = unsafe {
+    let _cache_ref = unsafe {
         debug_assert!(!cache.is_null());
         &(*cache)
     };
 
-    // Get stats snapshot
-    let stats_read = cache_ref.stats.read();
-    *reader_hits = stats_read.reader_hits;
-    *reader_includes = stats_read.reader_includes;
-    *write_hits = stats_read.write_hits;
-    *write_inc_or_mod = stats_read.write_inc_or_mod;
-    *freq_evicts = stats_read.freq_evicts;
-    *recent_evicts = stats_read.recent_evicts;
-    *p_weight = stats_read.p_weight;
-    *shared_max = stats_read.shared_max;
-    *freq = stats_read.freq;
-    *recent = stats_read.recent;
-    *all_seen_keys = stats_read.all_seen_keys;
+    *reader_hits = 0;
+    *reader_includes = 0;
+    *write_hits = 0;
+    *write_inc_or_mod = 0;
+    *shared_max = 0;
+    *freq = 0;
+    *recent = 0;
+    *freq_evicts = 0;
+    *recent_evicts = 0;
+    *p_weight = 0;
+    *all_seen_keys = 0;
 }
 
 // start read
@@ -212,8 +165,7 @@ pub extern "C" fn cache_char_read_begin(cache: *mut ARCacheChar) -> *mut ARCache
         &(*cache) as &ARCacheChar
     };
     let read_txn = Box::new(ARCacheCharRead {
-        inner: cache_ref.inner.read_stats(ReadCountStat::default()),
-        cache: cache_ref,
+        inner: cache_ref.inner.read(),
     });
     Box::into_raw(read_txn)
 }
@@ -224,17 +176,7 @@ pub extern "C" fn cache_char_read_complete(read_txn: *mut ARCacheCharRead) {
 
     unsafe {
         let read_txn_box = Box::from_raw(read_txn);
-        let read_stats = read_txn_box.inner.finish();
-        let write_stats = read_txn_box
-            .cache
-            .inner
-            .try_quiesce_stats(FFIWriteStat::default());
-
-        // Update stats
-        let mut stats_write = read_txn_box.cache.stats.write();
-        stats_write.update_from_read_stat(read_stats);
-        stats_write.update_from_write_stat(&write_stats);
-        stats_write.commit();
+        let _read_stats = read_txn_box.inner.finish();
     }
 }
 
@@ -287,8 +229,7 @@ pub extern "C" fn cache_char_write_begin(
         &(*cache) as &ARCacheChar
     };
     let write_txn = Box::new(ARCacheCharWrite {
-        inner: cache_ref.inner.write_stats(FFIWriteStat::default()),
-        cache: cache_ref,
+        inner: cache_ref.inner.write(),
     });
     Box::into_raw(write_txn)
 }
@@ -298,11 +239,7 @@ pub extern "C" fn cache_char_write_commit(write_txn: *mut ARCacheCharWrite) {
     debug_assert!(!write_txn.is_null());
     unsafe {
         let write_txn_box = Box::from_raw(write_txn);
-        let current_stats = write_txn_box.inner.commit();
-
-        let mut stats_write = write_txn_box.cache.stats.write();
-        stats_write.update_from_write_stat(&current_stats);
-        stats_write.commit();
+        let _current_stats = write_txn_box.inner.commit();
     }
 }
 
