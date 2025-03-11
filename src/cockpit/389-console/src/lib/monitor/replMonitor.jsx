@@ -45,7 +45,7 @@ export class ReplMonitor extends React.Component {
             logData: "",
             showBindModal: false,
             showLogModal: false,
-            showFullReportModal: false,
+            showFullLagReportModal: false,
             showReportLoginModal: false,
             showCredentialsModal: false,
             showAliasesModal: false,
@@ -140,7 +140,7 @@ export class ReplMonitor extends React.Component {
 
         this.handleFullReport = this.handleFullReport.bind(this);
         this.processCredsInput = this.processCredsInput.bind(this);
-        this.closeReportModal = this.closeReportModal.bind(this);
+        this.closeLagReportModal = this.closeLagReportModal.bind(this);
         this.refreshFullReport = this.refreshFullReport.bind(this);
 
         this.handleMinusConfig = this.handleMinusConfig.bind(this);
@@ -176,7 +176,7 @@ export class ReplMonitor extends React.Component {
 
             this.timer = window.setTimeout(() => {
                 this.setState({
-                    showFullReportModal: false
+                    showFullLagReportModal: false
                 });
                 this.timer = null;
             }, 300);
@@ -912,7 +912,7 @@ export class ReplMonitor extends React.Component {
                     const report_reparsed = { ...report, items: supplier_reparsed };
                     this.setState({
                         reportData: report_reparsed.items,
-                        showFullReportModal: true,
+                        showFullLagReportModal: true,
                         reportLoading: false,
                         doFullReportCleanup: true
                     });
@@ -1048,9 +1048,9 @@ export class ReplMonitor extends React.Component {
         }
     }
 
-    closeReportModal() {
+    closeLagReportModal() {
         this.setState({
-            showFullReportModal: false,
+            showFullLagReportModal: false,
             reportLoading: false
         });
     }
@@ -1250,7 +1250,7 @@ export class ReplMonitor extends React.Component {
         const reportData = this.state.reportData;
         const credentialsList = this.state.credentialsList;
         const aliasesList = this.state.aliasesList;
-        const fullReportModal = "";
+        const fullLagReportModal = "";
         let reportLoginModal = "";
         let reportCredentialsModal = "";
         let reportAliasesModal = "";
@@ -1527,7 +1527,7 @@ export class ReplMonitor extends React.Component {
                 </div>
 
                 {reportContent}
-                {fullReportModal}
+                {fullLagReportModal}
                 {reportLoginModal}
                 {reportCredentialsModal}
                 {reportAliasesModal}
