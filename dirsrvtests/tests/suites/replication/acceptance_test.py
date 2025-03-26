@@ -869,6 +869,101 @@ def test_default_cl_trimming_enabled(topo_m2):
     assert cl.get_attr_val_utf8("nsslapd-changelogmaxage") == "7d"
 
 
+def test_replication_noop_concurrent_delete(topo_m4):
+    """Check for NOOP operations when entries are deleted concurrently
+
+    :id: b06d4113-1c0f-4b27-abf3-44f6fde31239
+    :setup: Four suppliers replication setup
+    :steps:
+        1. Add a test entry to supplier1 using UserAccounts
+        2. Verify entry replicates to all suppliers
+        3. Pause replication agreements between suppliers
+        4. Delete the entry on all suppliers concurrently
+        5. Resume replication agreements
+        6. Check logs for NOOP operations
+    :expectedresults:
+        1. Entry should be successfully added
+        2. Entry should replicate to all suppliers
+        3. Replication should be paused
+        4. Deletion operations should succeed
+        5. Replication should be resumed
+        6. NOOP operations should be detected in logs of at least one supplier
+    """
+
+    # Get all suppliers
+    suppliers = [
+        topo_m4.ms["supplier1"],
+        topo_m4.ms["supplier2"],
+        topo_m4.ms["supplier3"],
+        topo_m4.ms["supplier4"]
+    ]
+
+    # Delete logs
+    for inst in suppliers:
+        inst.deleteAccessLogs()
+        inst.restart()
+
+    # Enable replication debugging
+    log.info('Set replication debugging log levels')
+    for inst in suppliers:
+        inst.config.set('nsslapd-errorlog-level', '8192')  # Replication debugging level
+
+    # Create a test entry on supplier1 using UserAccounts
+    test_entry_uid = 'noop_test_user'
+    log.info('Adding user {} using UserAccounts'.format(test_entry_uid))
+    users = UserAccounts(topo_m4.ms["supplier1"], DEFAULT_SUFFIX)
+    user = users.create(properties={
+        'uid': test_entry_uid,
+        'cn': test_entry_uid,
+        'sn': 'User',
+        'uidNumber': '1002',
+        'gidNumber': '1002',
+        'homeDirectory': '/home/testuser',
+        'userPassword': 'password',
+    })
+    test_entry_dn = user.dn
+
+    # Wait for replication to sync the entry to all suppliers
+    repl = ReplicationManager(DEFAULT_SUFFIX)
+    for i in range(2, 5):
+        repl.wait_for_replication(topo_m4.ms["supplier1"], topo_m4.ms[f"supplier{i}"])
+
+    # Verify entry exists on all suppliers
+    for i in range(1, 5):
+        entries = topo_m4.ms[f"supplier{i}"].search_s(test_entry_dn, ldap.SCOPE_BASE, "objectclass=*")
+        assert entries, f"Entry did not replicate to supplier{i}"
+    log.info('Entry successfully replicated to all suppliers')
+
+    # Pause replication agreements
+    log.info('Pausing all replication agreements')
+    topo_m4.pause_all_replicas()
+
+    # Delete entry on all suppliers
+    for i in range(1, 5):
+        log.info(f'Deleting entry {test_entry_dn} from supplier{i}')
+        users = UserAccounts(topo_m4.ms[f"supplier{i}"], DEFAULT_SUFFIX)
+        user = users.get(test_entry_dn)
+        user.delete()
+
+    log.info('Resuming all replication agreements')
+    topo_m4.resume_all_replicas()
+
+    # Wait for replication to process updates
+    for i in range(1, 5):
+        repl.wait_for_replication(topo_m4.ms[f"supplier{i}"], topo_m4.ms["supplier1"])
+
+    log.info('Checking logs for NOOP operations')
+    noop_found = False
+    for i in range(1, 5):
+        noop_match = topo_m4.ms[f"supplier{i}"].ds_access_log.match('.*NOOP.*')
+        if noop_match:
+            log.info(f'Found NOOP operation in supplier{i} logs')
+            noop_found = True
+
+    # Assert that we detected NOOP operations in at least one supplier
+    assert noop_found, "Expected NOOP operation not found in logs of any supplier"
+
+
 if __name__ == '__main__':
     # Run isolated
     # -s for DEBUG mode
