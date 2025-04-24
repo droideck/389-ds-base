@@ -129,6 +129,14 @@ def db_monitor(inst, basedn, log, args):
     # Gather the global DB stats
     report_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ldbm_mon = ldbm_monitor.get_status()
+    ndn_cache_enabled = inst.config.get_attr_val_utf8('nsslapd-ndn-cache-enabled') == 'on'
+
+    # Build global cache stats
+    result = {
+        'date': report_time,
+        'backends': {},
+    }
+
     if ldbm_monitor.inst_db_impl == DB_IMPL_BDB:
         dbcachesize = int(ldbm_mon['nsslapd-db-cache-size-bytes'][0])
         # Warning: there are two different page sizes associated with bdb:
@@ -153,21 +161,14 @@ def db_monitor(inst, basedn, log, args):
         dbcachefree = max(int(dbcachesize - (pagesize * dbpages)), 0)
         dbcachefreeratio = dbcachefree/dbcachesize
 
-    ndn_cache_enabled = inst.config.get_attr_val_utf8('nsslapd-ndn-cache-enabled') == 'on'
-
-    # Build global cache stats
-    result = {
-        'date': report_time,
-        'dbcache': {
-            'hit_ratio': dbhitratio,
-            'free': convert_bytes(str(dbcachefree)),
-            'free_percentage': "{:.1f}".format(dbcachefreeratio * 100),
-            'roevicts': dbroevict,
-            'pagein': dbcachepagein,
-            'pageout': dbcachepageout
-        },
-        'backends': {},
-    }
+        result['dbcache'] = {
+                'hit_ratio': dbhitratio,
+                'free': convert_bytes(str(dbcachefree)),
+                'free_percentage': "{:.1f}".format(dbcachefreeratio * 100),
+                'roevicts': dbroevict,
+                'pagein': dbcachepagein,
+                'pageout': dbcachepageout
+        }
 
     # Add NDN cache stats only if enabled
     if ndn_cache_enabled:
@@ -189,16 +190,6 @@ def db_monitor(inst, basedn, log, args):
             'free_percentage': ndnfreeratio,
             'count': ndncount,
             'evictions': ndnevictions
-        }
-
-    if ldbm_monitor.inst_db_impl == DB_IMPL_BDB:
-        result['dbcache'] = {
-                'hit_ratio': dbhitratio,
-                'free': convert_bytes(str(dbcachefree)),
-                'free_percentage': "{:.1f}".format(dbcachefreeratio * 100),
-                'roevicts': dbroevict,
-                'pagein': dbcachepagein,
-                'pageout': dbcachepageout
         }
 
     # Build the backend results
