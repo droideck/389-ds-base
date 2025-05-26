@@ -463,16 +463,9 @@ autoreconf -fiv
 
 # lib389
 pushd ./src/lib389
-python3 validate_version.py --update
+%{python3} validate_version.py --update
 %pyproject_wheel
 popd
-
-# argparse-manpage dynamic man pages have hardcoded man v1 in header,
-# need to change it to v8
-sed -i  "1s/\"1\"/\"8\"/" %{_builddir}/%{name}-%{version}/src/lib389/man/dsconf.8
-sed -i  "1s/\"1\"/\"8\"/" %{_builddir}/%{name}-%{version}/src/lib389/man/dsctl.8
-sed -i  "1s/\"1\"/\"8\"/" %{_builddir}/%{name}-%{version}/src/lib389/man/dsidm.8
-sed -i  "1s/\"1\"/\"8\"/" %{_builddir}/%{name}-%{version}/src/lib389/man/dscreate.8
 
 # Generate symbolic info for debuggers
 export XCFLAGS=$RPM_OPT_FLAGS
@@ -771,6 +764,7 @@ fi
 %{_mandir}/man8/dsctl.8.gz
 %{_mandir}/man8/dsidm.8.gz
 %{_mandir}/man8/openldap_to_ds.8.gz
+%exclude %{_mandir}/man1
 # Bash completions for scripts provided by python-lib389
 %{bash_completions_dir}/dsctl
 %{bash_completions_dir}/dsconf
