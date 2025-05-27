@@ -16,7 +16,7 @@ crate-type = ["staticlib", "lib"]
 [dependencies]
 slapd = { path = "../slapd" }
 libc = "0.2"
-concread = "0.5.4"
+concread = { git = "https://github.com/droideck/concread", rev = "e4f15cb6d9c81ba041e8c42179309e09ad6330b7" }
 
 [build-dependencies]
 cbindgen = "0.26"
