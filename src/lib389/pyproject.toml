@@ -11,7 +11,6 @@ requires = [
     "distro",
     "cryptography",
     "psutil",
-    "pytest",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -92,3 +91,6 @@ manpages = [
 
 [tool.setuptools.packages.find]
 include = ["lib389", "lib389.*"]
+
+[dependency-groups]
+test = ["pytest"]

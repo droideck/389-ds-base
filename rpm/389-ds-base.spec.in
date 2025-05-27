@@ -354,7 +354,7 @@ A cockpit UI Plugin for configuring and administering the 389 Directory Server
 
 %generate_buildrequires
 cd src/lib389
-%pyproject_buildrequires
+%pyproject_buildrequires -g test
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -751,6 +751,7 @@ fi
 
 %files -n python%{python3_pkgversion}-lib389 -f %{pyproject_files}
 %doc src/lib389/README.md
+%license LICENSE LICENSE.GPLv3+
 # Binaries
 %{_bindir}/dsconf
 %{_bindir}/dscreate
