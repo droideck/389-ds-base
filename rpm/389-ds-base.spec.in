@@ -304,20 +304,8 @@ Requires: openssl
 # This is for /usr/bin/c_rehash tool, only needed for openssl < 1.1.0
 Requires: openssl-perl
 Requires: iproute
-Requires: python%{python3_pkgversion}
-Requires: python%{python3_pkgversion}-distro
-Requires: python%{python3_pkgversion}-pytest
-Requires: python%{python3_pkgversion}-ldap
-Requires: python%{python3_pkgversion}-pyasn1
-Requires: python%{python3_pkgversion}-pyasn1-modules
-Requires: python%{python3_pkgversion}-dateutil
-Requires: python%{python3_pkgversion}-argcomplete
 Requires: python%{python3_pkgversion}-libselinux
-Requires: python%{python3_pkgversion}-setuptools
-Requires: python%{python3_pkgversion}-cryptography
-Requires: python%{python3_pkgversion}-psutil
 Recommends: bash-completion
-%{?python_provide:%python_provide python%{python3_pkgversion}-lib389}
 
 %description -n python%{python3_pkgversion}-lib389
 This module contains tools and libraries for accessing, testing,
@@ -766,7 +754,7 @@ fi
 %{_mandir}/man8/dsidm.8.gz
 %{_mandir}/man8/openldap_to_ds.8.gz
 %exclude %{_mandir}/man1
-# Bash completions for scripts provided by python-lib389
+# Bash completions for scripts provided by python3-lib389
 %{bash_completions_dir}/dsctl
 %{bash_completions_dir}/dsconf
 %{bash_completions_dir}/dscreate

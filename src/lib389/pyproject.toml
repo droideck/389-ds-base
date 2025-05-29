@@ -1,7 +1,7 @@
 [build-system]
+# argparse-manpage needs all the runtime requires repeated here
 requires = [
     "setuptools",
-    "wheel",
     "argparse-manpage[setuptools]",
     "pyasn1",
     "pyasn1-modules",
