@@ -60,7 +60,7 @@ shadowWarning: 7
 homeDirectory: /home/user[A]
 loginShell: /bin/false
 """
-        with open('/tmp/ldclt_template_lib389.ldif', 'wb') as f:
+        with open('/tmp/ldclt_template_lib389.ldif', 'w') as f:
             f.write(template)
         # call ldclt with the current rootdn and rootpass
         digits = len('%s' % max)
@@ -164,3 +164,22 @@ loginShell: /bin/false
             'randomattrlist=cn:uid:ou',
         ]
         return self._run_ldclt(cmd)
+
+    def base_search_loadtest(self, base_dn, low=1, high=9999,
+                             threads=10, rounds=3):
+        cmd = [
+            '%s/ldclt' % self.ds.get_bin_dir(),
+            '-h', self.ds.host,
+            '-p', '%s' % self.ds.port,
+            '-n', '%s' % threads,
+            '-N', '%s' % rounds,
+            '-b', base_dn,
+            '-s', 'base',
+            '-f', '(objectclass=*)',
+            '-e', 'esearch,randombase,'
+                  'randombaselow=%s,randombasehigh=%s' % (low, high),
+        ]
+        result = self._run_ldclt(cmd)
+        if result is not None:
+            return float(result)
+        return None

@@ -17,6 +17,18 @@ crate-type = ["staticlib", "lib"]
 slapd = { path = "../slapd" }
 libc = "0.2"
 concread = "0.5.10"
+ahash = "0.8"
+hashbrown = "0.15"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+rand_distr = "0.4"
 
 [build-dependencies]
 cbindgen = "0.26"
+
+[[bench]]
+name = "ndn_cache"
+harness = false

@@ -241,3 +241,6 @@ vendor.tar.gz
 /rust-slapi-private.h
 /src/target
 src/lib389/lib389/tests/topologies.py
+/bench_results_mac
+/ndn_research
+/bench_results_vm

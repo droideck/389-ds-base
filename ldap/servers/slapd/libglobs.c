@@ -1206,6 +1206,11 @@ static struct config_get_and_set
      NULL, 0,
      (void **)&global_slapdFrontendConfig.ndn_cache_max_size,
      CONFIG_INT, (ConfigGetFunc)config_get_ndn_cache_size, SLAPD_DEFAULT_NDN_SIZE_STR, NULL},
+    {CONFIG_NDN_CACHE_BACKEND, config_set_ndn_cache_backend,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.ndn_cache_backend,
+     CONFIG_STRING, (ConfigGetFunc)config_get_ndn_cache_backend,
+     SLAPD_DEFAULT_NDN_CACHE_BACKEND, NULL},
     /* The issue here is that we probably need "empty string" to be valid, rather than NULL for reset purposes */
     {CONFIG_ALLOWED_SASL_MECHS, config_set_allowed_sasl_mechs,
      NULL, 0,
@@ -2052,6 +2057,7 @@ FrontendConfig_init(void)
     init_disk_logging_critical = cfg->disk_logging_critical = LDAP_OFF;
     init_ndn_cache_enabled = cfg->ndn_cache_enabled = LDAP_ON;
     cfg->ndn_cache_max_size = SLAPD_DEFAULT_NDN_SIZE;
+    cfg->ndn_cache_backend = slapi_ch_strdup(SLAPD_DEFAULT_NDN_CACHE_BACKEND);
     init_sasl_mapping_fallback = cfg->sasl_mapping_fallback = LDAP_OFF;
     init_ignore_vattrs = cfg->ignore_vattrs = LDAP_ON;
     cfg->sasl_max_bufsize = SLAPD_DEFAULT_SASL_MAXBUFSIZE;
@@ -2665,6 +2671,37 @@ config_set_ndn_cache_max_size(const char *attrname, char *value, char *errorbuf,
     }
 
     return retVal;
+}
+
+int
+config_set_ndn_cache_backend(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+
+    if (!apply) {
+        return LDAP_SUCCESS;
+    }
+
+    if (value == NULL || *value == '\0') {
+        value = SLAPD_DEFAULT_NDN_CACHE_BACKEND;
+    }
+
+    if (strcmp(value, "concread") != 0 &&
+        strcmp(value, "disabled") != 0 &&
+        strcmp(value, "s3fifo") != 0)
+    {
+        slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                              "%s: invalid value \"%s\". Valid values: concread, disabled, s3fifo",
+                              attrname, value);
+        return LDAP_UNWILLING_TO_PERFORM;
+    }
+
+    CFG_LOCK_WRITE(slapdFrontendConfig);
+    slapi_ch_free_string(&slapdFrontendConfig->ndn_cache_backend);
+    slapdFrontendConfig->ndn_cache_backend = slapi_ch_strdup(value);
+    CFG_UNLOCK_WRITE(slapdFrontendConfig);
+
+    return LDAP_SUCCESS;
 }
 
 int
@@ -7929,6 +7966,17 @@ config_get_ndn_cache_enabled()
 {
     slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
     return slapi_atomic_load_32(&(slapdFrontendConfig->ndn_cache_enabled), __ATOMIC_ACQUIRE);
+}
+
+char *
+config_get_ndn_cache_backend()
+{
+    char *retVal;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    CFG_LOCK_READ(slapdFrontendConfig);
+    retVal = slapi_ch_strdup(slapdFrontendConfig->ndn_cache_backend);
+    CFG_UNLOCK_READ(slapdFrontendConfig);
+    return retVal;
 }
 
 int32_t

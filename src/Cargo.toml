@@ -14,4 +14,8 @@ members = [
 panic = "abort"
 lto = true
 
+[profile.bench]
+lto = false
+opt-level = 3
+
 

@@ -411,6 +411,7 @@ int config_set_errorlog_time_format(const char *attrname, char *value, char *err
 int config_set_external_libs_debug_enabled(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_ndn_cache_enabled(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_ndn_cache_max_size(const char *attrname, char *value, char *errorbuf, int apply);
+int config_set_ndn_cache_backend(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_unhashed_pw_switch(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_return_orig_type_switch(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_sasl_maxbufsize(const char *attrname, char *value, char *errorbuf, int apply);
@@ -590,6 +591,7 @@ int config_get_disk_logging_critical(void);
 int config_get_ndn_cache_count(void);
 uint64_t config_get_ndn_cache_size(void);
 int config_get_ndn_cache_enabled(void);
+char *config_get_ndn_cache_backend(void);
 int config_get_return_orig_type_switch(void);
 char *config_get_allowed_sasl_mechs(void);
 char **config_get_allowed_sasl_mechs_array(void);

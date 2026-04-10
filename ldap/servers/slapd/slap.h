@@ -311,6 +311,7 @@ typedef void (*VFPV)(); /* takes undefined arguments */
 
 #define SLAPD_DEFAULT_NDN_SIZE     20971520
 #define SLAPD_DEFAULT_NDN_SIZE_STR "20971520"
+#define SLAPD_DEFAULT_NDN_CACHE_BACKEND "concread"
 
 #define SLAPD_DEFAULT_DIRECTORY_MANAGER "cn=Directory Manager"
 #define SLAPD_DEFAULT_UIDNUM_TYPE       "uidNumber"
@@ -2415,6 +2416,7 @@ typedef struct _slapdEntryPoints
 #define CONFIG_DISK_LOGGING_CRITICAL "nsslapd-disk-monitoring-logging-critical"
 #define CONFIG_NDN_CACHE "nsslapd-ndn-cache-enabled"
 #define CONFIG_NDN_CACHE_SIZE "nsslapd-ndn-cache-max-size"
+#define CONFIG_NDN_CACHE_BACKEND "nsslapd-ndn-cache-backend"
 #define CONFIG_ALLOWED_SASL_MECHS "nsslapd-allowed-sasl-mechanisms"
 #define CONFIG_IGNORE_VATTRS "nsslapd-ignore-virtual-attrs"
 #define CONFIG_SASL_MAPPING_FALLBACK "nsslapd-sasl-mapping-fallback"
@@ -2756,6 +2758,7 @@ typedef struct _slapdFrontendConfig
     /* normalized dn cache */
     slapi_onoff_t ndn_cache_enabled;
     uint64_t ndn_cache_max_size;
+    char *ndn_cache_backend;
 
     slapi_onoff_t return_orig_type; /* if on, search returns original type set in attr list */
     slapi_onoff_t sasl_mapping_fallback;

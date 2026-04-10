@@ -8,69 +8,98 @@
 # --- END COPYRIGHT BLOCK ---
 #
 import pytest
-import re
-import csv
-import sys
-import argparse, argcomplete
-from abc import ABC, abstractmethod
-from ldap.controls.sss import SSSRequestControl
+import os
+import time
+import threading
+import logging
+from abc import abstractmethod
+
+import ldap
+
 from lib389.backend import Backends
-from lib389.config import BDB_LDBMConfig, LMDB_LDBMConfig
 from lib389.config import Config
-from lib389.index import Indexes
-from lib389._mapped_object import DSLdapObject
-from lib389.monitor import MonitorBackend
 from lib389.properties import TASK_WAIT
 from test389.topologies import topology_st as topo
-from shutil import copyfile
-from statistics import fmean, stdev
-
 
 from lib389._constants import (
     DEFAULT_BENAME,
     DEFAULT_SUFFIX,
-    DN_DM,
-    DN_USERROOT_LDBM,
-    PASSWORD,
 )
 
 from lib389.utils import (
-    ldap, os, time, logging,
-    ds_is_older,
-    ensure_bytes,
     ensure_str,
-    get_default_db_lib,
 )
 from lib389.dseutils import get_ldapurl_from_serverid
 
 pytestmark = pytest.mark.tier3
 
 THIS_DIR = os.path.dirname(__file__)
-LDIF = os.path.join(THIS_DIR, '../data/5Kusers.ldif')
+LDIF = os.path.join(THIS_DIR, '../data/50Kusers.ldif')
 RESULT_DIR = f'{THIS_DIR}/../data/ndncache_test_results/r'
 RESULT_FILE = f'{RESULT_DIR}/results_ndncache.'
-CSV_FILE = f'{RESULT_DIR}/r.csv.'
-NB_MEASURES = 100
-NB_MEANINGFULL_MEASURES = int(NB_MEASURES/5)
-SCENARIO='SCENARIO'
-STAT_ATTRS2 =  ( 'currentdncachesize', 'currentdncachecount' )
-STAT_ATTRS = ( 'dncachehits', 'dncachetries' ) + STAT_ATTRS2
 
-WITHOUT_CACHE = 'without_ndn_cache'
-WITH_CACHE = 'with_ndn_cache'
+NB_MEASURES = int(os.environ.get('NDN_NB_MEASURES', '2000'))
+THREAD_COUNTS = [int(x) for x in os.environ.get(
+    'NDN_THREADS', '1,4,8,16').split(',')]
 
+NDN_MONITOR_DN = 'cn=monitor,cn=ldbm database,cn=plugins,cn=config'
+
+BACKENDS = os.environ.get(
+    'NDN_BACKENDS',
+    'disabled,concread,s3fifo'
+).split(',')
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
-args = None
 
-with open('/tmp/ndncache_test.log', 'w'):
-    pass
 
-def dbg(msg):
-    pass
-    # with open('/tmp/ndncache_test.log', 'a') as dbgfd:
-    #     dbgfd.write(msg)
+def open_conn(inst):
+    ldapurl, _ = get_ldapurl_from_serverid(inst.serverid)
+    conn = ldap.initialize(ldapurl)
+    conn.sasl_interactive_bind_s("", ldap.sasl.external())
+    return conn
+
+
+def get_ndn_stats(conn):
+    try:
+        res = conn.search_s(NDN_MONITOR_DN, ldap.SCOPE_BASE, '(objectclass=*)')
+        attrs = res[0][1]
+        lower_map = {k.lower(): k for k in attrs}
+        out = {}
+        for want in ('normalizedDnCacheTries', 'normalizedDnCacheHits',
+                     'NormalizedDnCacheEvictions', 'currentNormalizedDnCacheCount'):
+            real_key = lower_map.get(want.lower())
+            if real_key:
+                out[want] = int(ensure_str(attrs[real_key][0]))
+        return out
+    except Exception:
+        return {}
+
+
+def ndn_delta(pre, post):
+    hits = post.get('normalizedDnCacheHits', 0) - pre.get('normalizedDnCacheHits', 0)
+    tries = post.get('normalizedDnCacheTries', 0) - pre.get('normalizedDnCacheTries', 0)
+    evicts = post.get('NormalizedDnCacheEvictions', 0) - pre.get('NormalizedDnCacheEvictions', 0)
+    ratio = hits / tries if tries > 0 else 0
+    count = post.get('currentNormalizedDnCacheCount', 0)
+    return hits, tries, evicts, ratio, count
+
+
+NDN_CACHE_SIZE = int(os.environ.get('NDN_CACHE_SIZE', str(4 * 1024 * 1024)))
+
+
+def configure_backend(inst, backend_name):
+    config = Config(inst)
+    max_threads = max(THREAD_COUNTS) if THREAD_COUNTS else 32
+    config.set('nsslapd-threadnumber', str(max(max_threads * 2, 32)))
+    if backend_name == 'disabled':
+        config.set('nsslapd-ndn-cache-enabled', 'off')
+    else:
+        config.set('nsslapd-ndn-cache-enabled', 'on')
+        config.set('nsslapd-ndn-cache-max-size', str(NDN_CACHE_SIZE))
+        config.set('nsslapd-ndn-cache-backend', backend_name)
+    config.set('nsslapd-accesslog-logbuffering', 'off')
+    inst.restart()
 
 
 class Scenario:
@@ -81,16 +110,13 @@ class Scenario:
         self._name = None
 
     def preop(self):
-        # Run before measured operation
         pass
 
     @abstractmethod
     def op(self):
-        # Operation to measure ( Should better be a single ldap operation )
         pass
 
     def postop(self):
-        # Run after measured operation
         pass
 
     def __str__(self):
@@ -99,533 +125,409 @@ class Scenario:
     def description(self):
         return self._desc
 
-    @staticmethod
-    def average(data):
-        data.sort()
-        log.info(f'RAW DATA: len(data)={len(data)} {data}')
-        assert len(data) >= NB_MEANINGFULL_MEASURES
-        for i in range(len(data)-1, NB_MEANINGFULL_MEASURES-1, -1):
-            del data[i]
-        log.info(f'COOKED DATA: len(data)={len(data)} {data}')
-        m = fmean(data)
-        v = stdev(data, m)
-        v = v/m * 100
-        return [ m, v, str(data) ]
+    _thread_local = threading.local()
+    _op_idx_stride = 1000
 
-    def getndncache_stats(self):
-        dnbemon = 'cn=monitor,cn=userRoot,cn=ldbm database,cn=plugins,cn=config'
-
-        """The following fails ...
-        mon = MonitorBackend(inst, dn=dnbemon)
-        res = mon.get_status()
-        log.debug(f'getndncache_stats res={res}')
-        return [ res[a] for a in STAT_ATTRS ]
-        """
-        res = self.ldc.search_ext_s(
-            base=dnbemon,
-            scope=ldap.SCOPE_BASE,
-            filterstr='(objectclass=*)',
-            attrlist=list(STAT_ATTRS))
-        log.debug(f'getndncache_stats res={res}')
-        res = res[0][1]
-        return { a: ensure_str(res[a][0]) for a in STAT_ATTRS }
-
-
-    def measure(self, inst, conn):
-        name = str(self)
-        log.info(f'Perform {NB_MEASURES} of {name}')
-        data = []
-        self.ldc = conn
-        aggregated_stats = { a: 0 for a in STAT_ATTRS }
-        pattern = re.compile(br'.*optime=(\d+\.?\d*).*')
-        dbg(f'Running measure on {self}\n')
-
-        with  open(f'{inst.ds_paths.log_dir}/access', 'rb+') as logfd:
+    def _run_ops(self, conn, count, tid=0):
+        self._thread_local.conn = conn
+        self._thread_local.tid = tid
+        self._thread_local.op_idx = tid * self._op_idx_stride
+        completed = 0
+        for _ in range(count):
             try:
-                for _ in range(NB_MEASURES):
-                    self.preop()
-                    pre_stats = self.getndncache_stats()
-                    pos = os.fstat(logfd.fileno()).st_size
-                    logfd.seek(pos)
-                    dbg('Perform the operation\n')
-                    self.op()
-                    dbg('Done Performing the operation\n')
-                    for line in iter(logfd.readline, b''):
-                        res = pattern.match(line)
-                        if res:
-                            data.append(float(res.group(1)))
-                    dbg('Done parsing log file\n')
-                    post_stats = self.getndncache_stats()
-                    for k,v in post_stats.items():
-                        aggregated_stats[k] += float(v) - float(pre_stats[k])
-                    self.postop()
-                dbg('Compute average measure\n')
-                result = Scenario.average(data)
-            except ldap.LDAPError as exc:
-                log.error(f'Scenario {name} failed because of {exc}')
-                result = [ 0, 0, [] ]
-        log.info(f'result (average, normalized standard deviation, data) of {name} is {result}')
-        res_stats = [ str(aggregated_stats[a]) for a in STAT_ATTRS ]
-        res_stats2 = [ post_stats[a] for a in STAT_ATTRS2 ]
-        result.append(res_stats + res_stats2)
-        return result
+                self.preop()
+                self.op()
+                self.postop()
+                completed += 1
+            except ldap.LDAPError:
+                completed += 1
+        return completed
+
+    def _next_idx(self):
+        idx = getattr(self._thread_local, 'op_idx', 0)
+        self._thread_local.op_idx = idx + 1
+        return idx
+
+    @property
+    def conn(self):
+        return getattr(self._thread_local, 'conn', self.ldc)
+
+    def measure(self, inst, conn, n_threads=1):
+        name = str(self)
+        self.ldc = conn
+
+        try:
+            self._run_ops(conn, 50)
+        except ldap.LDAPError:
+            pass
+        log.info(f'  {name}: warmup done, measuring {NB_MEASURES} ops '
+                 f'across {n_threads} client threads...')
+
+        conns = [open_conn(inst) for _ in range(n_threads)]
+        ops_per_thread = NB_MEASURES // n_threads
+        thread_ops = [0] * n_threads
+        errors = [None] * n_threads
+
+        def worker(tid):
+            thread_ops[tid] = self._run_ops(conns[tid], ops_per_thread, tid=tid)
+
+        pre = get_ndn_stats(conn)
+
+        t0 = time.perf_counter()
+        threads = []
+        for i in range(n_threads):
+            t = threading.Thread(target=worker, args=(i,))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.perf_counter() - t0
+
+        for c in conns:
+            c.unbind_s()
+
+        post = get_ndn_stats(conn)
+        hits, tries, evicts, ratio, count = ndn_delta(pre, post)
+
+        total_ops = sum(thread_ops)
+        ops_sec = total_ops / elapsed if elapsed > 0 else 0
+        avg_ms = (elapsed / max(total_ops / n_threads, 1)) * 1000
+
+        log.info(f'  {name}: {ops_sec:.1f} ops/sec  avg={avg_ms:.2f}ms  '
+                 f'ndn_ratio={ratio:.3f} ({hits}/{tries})  '
+                 f'evicts={evicts}  count={count}  '
+                 f'normalizations_saved={hits}')
+
+        return {
+            'ops_sec': ops_sec,
+            'avg_ms': avg_ms,
+            'ndn_hits': hits,
+            'ndn_tries': tries,
+            'ndn_evicts': evicts,
+            'ndn_ratio': ratio,
+            'ndn_count': count,
+        }
 
 
-class Scen1(Scenario):
+ALL_OUS = [
+    'Technology', 'Engineering', 'Sales', 'Marketing',
+    'Human Resources', 'Quality Assurance', 'Operations', 'Legal',
+    'Customer Service', 'General Management', 'Information Technology',
+    'Creative Services', 'Business Development', 'Product Management',
+    'Asset Management', 'Board of Directors',
+]
+
+
+class ScenSubtreeRotating(Scenario):
+
     def __init__(self):
         super().__init__()
-        self._name = 'scen1'
-        self._desc = 'Subtree search'
+        self._name = 'subtree_search_rotating'
+        self._desc = 'Subtree search rotating across all OUs'
 
     def op(self):
-        basedn = f'ou=Technology,ou=people,{DEFAULT_SUFFIX}'
-        result = self.ldc.search_ext_s(
-            base=basedn,
+        ou = ALL_OUS[self._next_idx() % len(ALL_OUS)]
+        self.conn.search_ext_s(
+            base=f'ou={ou},ou=people,{DEFAULT_SUFFIX}',
             scope=ldap.SCOPE_SUBTREE,
             filterstr='(uid=*)',
-            attrlist=['dn']
-        )
+            attrlist=['dn'])
 
 
-class Scen2(Scenario):
+class ScenBaseSearchRotating(Scenario):
+
     def __init__(self):
         super().__init__()
-        self.sss_control = SSSRequestControl(criticality=True, ordering_rules=['modifiersName'])
-        self._name = 'scen2'
-        self._desc = 'Server Side Sorted Subtree search'
+        self._name = 'base_search_rotating'
+        self._desc = 'Base search rotating across user DNs in all OUs'
+        self._user_dns = []
+
+    def set_user_dns(self, inst):
+        if self._user_dns:
+            return
+        conn = open_conn(inst)
+        res = conn.search_s(f'ou=people,{DEFAULT_SUFFIX}',
+                            ldap.SCOPE_SUBTREE, '(uid=*)', ['dn'])
+        self._user_dns = [dn for dn, _ in res if dn.startswith('uid=')]
+        conn.unbind_s()
 
     def op(self):
-        basedn = f'ou=Technology,ou=people,{DEFAULT_SUFFIX}'
-        result = self.ldc.search_ext_s(
-            base=basedn,
+        dn = self._user_dns[self._next_idx() % len(self._user_dns)]
+        self.conn.search_ext_s(
+            base=dn, scope=ldap.SCOPE_BASE,
+            filterstr='(objectclass=*)', attrlist=['dn'])
+
+
+class ScenDnFilterRotating(Scenario):
+
+    def __init__(self):
+        super().__init__()
+        self._name = 'dn_filter_rotating'
+        self._desc = 'DN-syntax filter search rotating across users'
+        self._user_dns = []
+
+    def set_user_dns(self, inst):
+        if self._user_dns:
+            return
+        conn = open_conn(inst)
+        res = conn.search_s(f'ou=people,{DEFAULT_SUFFIX}',
+                            ldap.SCOPE_SUBTREE, '(uid=*)', ['dn'])
+        self._user_dns = [dn for dn, _ in res if dn.startswith('uid=')]
+        conn.unbind_s()
+
+    def op(self):
+        idx = self._next_idx()
+        user_dn = self._user_dns[idx % len(self._user_dns)]
+        ou = ALL_OUS[idx % len(ALL_OUS)]
+        self.conn.search_ext_s(
+            base=f'ou={ou},ou=people,{DEFAULT_SUFFIX}',
             scope=ldap.SCOPE_SUBTREE,
-            filterstr='(uid=*)',
-            serverctrls=[self.sss_control],
-            attrlist=['dn']
-        )
+            filterstr=f'(manager={user_dn})',
+            attrlist=['dn'])
 
 
-class Scen3(Scenario):
+class ScenModifyRotating(Scenario):
+
     def __init__(self):
         super().__init__()
-        self._name = 'scen3'
-        self._desc = 'Subtree search with filter equality on dn syntax attribute'
+        self._name = 'modify_rotating'
+        self._desc = 'Modify description rotating across user entries'
+        self._user_dns = []
+
+    def set_user_dns(self, inst):
+        if self._user_dns:
+            return
+        conn = open_conn(inst)
+        res = conn.search_s(f'ou=people,{DEFAULT_SUFFIX}',
+                            ldap.SCOPE_SUBTREE, '(uid=*)', ['dn'])
+        self._user_dns = [dn for dn, _ in res if dn.startswith('uid=')]
+        conn.unbind_s()
 
     def op(self):
-        basedn = f'ou=people,{DEFAULT_SUFFIX}'
-        filter = 'modifiersName=uid=bmcdonald,ou=Information Technology,ou=people,dc=example,dc=com'
-        result = self.ldc.search_ext_s(
-            base=basedn,
-            scope=ldap.SCOPE_SUBTREE,
-            filterstr=filter,
-            attrlist=['dn']
-        )
+        idx = self._next_idx()
+        dn = self._user_dns[idx % len(self._user_dns)]
+        tid = getattr(self._thread_local, 'tid', 0)
+        self.conn.modify_s(dn, [(ldap.MOD_REPLACE, 'description',
+                                 [f'bench-{tid}-{idx}'.encode()])])
 
 
-class Scen4(Scenario):
+class ScenSearchUnindexedMember(Scenario):
+
     def __init__(self):
         super().__init__()
-        self._name = 'scen4'
-        self._desc = 'Modify member of large group with no substring index'
+        self._name = 'search_unindexed_member'
+        self._desc = 'Search non-indexed member in 1000 small groups'
 
     def op(self):
-        basedn = f'cn=all_users,ou=groups,{DEFAULT_SUFFIX}'
-        value = b'uid=pwynn,ou=Information Technology,ou=people,dc=example,dc=com'
-        mods = [ ( ldap.MOD_DELETE, 'member', [value,] ), ]
-        result = self.ldc.modify_s(basedn, mods)
-
-    def postop(self):
-        basedn = f'cn=all_users,ou=groups,{DEFAULT_SUFFIX}'
-        value = b'uid=pwynn,ou=Information Technology,ou=people,dc=example,dc=com'
-        mods = [ ( ldap.MOD_ADD, 'member', [value,] ), ]
-        result = self.ldc.modify_s(basedn, mods)
-
-
-class Scen5(Scenario):
-    def __init__(self):
-        super().__init__()
-        self._name = 'scen5'
-        self._desc = 'Modify member of small group with no substring index'
-
-    def op(self):
-        basedn = f'cn=user_admin,ou=permissions,dc=example,dc=com'
-        value = b'uid=pwynn,ou=Information Technology,ou=people,dc=example,dc=com'
-        mods = [ ( ldap.MOD_DELETE, 'uniqueMember', [value,] ), ]
-        result = self.ldc.modify_s(basedn, mods)
-
-    def postop(self):
-        basedn = f'cn=user_admin,ou=permissions,dc=example,dc=com'
-        value = b'uid=pwynn,ou=Information Technology,ou=people,dc=example,dc=com'
-        mods = [ ( ldap.MOD_ADD, 'uniqueMember', [value,] ), ]
-        result = self.ldc.modify_s(basedn, mods)
-
-
-class Scen6(Scenario):
-    def __init__(self):
-        super().__init__()
-        self._name = 'scen6'
-        self._desc = 'Search non indexed member in 1000 small groups'
-
-    def op(self):
-        basedn = f'ou=tinygroups,ou=groups,dc=example,dc=com'
-        result = self.ldc.search_ext_s(
-            base=basedn,
+        self.conn.search_ext_s(
+            base=f'ou=tinygroups,ou=groups,dc=example,dc=com',
             scope=ldap.SCOPE_SUBTREE,
             filterstr='(member=uid=Xgclements,ou=Quality Assurance,ou=people,dc=example,dc=com)',
-            attrlist=['dn']
-        )
+            attrlist=['dn'])
 
 
-class Scen7(Scenario):
-    def __init__(self):
-        super().__init__()
-        self._name = 'scen7'
-        self._desc = 'Search large group with small entrycache'
-
-    def op(self):
-        basedn = 'cn=all_users,ou=groups,dc=example,dc=com'
-        result = self.ldc.search_ext_s(
-            base=basedn,
-            scope=ldap.SCOPE_BASE,
-            filterstr='(objectclass=*)',
-            attrlist=['dn']
-        )
-
-    def preop(self):
-        basedn = f'ou=Technology,ou=people,{DEFAULT_SUFFIX}'
-        result = self.ldc.search_ext_s(
-            base=basedn,
-            scope=ldap.SCOPE_SUBTREE,
-            filterstr='(uid=*)',
-            attrlist=['dn']
-        )
+SCENARIOS = [
+    ScenSubtreeRotating(),
+    ScenBaseSearchRotating(),
+    ScenDnFilterRotating(),
+    ScenModifyRotating(),
+    ScenSearchUnindexedMember(),
+]
 
 
-SCENARIOS = [ Scen1(), Scen3(), Scen4(), Scen5(), Scen6(), ]
-SCENARIOS_SMALL_ENTRYCACHE = [ Scen7(), ]
-SCENARIOS_SKIPPED = [ Scen2(), ]
-
-
-@pytest.fixture(scope="module")
-def with_indexes(topo):
-    # Add missing indexes (reindex is done by with_ldif fixture)
-    inst = topo.standalone
+def _setup_indexes(inst):
     backends = Backends(inst)
     backend = backends.get(DEFAULT_BENAME)
     indexes = backend.get_indexes()
 
     index = indexes.get('uid')
-    index.ensure_attr_state( { 'nsIndexType': ['eq', 'pres'] } )
+    index.ensure_attr_state({'nsIndexType': ['eq', 'pres']})
 
-    index = indexes.create(properties={
-        'cn': 'modifiersName',
-        'nsSystemIndex': 'false',
-        'nsIndexType': ['eq']
-        })
-
-    index = indexes.get('member')
-    index.delete()
-
-    # index = indexes.get('uniquemember')
-    # index.ensure_attr_state( { 'nsIndexType': ['eq', 'sub'] } )
-
-
-@pytest.fixture(scope="module", params=[WITHOUT_CACHE,WITH_CACHE])
-def with_ldif(topo, with_indexes, request):
-    # Import ldif
-    log.info('Run importLDIF task to add entries to Server')
-    inst = topo.standalone
-    # Import the ldif file
     try:
-        inst.tasks.importLDIF(suffix=DEFAULT_SUFFIX, input_file=LDIF, args={TASK_WAIT: True})
-        log.info('Online import succeded')
-    except ValueError as e:
-        log.error('Online import failed' + e.message('desc'))
-        assert False
-    # Enable/disable the ndn cache
-    ndncache = b'off' if request.param == WITHOUT_CACHE else 'on'
-    config = Config(inst)
-    config.set('nsslapd-ndn-cache-enabled', ndncache)
-    config.set('nsslapd-accesslog-logbuffering', 'off')
-    return request.param
+        indexes.create(properties={
+            'cn': 'modifiersName',
+            'nsSystemIndex': 'false',
+            'nsIndexType': ['eq'],
+        })
+    except ldap.ALREADY_EXISTS:
+        pass
+
+    try:
+        index = indexes.get('member')
+        index.delete()
+    except Exception:
+        pass
 
 
-def set_ldap_attribute(conn, dn, attr, val):
-    if val is None:
-        vals = val
-    else:
-        vals = [ ensure_bytes(str(val)), ]
-        conn.modify_s(dn, [(ldap.MOD_REPLACE, attr, vals),])
-
-
-def open_conn(inst):
-    ldapurl, certdir = get_ldapurl_from_serverid(inst.serverid)
-    assert 'ldapi://' in ldapurl
-    conn = ldap.initialize(ldapurl)
-    conn.sasl_interactive_bind_s("", ldap.sasl.external())
-    return conn
-
-
-@pytest.fixture(scope="function")
-def with_small_entrycache(topo, request):
+@pytest.fixture(scope="module", params=BACKENDS)
+def with_backend(topo, request):
     inst = topo.standalone
-    if get_default_db_lib() == 'bdb':
-        xdb_config_ldbm = BDB_LDBMConfig(inst)
-    else:
-        xdb_config_ldbm = LMDB_LDBMConfig(inst)
-    config_ldbm = DSLdapObject(inst, DN_USERROOT_LDBM)
-    conn = open_conn(inst)
-    new_values = {
-        'nsslapd-dbcachesize': 10,
-        'nsslapd-cachememsize': 512000,  # Minimum value
-        'nsslapd-dncachememsize': 100000000,
-    }
-    old_values = { attr: config_ldbm.get_attr_val_utf8(attr) for attr in new_values.keys() }
-    old_autotune = config_ldbm.get_attr_val_utf8('nsslapd-cache-autosize')
+    backend_name = request.param
 
-    def fin():
-        for k,v in old_values.items():
-            set_ldap_attribute(conn, config_ldbm.dn, k, v)
-        set_ldap_attribute(conn, config_ldbm.dn, 'nsslapd-cache-autosize', old_autotune)
-        set_ldap_attribute(conn, xdb_config_ldbm.dn, 'nsslapd-cache-autosize', old_autotune)
-        conn.unbind_s()
+    _setup_indexes(inst)
 
-    request.addfinalizer(fin)
-    set_ldap_attribute(conn, xdb_config_ldbm.dn, 'nsslapd-cache-autosize', 0)
-    set_ldap_attribute(conn, config_ldbm.dn, 'nsslapd-cache-autosize', 0)
-    for k,v in new_values.items():
-        set_ldap_attribute(conn, config_ldbm.dn, k, v)
-    return conn
+    try:
+        inst.tasks.importLDIF(suffix=DEFAULT_SUFFIX, input_file=LDIF,
+                              args={TASK_WAIT: True})
+    except ValueError as e:
+        log.error(f'Import failed: {e}')
+        assert False
+
+    configure_backend(inst, backend_name)
+    log.info(f'=== Backend: {backend_name} ===')
+    return backend_name
 
 
-def test_run_measure(topo, with_ldif):
-    """Perform the measure on all scenarios and record the result
+all_results = []
+
+
+@pytest.mark.parametrize('n_threads', THREAD_COUNTS)
+def test_run_measure(topo, with_backend, n_threads):
+    """Measure throughput and NDN cache effectiveness for each scenario
+    at varying client concurrency levels.
 
     :id: 0581e348-9d4f-11f0-a8cb-c85309d5c3e3
-    :setup: Standalone instance
-    :steps: 1. measure average optime for each sceanrios
+    :setup: Standalone instance with 5K users
+    :steps: 1. run each scenario N times across n_threads concurrent clients
+            2. measure aggregate throughput (ops/sec)
+            3. collect NDN cache stats (hits, tries, ratio, evictions)
     :expectedresults: no exception should occur
     """
-
     inst = topo.standalone
     conn = open_conn(inst)
+    backend = with_backend
+
     for scen in SCENARIOS:
-        v = scen.measure(inst, conn)
-        log.info(f'Set results ({with_ldif},{scen}): {v}')
-        scen.results[with_ldif] = v
+        if hasattr(scen, 'set_user_dns'):
+            scen.set_user_dns(inst)
+        result = scen.measure(inst, conn, n_threads=n_threads)
+        if result:
+            scen.results[(backend, n_threads)] = result
+            all_results.append({
+                'scenario': str(scen),
+                'backend': backend,
+                'threads': n_threads,
+                **result,
+            })
     conn.unbind_s()
 
 
-def test_run_measure_with_small_entrycache(topo, with_ldif, with_small_entrycache):
-    """Perform the measure on scenarios with small entrycache and record the result
-
-    :id: 4290cc9c-a081-11f0-bc19-c85309d5c3e3
-    :setup: Standalone instance
-    :steps: 1. measure average optime for each sceanrios
-    :expectedresults: no exception should occur
-    """
-
-    inst = topo.standalone
-    conn = with_small_entrycache
-    for scen in SCENARIOS_SMALL_ENTRYCACHE:
-        v = scen.measure(inst, conn)
-        log.info(f'Set results ({with_ldif},{scen}): {v}')
-        scen.results[with_ldif] = v
-    # conn.unbind_s is done by with_small_entrycache teardown
-
-
-def test_log_results():
-    """Perform the measure on all scenarios and record the result
+def test_zz_log_results():
+    """Print results summary comparing all backends.
 
     :id: b8131fee-9d50-11f0-a761-c85309d5c3e3
     :setup: None
     :steps: 1. display the results
     :expectedresults: no exception should occur
     """
+    if not all_results:
+        log.info('No results collected.')
+        return
 
     os.makedirs(RESULT_DIR, 0o755, exist_ok=True)
-    statkeys = []
-    for attr in STAT_ATTRS:
-        statkeys.append(f'delta {attr} WITHOUT CACHE')
-        statkeys.append(f'delta {attr} WITH CACHE')
-    for attr in STAT_ATTRS2:
-        statkeys.append(f'{attr} WITHOUT CACHE')
-        statkeys.append(f'{attr} WITH CACHE')
-    statkeys_str = "\t".join(statkeys)
-    fname = numbered_filename(RESULT_FILE)
-    with open(fname, 'w') as fout:
-        fmt1='SCENARIO\tVALUE WITHOUT CACHE\tVALUE WITH CACHE\tGAIN\tDEVIATION WITHOUT CACHE\tDEVIATION WITH CACHE\tTEST DESCRIPTION'
-        fout.write(f'{fmt1}\t{statkeys_str}\n')
-        # fout.write(f'{fmt1}\tDATA WITHOUT CACHE\tDATA WITH CACHE\t{statkeys_str}\n')
-        for scen in SCENARIOS + SCENARIOS_SMALL_ENTRYCACHE:
-            log.debug(f'scen.results[WITHOUT_CACHE]={scen.results[WITHOUT_CACHE]}')
-            log.debug(f'scen.results[WITH_CACHE]={scen.results[WITH_CACHE]}')
-            m1, v1, d1, s1 = scen.results[WITHOUT_CACHE]
-            m2, v2, d2, s2 = scen.results[WITH_CACHE]
-            log.debug(f's1={s1}')
-            log.debug(f's2={s2}')
-            gain = ( m1 - m2 ) / m1 * 100 if m1 > 0 else '###'
-            statvalues = []
-            for idx in range(len(s1)):
-                statvalues.append(s1[idx])
-                statvalues.append(s2[idx])
-            statvalues_str = "\t".join(statvalues)
-            fmt1 = f'{scen}\t{m1:.5f}\t{m2:.5f}\t{gain:.1f}%\t{v1:.2f}%\t{v2:.2f}%\t{scen.description()}'
-            fout.write(f'{fmt1}\t{statvalues_str}\n')
-            # fout.write({fmt1}\t{d1}\t{d2}\t{statvalues_str}\n')
+
+    scenarios = []
+    backends_seen = []
+    thread_counts = []
+    by_key = {}
+    for r in all_results:
+        s, b, t = r['scenario'], r['backend'], r['threads']
+        if s not in scenarios:
+            scenarios.append(s)
+        if b not in backends_seen:
+            backends_seen.append(b)
+        if t not in thread_counts:
+            thread_counts.append(t)
+        by_key[(s, b, t)] = r
+
+    disabled_label = 'disabled'
+
+    log.info(f'\n{"=" * 140}')
+    log.info(f'NDN CACHE BENCHMARK — {NB_MEASURES} ops/scenario')
+    log.info(f'{"=" * 140}')
+
+    for tc in sorted(thread_counts):
+        log.info(f'\nTHROUGHPUT (ops/sec) — {tc} client threads:')
+        header = f'{"scenario":<35}'
+        for b in backends_seen:
+            header += f'  {b:>16}'
+        header += f'  {"best":>16}'
+        log.info(header)
+        log.info('-' * len(header))
+
+        for scen in scenarios:
+            line = f'{scen:<35}'
+            best_backend = None
+            best_ops = 0
+            for b in backends_seen:
+                r = by_key.get((scen, b, tc))
+                if r:
+                    line += f'  {r["ops_sec"]:>13.1f}/s'
+                    if r['ops_sec'] > best_ops:
+                        best_ops = r['ops_sec']
+                        best_backend = b
+                else:
+                    line += f'  {"N/A":>16}'
+            line += f'  {best_backend or "":>16}'
+            log.info(line)
+
+    for tc in sorted(thread_counts):
+        log.info(f'\nNDN HIT RATIO — {tc} client threads:')
+        header = f'{"scenario":<35}'
+        for b in backends_seen:
+            header += f'  {b:>16}'
+        log.info(header)
+        log.info('-' * len(header))
+
+        for scen in scenarios:
+            line = f'{scen:<35}'
+            for b in backends_seen:
+                r = by_key.get((scen, b, tc))
+                if r:
+                    line += f'  {r["ndn_ratio"]:>15.3f}'
+                else:
+                    line += f'  {"N/A":>16}'
+            log.info(line)
+
+    for tc in sorted(thread_counts):
+        log.info(f'\nGAIN vs disabled — {tc} client threads:')
+        header = f'{"scenario":<35}'
+        for b in backends_seen:
+            if b != disabled_label:
+                header += f'  {b:>16}'
+        log.info(header)
+        log.info('-' * len(header))
+
+        for scen in scenarios:
+            line = f'{scen:<35}'
+            base = by_key.get((scen, disabled_label, tc))
+            for b in backends_seen:
+                if b == disabled_label:
+                    continue
+                r = by_key.get((scen, b, tc))
+                if r and base and base['ops_sec'] > 0:
+                    gain = (r['ops_sec'] - base['ops_sec']) / base['ops_sec'] * 100
+                    line += f'  {gain:>14.1f}%'
+                else:
+                    line += f'  {"N/A":>16}'
+            log.info(line)
+
+    log.info(f'\n{"=" * 140}')
+
+    fname = _numbered_filename(RESULT_FILE)
+    with open(fname, 'w') as f:
+        cols = ['scenario', 'backend', 'threads', 'ops_sec', 'avg_ms',
+                'ndn_hits', 'ndn_tries', 'ndn_evicts', 'ndn_ratio', 'ndn_count']
+        f.write('\t'.join(cols) + '\n')
+        for r in all_results:
+            f.write('\t'.join(str(r.get(c, '')) for c in cols) + '\n')
+    log.info(f'Results written to {fname}')
 
 
-def numbered_filename(prefix):
-    # Get a non excisting filename by adding a number to prefix
+def _numbered_filename(prefix):
     idx = 1
     fname = f'{prefix}{idx}'
     while os.path.exists(fname):
         idx += 1
         fname = f'{prefix}{idx}'
     return fname
-
-
-def move_results(dirname):
-    if os.path.isdir(dirname):
-        newdirname = numbered_filename(dirname)
-        os.rename(dirname, newdirname)
-        print(f'Result moved in {newdirname}')
-
-
-def generate_csv(csvfilename):
-    def parse_file(fname):
-        res = []
-        with open(fname, 'r') as fd:
-            for line in fd:
-                data = line.strip().split('\t')
-                res.append(data)
-        return res
-
-    def update_gain(data, gain):
-        k = data[0]
-        if k != SCENARIO:
-            if k not in gain:
-                gain[k] = []
-            gain[k].append(float(data[3][:-1]))
-
-
-    # Parse result files and generate list of dict
-    res1 = []
-    gains = {}
-    for idx in range(1, NB_MEASURES+1):
-        fname = f'{RESULT_FILE}{idx}'
-        if os.path.isfile(fname):
-            res = parse_file(fname)
-            res1.append(res)
-            for data in res:
-                update_gain(data, gains)
-
-    if len(res1) < 2:
-        print(f'ERROR: not enough result files {RESULT_FILE}*')
-        sys.exit(1)
-
-    scens = [ data[0] for data in res1[0] ]
-    scens[0] = ''
-
-    nbfiles = len(res1)
-    nbscen = len(gains)
-    nbdata = len(res1[1][1])
-
-    nbrows = nbfiles * nbscen + 1
-    nbcols = nbdata + 2 * nbscen + 4
-
-    idx_graph_data = nbdata + 2
-    idx_average = idx_graph_data + nbscen + 1
-
-    print(f'nbfiles={nbfiles}')
-    print(f'nbscen={nbscen}')
-    print(f'nbdata={nbdata}')
-    print(f'nbrows={nbrows}')
-    print(f'nbcols={nbcols}')
-    print(f'idx_graph_data={idx_graph_data}')
-    print(f'idx_average={idx_average}')
-
-    gtable = [ [ ' ' ] * nbcols  for _ in range(nbrows) ]
-    # First Row
-    for idx in range(nbdata):
-        gtable[0][idx] = res1[0][0][idx]
-
-    for idx,scen in enumerate(scens):
-        if idx > 0:
-            gtable[0][idx_graph_data+idx] = f'{scen} gain'
-            gtable[0][idx_average+idx] = f'average {scen} gain'
-
-    # Fill raw data table
-    for idx, row in enumerate(res1):
-        for idx2 in range(1, nbscen+1):
-            data = row[idx2]
-            for idx3, v in enumerate(data):
-                gtable[1+nbfiles*(idx2-1)+idx][idx3] = v
-
-    # Fill graph table
-    for idx in range(1, nbfiles+1):
-        for idx2 in range(1, nbscen+1):
-            scen = scens[idx2]
-            gtable[idx][idx_graph_data+idx2] = gains[scen][idx-1]
-        gtable[idx][idx_graph_data] = idx
-
-    # Fill average table
-    for idx in range(1, nbscen+1):
-        scen = scens[idx]
-        gtable[1][idx_average+idx] = fmean(gains[scen])
-    if args:
-        gtable[3][idx_average] = str(args)
-
-    # Write csv file
-    with open(csvfilename, 'w', newline='') as csvfile:
-        csvwriter = csv.writer(csvfile, delimiter='\t', quotechar='|', quoting=csv.QUOTE_MINIMAL)
-        for row in gtable:
-            csvwriter.writerow(row)
-
-
-parser = argparse.ArgumentParser(allow_abbrev=True)
-parser.add_argument('-b', '--batch',
-        action='store_true',
-        help="Run test in batch mode",
-    )
-parser.add_argument('-m', '--measure',
-        type=int,
-        help="Number of measured operations in a measure",
-        default=NB_MEASURES
-    )
-parser.add_argument('-l', '--nbloops',
-        type=int,
-        help="Number of loops in batch mode",
-        default=100
-    )
-parser.add_argument('-c', '--csv',
-        action='store_true',
-        help="generate csv file"
-    )
-argcomplete.autocomplete(parser)
-
-if __name__ == '__main__':
-    CURRENT_FILE = os.path.realpath(__file__)
-    args = parser.parse_args()
-    assert args.nbloops > 0
-    assert args.measure >= 10
-    NB_MEASURES = args.measure
-    NB_MEANINGFULL_MEASURES = int(NB_MEASURES/5)
-    if args.csv:
-        # Generate csv file
-        generate_csv(CSV_FILE)
-        copyfile(CSV_FILE, '/tmp/r.csv') # Copy in /tmp to ease the import in google sheet
-        sys.exit()
-    if args.batch:
-        # Run a series of nbloops tests
-        move_results(RESULT_DIR)
-        for idx in range(1, args.nbloops+1):
-            print(f'\n#############\nRun #{idx}')
-            pytest.main([CURRENT_FILE,])
-        csvname = f'{RESULT_DIR}/r.csv'
-        generate_csv(CSV_FILE)
-        copyfile(CSV_FILE, '/tmp/r.csv') # Copy in /tmp to ease the import in google sheet
-        move_results(RESULT_DIR)
-        sys.exit()
-    pytest.main([CURRENT_FILE,])
-    sys.exit()

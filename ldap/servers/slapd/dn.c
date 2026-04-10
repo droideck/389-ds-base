@@ -2875,17 +2875,35 @@ static int32_t ndn_enabled = 0;
 static int32_t ndn_import_task_count = 0;
 static ARCacheChar *cache = NULL;
 
+#define NDN_BACKEND_CONCREAD 0
+#define NDN_BACKEND_V2       1
+static int32_t ndn_backend_type = NDN_BACKEND_CONCREAD;
+static NdnCacheV2 *v2_cache = NULL;
+
+static uint32_t
+ndn_backend_variant_from_name(const char *name)
+{
+    if (strcmp(name, "s3fifo") == 0) return 2;
+    return UINT32_MAX;
+}
+
 int32_t
 ndn_cache_init()
 {
     ndn_enabled = config_get_ndn_cache_enabled();
     if (ndn_enabled == 0) {
-        /*
-         * Don't configure the keys or anything, need a restart
-         * to enable. We'll just never use ndn cache in this
-         * run.
-         */
         return 0;
+    }
+
+    char *backend = config_get_ndn_cache_backend();
+    if (backend == NULL || strcmp(backend, "concread") == 0) {
+        ndn_backend_type = NDN_BACKEND_CONCREAD;
+    } else if (strcmp(backend, "disabled") == 0) {
+        ndn_enabled = 0;
+        slapi_ch_free_string(&backend);
+        return 0;
+    } else {
+        ndn_backend_type = NDN_BACKEND_V2;
     }
 
     uint64_t max_size = config_get_ndn_cache_size();
@@ -2893,14 +2911,30 @@ ndn_cache_init()
         max_size = NDN_CACHE_MINIMUM_CAPACITY;
     }
     uintptr_t max_estimate = max_size / NDN_ENTRY_AVG_SIZE;
-    /*
-     * Since we currently only do one op per read, we set 0 because there
-     * is no value in having the read thread cache.
-     */
-    uintptr_t max_thread_read = 0;
-    /* Setup the main cache which all other caches will inherit. */
-    cache = cache_char_create(max_estimate, max_thread_read);
 
+    if (ndn_backend_type == NDN_BACKEND_CONCREAD) {
+        uintptr_t max_thread_read = 0;
+        cache = cache_char_create(max_estimate, max_thread_read);
+    } else {
+        uint32_t variant = ndn_backend_variant_from_name(backend);
+        if (variant == UINT32_MAX) {
+            slapi_log_err(SLAPI_LOG_WARNING, "ndn_cache_init",
+                          "NDN cache backend \"%s\" is not available in this build "
+                          "(removed). Falling back to concread.\n",
+                          backend);
+        }
+        v2_cache = ndn_cache_v2_create(max_estimate, variant);
+        if (v2_cache == NULL) {
+            slapi_log_err(SLAPI_LOG_ERR, "ndn_cache_init",
+                          "Failed to create v2 cache backend \"%s\", falling back to concread\n",
+                          backend);
+            ndn_backend_type = NDN_BACKEND_CONCREAD;
+            uintptr_t max_thread_read = 0;
+            cache = cache_char_create(max_estimate, max_thread_read);
+        }
+    }
+
+    slapi_ch_free_string(&backend);
     return 0;
 }
 
@@ -2922,7 +2956,12 @@ ndn_cache_destroy()
     if (ndn_enabled == 0) {
         return;
     }
-    cache_char_free(cache);
+    if (ndn_backend_type == NDN_BACKEND_CONCREAD) {
+        cache_char_free(cache);
+    } else {
+        ndn_cache_v2_free(v2_cache);
+        v2_cache = NULL;
+    }
 }
 
 int
@@ -2948,7 +2987,36 @@ ndn_cache_lookup(char *dn, size_t dn_len, char **ndn, char **udn, int32_t *rc)
         return 1;
     }
 
-    /* Look for it */
+    if (ndn_backend_type == NDN_BACKEND_V2) {
+        char stack_buf[2048];
+        size_t actual_len = ndn_cache_v2_get(v2_cache, dn, dn_len,
+                                             stack_buf, sizeof(stack_buf));
+        if (actual_len > 0) {
+            if (actual_len <= sizeof(stack_buf)) {
+                *ndn = slapi_ch_malloc(actual_len + 1);
+                memcpy(*ndn, stack_buf, actual_len);
+                (*ndn)[actual_len] = '\0';
+            } else {
+                *ndn = slapi_ch_malloc(actual_len + 1);
+                size_t got = ndn_cache_v2_get(v2_cache, dn, dn_len,
+                                              *ndn, actual_len);
+                if (got != actual_len) {
+                    slapi_ch_free_string(ndn);
+                    *udn = slapi_ch_strdup(dn);
+                    *rc = 0;
+                    return 0;
+                }
+                (*ndn)[actual_len] = '\0';
+            }
+            *rc = 1;
+            return 1;
+        } else {
+            *udn = slapi_ch_strdup(dn);
+            *rc = 0;
+            return 0;
+        }
+    }
+
     ARCacheCharRead *read_txn = cache_char_read_begin(cache);
     PR_ASSERT(read_txn);
 
@@ -2985,6 +3053,12 @@ ndn_cache_add(char *dn, size_t dn_len, char *ndn, size_t ndn_len)
         *(ndn + ndn_len) = '\0';
     }
 
+    if (ndn_backend_type == NDN_BACKEND_V2) {
+        ndn_cache_v2_put(v2_cache, dn, dn_len, ndn, ndn_len);
+        slapi_ch_free_string(&dn);
+        return;
+    }
+
     ARCacheCharRead *read_txn = cache_char_read_begin(cache);
     PR_ASSERT(read_txn);
     cache_char_read_include(read_txn, dn, ndn);
@@ -3001,13 +3075,21 @@ ndn_cache_add(char *dn, size_t dn_len, char *ndn, size_t ndn_len)
 void
 ndn_cache_get_stats(uint64_t *hits, uint64_t *tries, uint64_t *size, uint64_t *max_size, uint64_t *thread_size, uint64_t *evicts, uint64_t *slots, uint64_t *count)
 {
-    /*
-     * A pretty big note here - the ARCache stores things by slot, not size, because
-     * getting the real byte size is expensive in some cases (that are beyond this
-     * project). Additionally, due to the concurrent nature of this, the size is
-     * not really accurate to begin with anyway, but you know, this is a best
-     * effort for stats for the user to see.
-     */
+    if (ndn_backend_type == NDN_BACKEND_V2) {
+        uint64_t v2_hits, v2_tries, v2_count, v2_max, v2_evicts, v2_size;
+        ndn_cache_v2_get_stats(v2_cache, &v2_hits, &v2_tries,
+                               &v2_size, &v2_max, &v2_evicts, &v2_count);
+        *hits = v2_hits;
+        *tries = v2_tries;
+        *evicts = v2_evicts;
+        *count = v2_count;
+        *size = v2_count * NDN_ENTRY_AVG_SIZE;
+        *max_size = v2_max * NDN_ENTRY_AVG_SIZE;
+        *thread_size = 0;
+        *slots = 0;
+        return;
+    }
+
     uint64_t reader_hits;
     uint64_t reader_includes;
     uint64_t write_hits;

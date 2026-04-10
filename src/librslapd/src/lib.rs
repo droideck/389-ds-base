@@ -12,7 +12,8 @@ use slapd;
 use libc::c_char;
 use std::ffi::{CStr, CString};
 
-mod cache;
+pub mod cache;
+pub mod ndn_cache_v2;
 
 #[no_mangle]
 pub extern "C" fn do_nothing_rust() -> usize {
