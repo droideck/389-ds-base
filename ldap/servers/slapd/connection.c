@@ -27,6 +27,9 @@
 #if defined(LINUX)
 #include <netinet/tcp.h> /* for TCP_CORK */
 #endif
+#ifdef SYSTEMTAP
+#include <sys/sdt.h>
+#endif
 
 typedef Connection work_q_item;
 static void connection_threadmain(void *arg);
@@ -1080,7 +1083,24 @@ connection_wait_for_new_work(Slapi_PBlock *pb, int32_t interval)
         }
     }
 
+#ifdef SYSTEMTAP
+    /* Snapshot probe args under the lock; same pattern as add_work_q. */
+    uint64_t probe_connid = 0;
+    int probe_opid = 0;
+    int32_t probe_depth = 0;
+    if (wqitem != NULL) {
+        probe_connid = wqitem->c_connid;
+        probe_opid = op_stack_obj->op->o_opid;
+        probe_depth = work_q_size;
+    }
+#endif
     pthread_mutex_unlock(&work_q_lock);
+
+#ifdef SYSTEMTAP
+    if (wqitem != NULL) {
+        STAP_PROBE3(ns-slapd, work_q__dequeue, probe_connid, probe_opid, probe_depth);
+    }
+#endif
     return ret;
 }
 
@@ -1758,6 +1778,9 @@ connection_threadmain(void *arg)
                we should finish the op now.  Client might be thinking it's
                done sending the request and wait for the response forever.
                [blackflag 624234] */
+#ifdef SYSTEMTAP
+            STAP_PROBE1(ns-slapd, worker__idle, *snmp_vars_idx);
+#endif
             ret = connection_wait_for_new_work(pb, interval);
 
             switch (ret) {
@@ -1873,6 +1896,9 @@ connection_threadmain(void *arg)
             g_decr_active_threadcnt();
             return;
         }
+#ifdef SYSTEMTAP
+        STAP_PROBE2(ns-slapd, worker__busy, conn->c_connid, op->o_opid);
+#endif
         maxthreads = conn->c_max_threads_per_conn;
         more_data = 0;
         ret = connection_read_operation(conn, op, &tag, &more_data);
@@ -2249,7 +2275,17 @@ add_work_q(work_q_item *wqitem, struct Slapi_op_stack *op_stack_obj)
         work_q_size_max = work_q_size;
     }
     pthread_cond_signal(&work_q_cv); /* notify waiters in connection_wait_for_new_work */
+#ifdef SYSTEMTAP
+    /* Snapshot under the lock: op_stack pool recycling can zero o_opid before the probe fires. */
+    uint64_t probe_connid = wqitem->c_connid;
+    int probe_opid = op_stack_obj->op->o_opid;
+    int32_t probe_depth = work_q_size;
+#endif
     pthread_mutex_unlock(&work_q_lock);
+
+#ifdef SYSTEMTAP
+    STAP_PROBE3(ns-slapd, work_q__enqueue, probe_connid, probe_opid, probe_depth);
+#endif
 }
 
 /* get_work_q(): will get a work_q_item from the beginning of the work queue, return NULL if

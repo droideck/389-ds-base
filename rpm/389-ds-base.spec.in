@@ -60,6 +60,9 @@
 # Build cockpit plugin
 %bcond cockpit 1
 
+# Build with SystemTap/USDT probes enabled
+%bcond systemtap 1
+
 # fedora 15 and later uses tmpfiles.d
 # otherwise, comment this out
 %{!?with_tmpfiles_d: %global with_tmpfiles_d %{_sysconfdir}/tmpfiles.d}
@@ -132,6 +135,9 @@ BuildRequires:    openssl-devel
 BuildRequires:    pam-devel
 BuildRequires:    systemd-units
 BuildRequires:    systemd-devel
+%if %{with systemtap}
+BuildRequires:    systemtap-sdt-devel
+%endif
 BuildRequires:    cargo
 BuildRequires:    rust
 BuildRequires:    pkgconfig
@@ -414,6 +420,10 @@ RUST_FLAGS="--enable-rust --enable-rust-offline"
 COCKPIT_FLAGS="--disable-cockpit"
 %endif
 
+%if %{with systemtap}
+SYSTEMTAP_FLAGS="--enable-systemtap"
+%endif
+
 %if %{with bundle_jemalloc}
 # Override page size, bz #1545539
 # 4K
@@ -471,7 +481,7 @@ autoreconf -fiv
            --with-systemdsystemconfdir=%{_sysconfdir}/systemd/system \
            --with-systemdgroupname=%{groupname} \
            --libexecdir=%{_libexecdir}/%{pkgname} \
-           $ASAN_FLAGS $MSAN_FLAGS $TSAN_FLAGS $UBSAN_FLAGS $RUST_FLAGS $CLANG_FLAGS $COCKPIT_FLAGS \
+           $ASAN_FLAGS $MSAN_FLAGS $TSAN_FLAGS $UBSAN_FLAGS $RUST_FLAGS $CLANG_FLAGS $COCKPIT_FLAGS $SYSTEMTAP_FLAGS \
 %if 0%{?fedora} >= 34 || 0%{?rhel} >= 9
            --with-libldap-r=no \
 %endif

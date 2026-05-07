@@ -291,6 +291,8 @@ AC_ARG_ENABLE(systemtap, AS_HELP_STRING([--enable-systemtap], [Enable systemtap 
               [], [ enable_systemtap=no ])
 AC_MSG_RESULT($enable_systemtap)
 if test "$enable_systemtap" = yes ; then
+  AC_CHECK_HEADER([sys/sdt.h], [],
+    [AC_MSG_ERROR([systemtap support requires <sys/sdt.h>. Install systemtap-sdt-devel (Fedora/RHEL) or systemtap-sdt-dev (Debian/Ubuntu).])])
   systemtap_defs="-DSYSTEMTAP"
 else
   systemtap_defs=""
