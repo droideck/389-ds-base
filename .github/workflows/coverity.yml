@@ -3,22 +3,68 @@ name: Coverity Scan
 on:
   schedule:
     - cron:  '30 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   coverity:
     runs-on: ubuntu-24.04
+    env:
+      COVERITY_PROJECT: 389ds/389-ds-base
+      COVERITY_BUILD_LANGUAGE: cxx
+      COVERITY_BUILD_PLATFORM: linux64
 
     container:
       image: quay.io/389ds/ci-images:fedora
 
     steps:
       - uses: actions/checkout@v6
+
       - name: Checkout and configure
         run: autoreconf -fvi && ./configure
 
-      - uses: vapier/coverity-scan-action@v1
+      - name: Validate Coverity credentials
+        run: bash .github/scripts/coverity-scan.sh validate-env
+        env:
+          COVERITY_SCAN_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+
+      - name: Lookup Coverity Build Tool hash
+        id: coverity-cache-lookup
+        run: bash .github/scripts/coverity-scan.sh lookup-hash
+        env:
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+
+      - name: Cache Coverity Build Tool
+        id: cov-build-cache
+        uses: actions/cache@v4
         with:
-          project: '389ds/389-ds-base'
-          command: make
-          email: ${{ secrets.COVERITY_SCAN_EMAIL }}
-          token: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          path: ${{ github.workspace }}/cov-analysis
+          key: cov-build-${{ env.COVERITY_BUILD_LANGUAGE }}-${{ env.COVERITY_BUILD_PLATFORM }}-${{ steps.coverity-cache-lookup.outputs.hash }}
+
+      - name: Install Coverity Build Tool
+        if: steps.cov-build-cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/coverity-scan.sh install-tool
+        env:
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+
+      - name: Verify Coverity Build Tool
+        run: bash .github/scripts/coverity-scan.sh verify-tool
+
+      - name: Build with cov-build
+        run: bash .github/scripts/coverity-scan.sh build
+
+      - name: Archive results
+        run: bash .github/scripts/coverity-scan.sh archive
+
+      - name: Submit results to Coverity Scan
+        run: bash .github/scripts/coverity-scan.sh submit
+        env:
+          COVERITY_SCAN_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
