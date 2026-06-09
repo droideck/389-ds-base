@@ -39,6 +39,9 @@ jobs:
       - name: Add GITHUB_WORKSPACE as a safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Install CodeQL dependencies
+        run: dnf install -y which
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
