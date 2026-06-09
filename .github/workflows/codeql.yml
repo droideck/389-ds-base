@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: cpp
+          - language: c-cpp
             build_mode: manual
           - language: python
             build_mode: none
@@ -50,19 +50,19 @@ jobs:
           queries: +security-and-quality
 
       - name: Configure
-        if: matrix.language == 'cpp'
+        if: matrix.language == 'c-cpp'
         run: |
           set -o pipefail
           (autoreconf -fvi && ./configure) 2>&1 | tee codeql-build.log
 
       - name: Build
-        if: matrix.language == 'cpp'
+        if: matrix.language == 'c-cpp'
         run: |
           set -o pipefail
           make -j$(nproc) 2>&1 | tee -a codeql-build.log
 
       - name: Upload build and configuration artifacts
-        if: always() && matrix.language == 'cpp'
+        if: always() && matrix.language == 'c-cpp'
         uses: actions/upload-artifact@v7
         with:
           name: codeql-build-cpp
