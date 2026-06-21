@@ -592,14 +592,15 @@ def test_replication_log_monitoring_filter_combinations(topo_m4):
 
         log_dirs = _get_log_dirs(suppliers)
 
-        # Test combined filters
+        # Test filters whose inputs are controlled by this replication flow.
+        # etime_lowest is intentionally covered by a deterministic test below:
+        # replication lag can come from backlog wait time while replay etime is
+        # still legitimately below 1ms on fast systems.
         lag_threshold = 0.5
-        etime_threshold = 0.001
         repl_monitor = ReplicationLogAnalyzer(
             log_dirs=log_dirs,
             suffixes=[DEFAULT_SUFFIX],
             lag_time_lowest=lag_threshold,
-            etime_lowest=etime_threshold,
             only_fully_replicated=True,
             time_range={'start': start_time, 'end': end_time}
         )
@@ -620,7 +621,7 @@ def test_replication_log_monitoring_filter_combinations(topo_m4):
             lag_time = max(t_list) - min(t_list)
 
             # Verify all filters were applied
-            assert lag_time >= lag_threshold, "Lag time filter not applied"
+            assert lag_time > lag_threshold, "Lag time filter not applied"
             assert len(t_list) == len(suppliers), "Not fully replicated"
 
             # Verify time range
@@ -630,6 +631,66 @@ def test_replication_log_monitoring_filter_combinations(topo_m4):
     finally:
         _resume_agreements(paused_agreements)
         _cleanup_test_data(test_users, tmp_dir)
+
+
+def test_replication_log_monitoring_filter_threshold_interactions():
+    """Test threshold filter interactions with deterministic records
+
+    :id: 4cbd96a5-9cdf-4772-886e-2a47d39e9d00
+    :setup: Synthetic replication log records for four suppliers
+    :steps:
+        1. Apply fully-replicated, lag, and etime filters to matching records
+        2. Apply the same filters when one server etime is below threshold
+        3. Apply the same filters when lag is below threshold
+        4. Apply the same filters when a CSN is not fully replicated
+    :expectedresults:
+        1. Matching records should be included
+        2. Records with one low etime should be excluded
+        3. Records with low lag should be excluded
+        4. Partially replicated records should be excluded
+    """
+
+    def repl_record(logtime, etime):
+        return {
+            'logtime': logtime,
+            'etime': etime,
+        }
+
+    repl_monitor = ReplicationLogAnalyzer(
+        log_dirs=['supplier1', 'supplier2', 'supplier3', 'supplier4'],
+        lag_time_lowest=0.5,
+        etime_lowest=0.001,
+        only_fully_replicated=True
+    )
+
+    matching_records = {
+        0: repl_record(100.0, '0.0011'),
+        1: repl_record(100.2, '0.0012'),
+        2: repl_record(100.8, '0.0013'),
+        3: repl_record(101.0, '0.0014'),
+    }
+    # These filters only inspect server_map; the CSN value is arbitrary.
+    arbitrary_csn = '00000000000000000000'
+    assert repl_monitor._should_include_record(arbitrary_csn, matching_records)
+
+    low_etime_records = matching_records.copy()
+    low_etime_records[1] = repl_record(100.2, '0.0009')
+    assert not repl_monitor._should_include_record(arbitrary_csn, low_etime_records)
+
+    low_lag_records = {
+        0: repl_record(100.0, '0.0011'),
+        1: repl_record(100.1, '0.0012'),
+        2: repl_record(100.2, '0.0013'),
+        3: repl_record(100.3, '0.0014'),
+    }
+    assert not repl_monitor._should_include_record(arbitrary_csn, low_lag_records)
+
+    partially_replicated_records = matching_records.copy()
+    del partially_replicated_records[3]
+    assert not repl_monitor._should_include_record(
+        arbitrary_csn,
+        partially_replicated_records
+    )
 
 
 def test_replication_log_monitoring_csn_details_edge_cases(topo_m4):
