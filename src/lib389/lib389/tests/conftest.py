@@ -47,11 +47,13 @@ def fake_ds_modules(request):
     # module_dir contains fake ds modules, that can be used for testing
     module_dir = mkdtemp()
     old_cwd = os.getcwd()
+    old_sys_path = sys.path[:]
 
     # when fixture is destroyed, we change back to old cwd
     # and delete fake module dir
     def fin():
         os.chdir(old_cwd)
+        sys.path[:] = old_sys_path
         rmtree(module_dir)
     request.addfinalizer(fin)
 

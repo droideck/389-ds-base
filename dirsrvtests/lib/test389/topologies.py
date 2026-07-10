@@ -69,6 +69,76 @@ def _remove_ssca_db(topology):
         return True
 
 
+def _stop_instances(instances, phase, propagate_first_error=False):
+    """Stop every instance, optionally raising the first failure afterwards."""
+
+    first_error = None
+    for instance in instances:
+        serverid = getattr(instance, 'serverid', '<unallocated>')
+        try:
+            instance.stop()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            log.exception("Failed to stop instance %s %s", serverid, phase)
+
+    if propagate_first_error and first_error is not None:
+        raise first_error
+
+
+def _delete_instances(instances, phase, check_exists=False,
+                      propagate_first_error=False):
+    """Delete every instance, optionally raising the first failure afterwards."""
+
+    first_error = None
+    for instance in instances:
+        serverid = getattr(instance, 'serverid', '<unallocated>')
+        try:
+            if not check_exists or instance.exists():
+                instance.delete()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            log.exception("Failed to delete instance %s %s", serverid, phase)
+
+    if propagate_first_error and first_error is not None:
+        raise first_error
+
+
+def _unbind_instances(instances, phase):
+    """Close every LDAP handle without allowing one failure to interrupt cleanup."""
+
+    for instance in instances:
+        serverid = getattr(instance, 'serverid', '<unallocated>')
+        try:
+            instance.unbind_s(escapehatch='i am sure')
+        except Exception:
+            log.debug("Failed to unbind instance %s %s", serverid, phase, exc_info=True)
+
+
+def _cleanup_failed_create(instances):
+    """Best-effort cleanup for instances involved in a failed topology creation."""
+
+    if instances:
+        latest_instance = instances[-1]
+        diagnostics = getattr(latest_instance, '_log_start_failure_diagnostics', None)
+        if diagnostics:
+            try:
+                diagnostics()
+            except Exception:
+                log.exception(
+                    "Failed to collect diagnostics for instance %s after topology creation failed",
+                    getattr(latest_instance, 'serverid', '<unallocated>')
+                )
+
+    instances = list(reversed(instances))
+    phase = "after topology creation failed"
+    _stop_instances(instances, phase, propagate_first_error=False)
+    _unbind_instances(instances, phase)
+    if not DEBUGGING:
+        _delete_instances(instances, phase, propagate_first_error=False)
+
+
 def _create_instances(topo_dict, suffix):
     """Create requested instances without replication or any other modifications
 
@@ -80,6 +150,19 @@ def _create_instances(topo_dict, suffix):
 
     :return - TopologyMain object
     """
+
+    allocated_instances = []
+    try:
+        return _create_instances_impl(topo_dict, suffix, allocated_instances)
+    except Exception:
+        # Keep cleanup failures from replacing the exception which caused topology
+        # creation to fail.
+        _cleanup_failed_create(allocated_instances)
+        raise
+
+
+def _create_instances_impl(topo_dict, suffix, allocated_instances):
+    """Create instances while recording every object that may need cleanup."""
 
     nbinsts = sum(topo_dict.values())
     instances = {}
@@ -123,10 +206,14 @@ def _create_instances(topo_dict, suffix):
             instance.allocate(args_instance)
 
             instance_exists = instance.exists()
+            log.info("Instance %s exists before creation: %s", instance.serverid, instance_exists)
 
             if instance_exists:
                 instance.delete()
 
+            # Cleanup owns this object only after any pre-existing instance has
+            # been handled and this creation attempt is about to begin.
+            allocated_instances.append(instance)
             instance.create()
             # We set a URL here to force ldap:// only. Once we turn on TLS
             # we'll flick this to ldaps.
@@ -200,15 +287,37 @@ def create_topology(topo_dict, suffix=DEFAULT_SUFFIX, request=None, cleanup_cb=N
         log.info(f"Topology has a request")
         def fin():
             alarm(0)
-            [inst.stop() for inst in topo]
-            if DEBUGGING is None:
+            topology_instances = list(topo)
+            cleanup_error = None
+            try:
+                _stop_instances(topology_instances, "during topology cleanup",
+                                propagate_first_error=True)
+            except Exception as exc:
+                cleanup_error = exc
+            _unbind_instances(topology_instances, "during topology cleanup")
+            if not DEBUGGING:
                 if cleanup_cb:
-                    cleanup_cb(topo)
-                if not _remove_ssca_db(topo):
-                    log.warning("Failed to remove the CA certificate database during the tescase cleanup phase.")
-                for inst in topo:
-                    if inst.exists():
-                        inst.delete()
+                    try:
+                        cleanup_cb(topo)
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                        log.exception("Topology cleanup callback failed")
+                try:
+                    if not _remove_ssca_db(topo):
+                        log.warning("Failed to remove the CA certificate database during test case cleanup")
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    log.exception("Failed to remove the CA certificate database during topology cleanup")
+                try:
+                    _delete_instances(topology_instances, "during topology cleanup",
+                                      check_exists=True, propagate_first_error=True)
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            if cleanup_error is not None:
+                raise cleanup_error
 
         request.addfinalizer(fin)
 

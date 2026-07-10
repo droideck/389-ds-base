@@ -47,7 +47,7 @@ from lib389.utils import (
     get_default_mdb_max_size,
     normalizeDN,
     parse_size,
-    socket_check_open,
+    socket_check_bind,
     selinux_label_file,
     selinux_label_port,
     resolve_selinux_path,
@@ -84,7 +84,7 @@ def get_port(port, default_port, secure=False):
                 continue
 
             # Validate port is available
-            if socket_check_open('::1', port):
+            if not socket_check_bind(port):
                 print('Port number {} is already in use, please choose a different port number'.format(port))
                 continue
 
@@ -381,7 +381,7 @@ class SetupDs(object):
                 slapd[key] = value.format(instance_name=slapd['instance_name'])
 
         # Non-Secure Port
-        if not socket_check_open('::1', slapd['port']):
+        if socket_check_bind(slapd['port']):
             port = get_port(slapd['port'], slapd['port'])
         else:
             # Port 389 is already taken, pick another port
@@ -407,7 +407,7 @@ class SetupDs(object):
 
         # Secure Port (only if using self signed cert)
         if slapd['self_sign_cert']:
-            if not socket_check_open('::1', slapd['secure_port']):
+            if socket_check_bind(slapd['secure_port']):
                 port = get_port(slapd['secure_port'], slapd['secure_port'], secure=True)
             else:
                 # Port 636 is already taken, pick another port
@@ -714,10 +714,10 @@ class SetupDs(object):
                 self.log.warning("WARNING: slapd port %s may not work without NET_BIND_SERVICE in containers" % slapd['port'])
             if slapd['secure_port'] <= 1024:
                 self.log.warning("WARNING: slapd secure_port %s may not work without NET_BIND_SERVICE in containers" % slapd['secure_port'])
-        assert_c(socket_check_open('::1', slapd['port']) is False, "port %s is already in use, or missing NET_BIND_SERVICE" % slapd['port'])
+        assert_c(socket_check_bind(slapd['port']), "port %s is already in use, or missing NET_BIND_SERVICE" % slapd['port'])
         # We enable secure port by default.
         assert_c(slapd['secure_port'] is not None, "Configuration secure_port in section [slapd] not found")
-        assert_c(socket_check_open('::1', slapd['secure_port']) is False, "secure_port %s is already in use, or missing NET_BIND_SERVICE" % slapd['secure_port'])
+        assert_c(socket_check_bind(slapd['secure_port']), "secure_port %s is already in use, or missing NET_BIND_SERVICE" % slapd['secure_port'])
         self.log.debug("PASSED: network avaliability checking")
 
         # Make assertions of the paths?
@@ -755,18 +755,34 @@ class SetupDs(object):
         if self.dryrun:
             self.log.info("NOOP: Dry run requested")
         else:
-            # Actually trigger the installation.
+            # Actually trigger the installation.  Once _install_ds starts it
+            # can leave files, a systemd unit, or a running process behind, so
+            # every failure from this point must use the failed-install cleanup
+            # path.  In particular, DirSrv.start() raises CalledProcessError
+            # when systemd cannot start the instance; limiting this handler to
+            # ValueError used to leave partial test instances behind.
+            install_ds_complete = False
             try:
                 self._install_ds(general, slapd, backends)
-            except ValueError as e:
+                install_ds_complete = True
+                # Call the child api to do anything it needs.
+                self._install(extra)
+            except Exception as e:
                 if DEBUGGING is False:
-                    self._remove_failed_install(slapd['instance_name'])
+                    self.log.info("Removing incomplete installation %s after setup failed",
+                                  slapd['instance_name'])
+                    try:
+                        self._remove_failed_install(slapd['instance_name'])
+                    except Exception:
+                        # Cleanup is best-effort and must never hide the
+                        # exception which caused installation to fail.
+                        self.log.exception("Failed to remove incomplete installation %s",
+                                           slapd['instance_name'])
                 else:
                     self.log.fatal(f"Error: {str(e)}, preserving incomplete installation for analysis...")
-                raise ValueError(f"Instance creation failed!  {str(e)}")
-
-            # Call the child api to do anything it needs.
-            self._install(extra)
+                if not install_ds_complete and isinstance(e, ValueError):
+                    raise ValueError(f"Instance creation failed!  {str(e)}") from e
+                raise
         self.log.debug("FINISH: Completed installation for instance: slapd-%s", slapd['instance_name'])
         if not self.verbose:
             self.log.info("Completed installation for instance: slapd-%s", slapd['instance_name'])

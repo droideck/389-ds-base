@@ -1126,6 +1126,177 @@ class DirSrv(SimpleLDAPObject, object):
         else:
             logger.info('Cannot find the error log file %s.' % errlog)
 
+    @staticmethod
+    def _filter_start_failure_socket_output(output, ports, max_lines=50):
+        """Return only socket rows which mention one of the instance ports."""
+        if not ports:
+            return []
+        if isinstance(output, bytes):
+            output = output.decode(errors='replace')
+        elif output is None:
+            output = ''
+        else:
+            output = str(output)
+
+        port_pattern = re.compile(
+            r':(?:%s)(?![0-9])' %
+            '|'.join(re.escape(str(port)) for port in ports)
+        )
+        lines = output.splitlines()
+        matches = [line for line in lines if port_pattern.search(line)]
+        if not matches:
+            return []
+
+        # Keep the command's column headings when available, but never log
+        # unrelated socket rows.  The cap prevents a pathological socket list
+        # from flooding a CI log.
+        heading_prefixes = ('State ', 'Netid ', 'COMMAND ', 'Proto ')
+        selected = [line for line in lines
+                    if line.startswith(heading_prefixes) and line not in matches][:2]
+        selected.extend(matches[:max_lines])
+        if len(matches) > max_lines:
+            selected.append('... %d additional matching socket rows omitted' %
+                            (len(matches) - max_lines))
+        return selected
+
+    @staticmethod
+    def _run_start_failure_diagnostic_command(command):
+        """Run a diagnostic command without invoking a shell."""
+        return subprocess.run(command,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,
+                              universal_newlines=True,
+                              timeout=5,
+                              check=False,
+                              shell=False)
+
+    def _collect_start_failure_socket_diagnostics(self, ports):
+        """Collect TCP socket state, preferring ss and portable fallbacks."""
+        attempts = []
+
+        try:
+            result = self._run_start_failure_diagnostic_command(['ss', '-tanp'])
+            if result.returncode == 0:
+                rows = self._filter_start_failure_socket_output(result.stdout, ports)
+                return 'ss -tanp', rows
+            attempts.append('ss exited with status %s' % result.returncode)
+        except Exception as exc:
+            attempts.append('ss unavailable (%s)' % type(exc).__name__)
+
+        # lsof retains process ownership and state on systems without ss.  A
+        # status of 1 means that no matching sockets were found, not that the
+        # diagnostic itself failed.
+        try:
+            command = ['lsof', '-nP'] + ['-iTCP:%d' % port for port in ports]
+            result = self._run_start_failure_diagnostic_command(command)
+            if result.returncode in (0, 1):
+                rows = self._filter_start_failure_socket_output(result.stdout, ports)
+                return 'lsof -nP -iTCP:<port>', rows
+            attempts.append('lsof exited with status %s' % result.returncode)
+        except Exception as exc:
+            attempts.append('lsof unavailable (%s)' % type(exc).__name__)
+
+        try:
+            result = self._run_start_failure_diagnostic_command(['netstat', '-tan'])
+            if result.returncode == 0:
+                rows = self._filter_start_failure_socket_output(result.stdout, ports)
+                return 'netstat -tan', rows
+            attempts.append('netstat exited with status %s' % result.returncode)
+        except Exception as exc:
+            attempts.append('netstat unavailable (%s)' % type(exc).__name__)
+
+        return None, attempts
+
+    @staticmethod
+    def _read_start_failure_port_setting(path):
+        """Read a Linux port-allocation sysctl through procfs."""
+        with open(path, 'r', encoding='ascii', errors='replace') as setting_file:
+            return ' '.join(setting_file.read().split())
+
+    @staticmethod
+    def _format_start_failure_output(output):
+        """Format subprocess output without allowing decoding errors."""
+        if isinstance(output, bytes):
+            return output.decode(errors='replace')
+        if output is None:
+            return ''
+        return str(output)
+
+    def _log_start_failure_diagnostics(self):
+        """Log actionable, best-effort diagnostics after an instance fails to start.
+
+        This deliberately avoids configuration contents, environment variables,
+        and command lines so that credentials cannot be exposed.  Every section
+        is isolated so a failed diagnostic cannot hide the startup exception.
+        """
+        try:
+            try:
+                instance_exists = self.exists()
+            except Exception as exc:
+                instance_exists = 'unavailable (%s)' % type(exc).__name__
+
+            self.log.error(
+                'Start failure diagnostics: serverid=%r exists=%r state=%r '
+                'LDAP port=%r LDAPS port=%r',
+                getattr(self, 'serverid', None),
+                instance_exists,
+                getattr(self, 'state', None),
+                getattr(self, 'port', None),
+                getattr(self, 'sslport', None)
+            )
+        except Exception:
+            pass
+
+        try:
+            port_settings = []
+            settings = (
+                ('ip_local_port_range', '/proc/sys/net/ipv4/ip_local_port_range'),
+                ('ip_local_reserved_ports', '/proc/sys/net/ipv4/ip_local_reserved_ports'),
+            )
+            for name, path in settings:
+                try:
+                    value = self._read_start_failure_port_setting(path)
+                except OSError:
+                    continue
+                except Exception as exc:
+                    value = 'unavailable (%s)' % type(exc).__name__
+                port_settings.append('%s=%r' % (name, value))
+            if port_settings:
+                self.log.error('Linux TCP port allocation: %s', ' '.join(port_settings))
+        except Exception:
+            pass
+
+        try:
+            ports = []
+            for configured_port in (getattr(self, 'port', None),
+                                    getattr(self, 'sslport', None)):
+                try:
+                    port = int(configured_port)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < port <= 65535 and port not in ports:
+                    ports.append(port)
+
+            if not ports:
+                self.log.error('TCP socket diagnostics skipped: no configured TCP ports')
+                return
+
+            source, rows = self._collect_start_failure_socket_diagnostics(ports)
+            if source is None:
+                self.log.error('TCP socket diagnostics unavailable for ports %s: %s',
+                               ports, '; '.join(rows))
+            elif rows:
+                self.log.error('TCP socket diagnostics from %s for ports %s:\n%s',
+                               source, ports, '\n'.join(rows))
+            else:
+                self.log.error('TCP socket diagnostics from %s: no entries for ports %s',
+                               source, ports)
+        except Exception as exc:
+            try:
+                self.log.error('TCP socket diagnostics failed (%s)', type(exc).__name__)
+            except Exception:
+                pass
+
     def start(self, timeout=120, post_open=True):
         '''
             It starts an instance and rebind it. Its final state after rebind
@@ -1153,9 +1324,12 @@ class DirSrv(SimpleLDAPObject, object):
             try:
                 subprocess.check_output(["systemctl", "start", "dirsrv@%s" % self.serverid], stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as e:
-                self.dump_errorlog()
-                logger.info('Failed to start dirsrv@%s: "%s"' % (self.serverid, e.output.decode()))
-                logger.info(e)
+                self._log_start_failure_diagnostics()
+                with suppress(Exception):
+                    self.dump_errorlog()
+                self.log.error('Failed to start dirsrv@%s: "%s"',
+                               self.serverid, self._format_start_failure_output(e.output))
+                self.log.error(e)
                 raise e from None
         else:
             self.log.debug("systemd status -> False")
@@ -1180,10 +1354,13 @@ class DirSrv(SimpleLDAPObject, object):
                 self.log.debug("DEBUG: starting with %s" % cmd)
                 output = subprocess.check_output(*cmd, env=env, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as e:
-                self.dump_errorlog()
-                self.log.error('Failed to start ns-slapd: "%s"' % e.output.decode())
+                self._log_start_failure_diagnostics()
+                with suppress(Exception):
+                    self.dump_errorlog()
+                self.log.error('Failed to start ns-slapd: "%s"',
+                               self._format_start_failure_output(e.output))
                 self.log.error(e)
-                raise ValueError('Failed to start DS')
+                raise ValueError('Failed to start DS') from e
             count = timeout
             pid = pid_from_file(self.pid_file())
             while (pid is None) and count > 0:
@@ -1191,6 +1368,7 @@ class DirSrv(SimpleLDAPObject, object):
                 time.sleep(1)
                 pid = pid_from_file(self.pid_file())
             if pid == 0 or pid is None:
+                self._log_start_failure_diagnostics()
                 self.log.error("Unable to find pid (%s) of ns-slapd process" % self.pid_file())
                 raise ValueError('Failed to start DS')
             # Wait
@@ -1202,7 +1380,9 @@ class DirSrv(SimpleLDAPObject, object):
                 time.sleep(1)
                 count -= 1
             if not pid_exists(pid):
-                self.dump_errorlog()
+                self._log_start_failure_diagnostics()
+                with suppress(Exception):
+                    self.dump_errorlog()
                 self.log.error("pid (%s) of ns-slapd process does not exist" % pid)
                 raise ValueError("Failed to start DS")
         if post_open:

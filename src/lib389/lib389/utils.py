@@ -1420,28 +1420,42 @@ def socket_check_open(host, port):
 
 def socket_check_bind(port):
     """
-    Check if a socket can be bound.  Need to handle cases where IPv6 is
-    completely disabled.
+    Check whether wildcard TCP sockets can be bound to a port.
+
+    Directory Server listens on all configured interfaces, so checking only a
+    loopback address can miss an existing socket on another local address.  An
+    established client connection can also own the prospective listener port
+    as its ephemeral source port.  Probe IPv6 and IPv4 independently and treat
+    an unavailable IPv6 stack as optional.
     """
-    # Trying IPv6 first ...
-    host = "::1"
-    family = socket.AF_INET6
-    try:
-        with closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
-            sock.bind((host, port))
-            return True
-    except OSError as e:
-        if e.errno == errno.EACCES or  e.errno == errno.EADDRINUSE:
+    checked_family = False
+    ipv6_unavailable = {
+        errno.EAFNOSUPPORT,
+        errno.EADDRNOTAVAIL,
+        errno.EPROTONOSUPPORT,
+    }
+    if hasattr(errno, 'ENODEV'):
+        ipv6_unavailable.add(errno.ENODEV)
+
+    for family, host in ((socket.AF_INET6, "::"),
+                         (socket.AF_INET, "0.0.0.0")):
+        try:
+            with closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+                # Match ns-slapd's listener semantics.  The server enables
+                # SO_REUSEADDR before PR_Bind(), which allows it to reclaim a
+                # listener port left in TIME_WAIT after a normal shutdown.
+                # An established client which owns this port as its source
+                # still makes the bind fail, so the collision check remains
+                # effective for topology ports.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((host, port))
+                checked_family = True
+        except OSError as e:
+            if family == socket.AF_INET6 and e.errno in ipv6_unavailable:
+                continue
             return False
-    # Maybe there is no IPv6, adjust hostname, and try IPv4 ...
-    host = "127.0.0.1"
-    family = socket.AF_INET
-    try:
-        with closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
-            sock.bind((host, port))
-            return True
-    except OSError as e:
-        return False
+
+    return checked_family
 
 
 def ensure_bytes(val):

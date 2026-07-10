@@ -81,10 +81,21 @@ For more detailed examples on managing users, groups, services, and other direct
 
 Please see our [contributing guide](https://www.port389.org/docs/389ds/contributing.html).
 
+### Unit tests
+
+Run the hermetic lib389 unit-test set from this directory with:
+
+```bash
+python3 -m pytest -c pytest-unit.ini
+```
+
+The broader `lib389/tests` tree also contains legacy tests that create live
+Directory Server instances. Those tests require the privileged integration
+environment and are intentionally not part of the unit-test manifest.
+
 ## License
 
 The 389 Directory Server is subject to the terms detailed in the
 license agreement file called LICENSE in the main project directory.
-
 
 
