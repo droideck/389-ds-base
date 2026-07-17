@@ -100,6 +100,7 @@ index reproRegion  eq
 index reproMailAlt eq
 index reproHostname eq
 index reproManager eq
+index member       eq
 index reproScore   eq
 index reproLevel   eq
 # reproFlag and reproNote stay deliberately UNINDEXED.

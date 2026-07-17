@@ -115,6 +115,22 @@ FAT_TOKEN = "Megaword"
 FAT_MOD = 6
 FAT_RESIDUE = 3
 
+# S10 groups: groupOfNames entries whose member value counts bracket the
+# OR-lookup fast path's DN value-count guard (an OR of S10_TARGET_WIDTH
+# member equalities declines per entry when the entry holds more values
+# than the table has keys). Three classes: m = width/2, width, 2*width.
+# Group cn values are digit-only so no substring/NOT component of the
+# other shapes can ever match a group: every pre-existing expected set
+# stays byte-identical. Emission is formula-driven (no rng consumption),
+# so the user entries are byte-identical to pre-s10 data too.
+GROUPS_OU = "ou=groups," + SUFFIX
+S10_TARGET_WIDTH = 64          # OR components per s10 filter
+S10_CLASSES = [32, 64, 128]    # member values per group, by class
+S10_PER_CLASS = 120            # groups per class
+S10_EXPECTED = 40              # groups per class holding one target member
+S10_TARGET_BASES = [0, 1000, 2000]  # first target uid index, by class
+S10_FILLER_FLOOR = 50000       # fillers never collide with target ranges
+
 
 def build_tag_assignments(rng, n_entries):
     """Pool of tag values, each used by 1-10 entries; 2 assignments per entry.
@@ -246,6 +262,32 @@ def main():
             lines.append("reproMailAlt: %s.alt%d@alt.example.net" % (uid, m))
         out.write("\n".join(lines))
         out.write("\n\n")
+
+    # S10 groups (deterministic formulas only - no rng consumption, so the
+    # user entries above and every later rng draw are unaffected).
+    out.write("dn: %s\n" % GROUPS_OU)
+    out.write("objectClass: top\n")
+    out.write("objectClass: organizationalUnit\n")
+    out.write("ou: groups\n\n")
+    for ci, msize in enumerate(S10_CLASSES):
+        base = S10_TARGET_BASES[ci]
+        for t in range(S10_PER_CLASS):
+            gcn = "9%d%04d" % (ci, t)
+            members = []
+            if t < S10_EXPECTED:
+                members.append(base + (t % S10_TARGET_WIDTH))
+            fill_base = S10_FILLER_FLOOR + ((ci * S10_PER_CLASS + t) * 173) % 40000
+            j = 0
+            while len(members) < msize:
+                members.append(fill_base + j)
+                j += 1
+            out.write("dn: cn=%s,%s\n" % (gcn, GROUPS_OU))
+            out.write("objectClass: top\n")
+            out.write("objectClass: groupOfNames\n")
+            out.write("cn: %s\n" % gcn)
+            for uidx in members:
+                out.write("member: uid=user%07d,%s\n" % (uidx, PEOPLE))
+            out.write("\n")
     out.close()
 
     surviving_tags = sorted(set(tag_assignments))
@@ -297,6 +339,16 @@ def main():
         "level_wide": list(LEVEL_WIDE),
         "hostname_format": "host%07d.example.com",
         "manager_mod": MANAGER_MOD,
+        "groups_ou": GROUPS_OU,
+        "group_entries": len(S10_CLASSES) * S10_PER_CLASS,
+        "s10": {
+            "target_width": S10_TARGET_WIDTH,
+            "classes": S10_CLASSES,
+            "per_class": S10_PER_CLASS,
+            "expected_per_class": S10_EXPECTED,
+            "target_bases": S10_TARGET_BASES,
+            "member_format": "uid=user%%07d,%s" % PEOPLE,
+        },
     }
     with open(args.manifest, "w") as f:
         json.dump(manifest, f, indent=2)

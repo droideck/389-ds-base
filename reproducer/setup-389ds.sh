@@ -146,6 +146,7 @@ dsc backend index add --attr reproRegion   --index-type eq userRoot
 dsc backend index add --attr reproMailAlt  --index-type eq userRoot
 dsc backend index add --attr reproHostname --index-type eq userRoot
 dsc backend index add --attr reproManager  --index-type eq userRoot
+# member (s10 shapes) needs no add: it is a default eq index in 389-ds
 dsc backend index add --attr reproScore    --index-type eq --matching-rule integerOrderingMatch userRoot
 dsc backend index add --attr reproLevel    --index-type eq --matching-rule integerOrderingMatch userRoot
 # reproFlag and reproNote stay deliberately UNINDEXED.

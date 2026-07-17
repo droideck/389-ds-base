@@ -164,3 +164,69 @@ because the ALLIDS base leaves no minimum to bound against, then the
   (min(4000, lookthroughlimit) extra entry evaluations, worst case).
 - **s2/s4 large ORs** are not improved by this series (see above); #6275
   stays open with the analysis.
+
+## The OR fix: per-entry equality-lookup tables (follow-up series)
+
+The residual O(result x k) of the per-entry filter test - the cost the
+union-rewrite gate isolated and left open above - is addressed by
+per-operation equality-lookup tables on the backend's private filter dups
+(`filter_or_lookup.c`; engagement rules and fallbacks in
+`filter-perf-design.md` section 11). Build under test:
+`3.3.0.202607171924gitd4f9c367b`. The series column below was RE-MEASURED
+in the same session on the same host (`3.3.0.202607170613git3e12baa81`,
+per-row stamps in `results/matrix.csv`) rather than compared against the
+committed numbers above - emulated host, moving CI image; the re-measured
+values agree with the committed ones within noise everywhere.
+
+| Shape | Expected | 389 series (re-measured) | 389 + OR lookup | OpenLDAP 2.6 | Verdict |
+|---|---|---|---|---|---|
+| s2-uid-125 | 125 | 0.024 | 0.005 | 0.001 | |
+| s2-uid-250 | 250 | 0.077 | 0.008 | 0.003 | |
+| s2-uid-500 | 500 | 0.276 | 0.011 | 0.014 | faster than OpenLDAP from here up |
+| s2-uid-1000 (#6275 literal) | 1000 | 1.071 | 0.019 | 0.045 | 56x; ~quadratic ladder now ~linear in results |
+| s2-tag-125 | 713 | 0.117 | 0.011 | 0.007 | |
+| s2-tag-250 | 1359 | 0.422 | 0.019 | 0.024 | |
+| s2-tag-500 | 2813 | 1.707 | 0.037 | 0.080 | |
+| s2-tag-1000 (member-like) | 5415 | 6.542 | 0.068 | 0.258 | 96x; 3.8x faster than OpenLDAP |
+| s4-400 (SSSD-analog OR in AND) | 2203 | 1.097 | 0.038 | 0.056 | 29x |
+| s6 (37-value score OR + fat sub) | 619 | 0.110 | 0.023 | 0.003 | the cap's losing shape recovers 5x |
+| s1 (mega-AND with big tag OR) | 120 | 0.103 | 0.095 | 0.138 | inner OR benefits too |
+| s3b (OR of two bounded ANDs) | 39 | 0.008 | 0.006 | 0.000 | |
+| s4-10 (SSSD 10-branch sentinel) | 62 | 0.007 | 0.007 | 0.000 | below threshold 16: today's path byte-for-byte |
+| s8-orsub-{4,16,64} | 16647 | 0.171-0.210 | 0.174-0.213 | 0.028-0.032 | substring ORs ineligible: parity (+1-4%) |
+| s9-notfirst | 16647 | 0.214 | 0.221 | 0.028 | parity |
+| s7-and-{1..64}, s9-not-{8,32} | 23 | 0.004-0.008 | 0.004-0.009 | 0.000-0.002 | no OR in these shapes; +-1ms = etime quantization |
+| s10-member-32 (m=32 < k=64) | 40 | - | 0.004 | 0.001 | table engages |
+| s10-member-64 (m=64 = k) | 40 | - | 0.004 | 0.001 | table engages |
+| s10-member-128 (m=128 > k) | 40 | - | 0.008 | 0.001 | DN value-count guard declines by design |
+
+Attribution probes on the OR-lookup build (same server, same data,
+access-log etimes):
+
+- Toggle cross-check: `nsslapd-enable-or-filter-lookup: off` restores
+  1.058-1.064s on the s2-uid-1000 filter (the series behavior exactly);
+  back on: 0.016-0.020s. The whole delta is the fast path.
+- 999-absent + 1-live 1000-value OR: ~0.007s - unchanged from the series
+  build, i.e. building two 1000-key tables per operation costs less than
+  the measurement floor even when only one entry is returned.
+
+Notes, honest as always:
+
+- s10 has no series column: the group entries did not exist in the
+  series-era data. The three rungs pin the value-count guard's crossover
+  instead: entries with more DN values than the table has keys (m > k)
+  take the classic walk (0.008s vs 0.004s at 40 results) - the guard
+  exists so 10k-member groups can never regress into O(m) probing
+  (the tbordaz 2023 uniqueMember cost class).
+- The 26 pre-existing shapes' expected DN sets are byte-identical before
+  and after the s10 data extension (verified md5-by-md5 at generation);
+  group cn values are digit-only so no legacy component can match them.
+- Sub-10ms shapes (s7-*, s9-not-*, s3, s5) show +-1ms movement between
+  builds; these filters contain no OR at all (s7/s9-not are AND/NOT of
+  equality+substring), so the fast path is not on their execution path -
+  the movement is etime quantization at the 1ms floor, not a regression.
+- Engagement/no-engagement of the table (s2/s4-400 engage; s4-10 and the
+  s8 substring ORs never) is pinned by
+  `dirsrvtests/tests/suites/filter/filter_or_lookup_test.py` via the
+  "OR filter equality lookup engaged" diagnostic rather than re-asserted
+  by this harness.

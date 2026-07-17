@@ -134,6 +134,7 @@ when `REPRO_CAP_BUILD=1`).
 | `s8-orsub-{4,16,64}` | top-level OR of N substrings (3/4 fat, 1/4 absent) | ISOLATION, OR only: identical result at every rung; never capped | false |
 | `s9-not-{8,32}` | s7-and-4 + M no-op NOTs | NOT probe: result identical to s7-and-4; NOTs must not change the cap picture | true |
 | `s9-notfirst` | `(&(!(eq absent))(2 fat substrings))` | NOT-of-equality staying first at runtime (isnot ALLIDS-subtraction path) | false |
+| `s10-member-{32,64,128}` | OR of 64 `member` equalities against groups holding 32/64/128 member values | OR-lookup DN value-count guard crossover: engages at m <= 64, declines at m = 128 (m > k) | false |
 
 The `Megaword` cn token (every non-golden entry with `i % 6 == 3`,
 16,647 entries at the default size) exists solely to give `s3`/`s3b`/`s6`

@@ -65,6 +65,7 @@ S4_SIZES = [10, 400]
 S7_SIZES = [1, 4, 16, 64]
 S8_SIZES = [4, 16, 64]
 S9_SIZES = [8, 32]
+S10_SIZES = [32, 64, 128]  # member values per group class (m-guard bracket)
 
 
 def esc_check(value):
@@ -465,6 +466,25 @@ def build_s4(rng, m, n):
     return ast, {"or_values": n, "all_live": True}
 
 
+def build_s10(m, msize):
+    """OR of target_width member equalities against the group class whose
+    entries hold msize member values each. The per-entry DN value-count
+    guard of the OR-lookup fast path declines when msize exceeds the OR's
+    component count, so the three classes bracket the crossover."""
+    s10 = m.get("s10")
+    if not s10:
+        sys.exit("data-manifest.json has no s10 block - regenerate the data "
+                 "with the current generate-data.py")
+    ci = s10["classes"].index(msize)
+    base = s10["target_bases"][ci]
+    member_fmt = s10["member_format"]
+    values = [member_fmt % (base + t) for t in range(s10["target_width"])]
+    return ("or", [("eq", "member", v) for v in values]), \
+        {"or_values": s10["target_width"], "attr": "member",
+         "group_member_count": msize,
+         "expected_groups": s10["expected_per_class"]}
+
+
 def build_s5(rng, m):
     host = m["hostname_format"] % (m["entries"] // 2)
     ast = ("and", [("or", [("eq", "objectClass", "inetOrgPerson"),
@@ -654,7 +674,8 @@ def main():
                   + ["s7-eqlast"]
                   + ["s8-orsub-%d" % n for n in S8_SIZES]
                   + ["s9-not-%d" % n for n in S9_SIZES]
-                  + ["s9-notfirst"])
+                  + ["s9-notfirst"]
+                  + ["s10-member-%d" % n for n in S10_SIZES])
     wanted = all_shapes if args.shapes == "all" else args.shapes.split(",")
     unknown = [s for s in wanted if s not in all_shapes]
     if unknown:
@@ -662,9 +683,12 @@ def main():
 
     print("parsing %s ..." % args.data)
     data = Data(args.data)
-    if len(data.dns) != m["entries"] + 2:
-        sys.exit("data.ldif has %d entries, manifest says %d users (+2 parents)"
-                 % (len(data.dns), m["entries"]))
+    group_entries = m.get("group_entries", 0)
+    parents = 2 + (1 if group_entries else 0)
+    if len(data.dns) != m["entries"] + group_entries + parents:
+        sys.exit("data.ldif has %d entries, manifest says %d users + %d groups "
+                 "(+%d parents)"
+                 % (len(data.dns), m["entries"], group_entries, parents))
 
     # expect_cap: tri-state read-cap expectation on a cap-capable build.
     expect_cap = {"s1": True, "s3": True, "s3b": False, "s5": False, "s6": True,
@@ -680,6 +704,8 @@ def main():
         expect_cap["s8-orsub-%d" % n] = False
     for n in S9_SIZES:
         expect_cap["s9-not-%d" % n] = True
+    for n in S10_SIZES:
+        expect_cap["s10-member-%d" % n] = False
 
     manifest = {}
     for shape in wanted:
@@ -710,6 +736,8 @@ def main():
             ast, params = build_s9_not(rng, m, data, int(shape.rsplit("-", 1)[1]))
         elif shape == "s9-notfirst":
             ast, params = build_s9_notfirst(rng, m)
+        elif shape.startswith("s10-member-"):
+            ast, params = build_s10(m, int(shape.rsplit("-", 1)[1]))
 
         filt = render(ast)
         expected_ids = data.evaluate(ast)
