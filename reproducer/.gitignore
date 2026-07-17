@@ -1,0 +1,8 @@
+data.ldif
+data-manifest.json
+filter-*.txt
+expected-dns-*.txt
+shapes-manifest.json
+measurements.md
+results/
+__pycache__/

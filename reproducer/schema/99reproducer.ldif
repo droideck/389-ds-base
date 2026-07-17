@@ -1,0 +1,17 @@
+dn: cn=schema
+objectClass: top
+objectClass: ldapSubentry
+objectClass: subschema
+cn: schema
+attributeTypes: ( 2.16.840.1.113730.999.1.1 NAME 'reproTitle' DESC 'Reproducer: job title, DirectoryString caseIgnore' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.2 NAME 'reproDept' DESC 'Reproducer: department, DirectoryString caseIgnore' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.3 NAME 'reproTag' DESC 'Reproducer: multi-valued tag, DirectoryString caseIgnore, big-OR target' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.4 NAME 'reproRegion' DESC 'Reproducer: region, one value covers about half the entries' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.5 NAME 'reproMailAlt' DESC 'Reproducer: multi-valued alternate mail, IA5 caseIgnore' EQUALITY caseIgnoreIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.6 NAME 'reproHostname' DESC 'Reproducer: hostname, IA5 caseExact' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.7 NAME 'reproScore' DESC 'Reproducer: integer 0..99999, narrow-range target' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.8 NAME 'reproLevel' DESC 'Reproducer: integer 0..999, wide-range target' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.9 NAME 'reproManager' DESC 'Reproducer: manager DN' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.10 NAME 'reproFlag' DESC 'Reproducer: boolean, deliberately unindexed, NOT target' EQUALITY booleanMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 SINGLE-VALUE X-ORIGIN 'reproducer' )
+attributeTypes: ( 2.16.840.1.113730.999.1.11 NAME 'reproNote' DESC 'Reproducer: free-text note, deliberately unindexed, NOT target' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE X-ORIGIN 'reproducer' )
+objectClasses: ( 2.16.840.1.113730.999.2.1 NAME 'reproPerson' DESC 'Reproducer: auxiliary class carrying all repro attributes' SUP top AUXILIARY MAY ( reproTitle $ reproDept $ reproTag $ reproRegion $ reproMailAlt $ reproHostname $ reproScore $ reproLevel $ reproManager $ reproFlag $ reproNote ) X-ORIGIN 'reproducer' )
