@@ -197,6 +197,34 @@ extern int ldbm_warn_if_no_db;
  */
 #define FILTER_TEST_THRESHOLD (NIDS)10
 
+/*
+ * When the AND components walked so far have produced a bounded candidate
+ * set, the index reads of later substring/approx components are capped at
+ * max(FLOOR, FACTOR * bound): an ID list many times larger than the bound
+ * cannot narrow the result enough to repay the cost of reading it, since
+ * the filter test must run on these filters anyway. A capped read returns
+ * ALLIDS, which AND intersection discards.
+ *
+ * The FLOOR is also the cap's eligibility ceiling: a frame whose bound is
+ * >= FLOOR (or >= the operation's lookthrough limit, when one is set) is
+ * never capped, so the fallback - filter-testing up to `bound` extra
+ * candidates - stays below min(FLOOR, lookthroughlimit) even for
+ * unlimited-lookthrough operations (root binds). The cap additionally
+ * engages only in AND frames whose every enclosing frame is also an AND
+ * (the and_chain argument threaded through candidate generation): every
+ * ancestor then intersects the engaged frame's result, which makes the
+ * bound an absolute ceiling on the whole search's candidate list, so no
+ * previously-passing search can newly hit LDAP_ADMINLIMIT_EXCEEDED.
+ * FLOOR is SLAPD_LDBM_MIN_MAXIDS, the historical default
+ * nsslapd-idlistscanlimit - bounds under it are the regime where fat reads
+ * were truncated by default for most of the server's history. The
+ * FLOOR-as-ceiling waiver needs a substring key holding > FACTOR * FLOOR
+ * IDs against a bound >= FLOOR to be observed, which is beyond CI-scale
+ * data; it is exercised by the reproducer benchmark (shape S6) instead.
+ */
+#define BOUNDED_LIMIT_FACTOR (uint64_t)4
+#define BOUNDED_LIMIT_FLOOR (uint64_t)4000
+
 /* flags to indicate what kind of startup the dblayer should do */
 #define DBLAYER_IMPORT_MODE                 0x1
 #define DBLAYER_NORMAL_MODE                 0x2

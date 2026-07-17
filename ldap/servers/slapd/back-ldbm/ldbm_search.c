@@ -1498,8 +1498,9 @@ subtree_candidates(
     Operation *op = NULL;
     PRBool is_bulk_import = PR_FALSE;
 
-    /* Fetch a candidate list for the original filter */
-    candidates = filter_candidates_ext(pb, be, base, filter, NULL, 0, err, allidslimit);
+    /* Fetch a candidate list for the original filter; the top-level frame
+     * has (vacuously) pure-AND ancestry, so and_chain starts at 1 */
+    candidates = filter_candidates_ext(pb, be, base, filter, NULL, 0, err, allidslimit, 1);
 
     /* set 'allids before scoping' flag */
     if (NULL != allids_before_scopingp) {
