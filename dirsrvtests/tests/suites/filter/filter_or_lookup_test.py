@@ -26,18 +26,26 @@ import ldap
 import logging
 import os
 import pytest
+import re
 
 from contextlib import contextmanager
 from ldap.controls import SimplePagedResultsControl
-from ldap.controls.simple import ManageDSAITControl
+from ldap.controls.simple import ManageDSAITControl, ProxyAuthzControl
 from ldap.controls.sss import SSSRequestControl
 from ldap.controls.vlv import VLVRequestControl
-from lib389._constants import DEFAULT_SUFFIX
+from ldap.filter import escape_filter_chars
+from ldap.schema.models import AttributeType
+from lib389._constants import DEFAULT_SUFFIX, REPLICA_RUV_UUID
 from lib389.cos import CosPointerDefinition, CosTemplate
+from lib389.extensibleobject import UnsafeExtensibleObjects
+from lib389.idm.directorymanager import DirectoryManager
 from lib389.idm.domain import Domain
-from lib389.idm.user import UserAccount
-from lib389.utils import ensure_str
-from test389.topologies import topology_st as topo
+from lib389.idm.organizationalunit import OrganizationalUnits
+from lib389.idm.user import UserAccount, UserAccounts
+from lib389.schema import OBJECT_MODEL_PARAMS, Schema
+from lib389.tombstone import Tombstones
+from lib389.utils import ensure_bytes, ensure_str
+from test389.topologies import topology_m2, topology_st as topo
 
 pytestmark = pytest.mark.tier1
 
@@ -58,6 +66,8 @@ BIG_GROUP_MEMBERS = 200
 PW = 'olpassword'
 
 ENG_LOG_PATTERN = '.*OR filter equality lookup engaged.*'
+ENG_LOG_RE = re.compile(
+    r'OR filter equality lookup engaged: (\d+) node\(s\), largest (\d+) branches')
 ERRORLOG_LEVEL_BACKLDBM = '524288'
 OR_LOOKUP_ATTR = 'nsslapd-enable-or-filter-lookup'
 
@@ -179,6 +189,17 @@ def or_of(attr, values):
     return '(|%s)' % ''.join(f'({attr}={v})' for v in values)
 
 
+def escaped_or_of(attr, values):
+    """Build an equality OR while preserving filter-special characters."""
+    return '(|%s)' % escaped_equalities(attr, values)
+
+
+def escaped_equalities(attr, values):
+    """Build equality components without an enclosing Boolean node."""
+    return ''.join(
+        f'({attr}={escape_filter_chars(ensure_str(value))})' for value in values)
+
+
 def ghosts(n, prefix='olghost'):
     """Absent-but-well-formed values to push an OR over the threshold."""
     return [f'{prefix}{i:05d}' for i in range(n)]
@@ -194,31 +215,92 @@ def search_dns(conn, filterstr, base=DEFAULT_SUFFIX, scope=ldap.SCOPE_SUBTREE):
     return sorted(e.dn.lower() for e in entries)
 
 
-def eng_count(topo):
+def search_dns_result(conn, filterstr, base=DEFAULT_SUFFIX,
+                      scope=ldap.SCOPE_SUBTREE, serverctrls=None):
+    """Run one asynchronous search and assert its final LDAP result."""
+    msgid = conn.search_ext(base, scope, filterstr, ['1.1'],
+                            serverctrls=serverctrls)
+    rtype, rdata, _, rctrls = conn.result3(msgid)
+    assert rtype == ldap.RES_SEARCH_RESULT
+    dns = []
+    for dn, _ in rdata:
+        assert dn is not None
+        dns.append(ensure_str(dn).lower())
+    return sorted(dns), rctrls
+
+
+def paged_search_dns(conn, filterstr, page_size, base=DEFAULT_SUFFIX,
+                     scope=ldap.SCOPE_SUBTREE):
+    """Collect a complete simple-paged search, asserting each result."""
+    req = SimplePagedResultsControl(True, size=page_size, cookie='')
+    dns = []
+    while True:
+        page_dns, rctrls = search_dns_result(
+            conn, filterstr, base=base, scope=scope, serverctrls=[req])
+        dns.extend(page_dns)
+        pctrls = [c for c in rctrls
+                  if c.controlType == SimplePagedResultsControl.controlType]
+        assert len(pctrls) == 1
+        if not pctrls[0].cookie:
+            break
+        req.cookie = pctrls[0].cookie
+    return sorted(dns)
+
+
+def assert_health(conn):
+    """Assert a simple base search completes successfully and exactly."""
+    dns, _ = search_dns_result(
+        conn, '(objectClass=*)', base=DEFAULT_SUFFIX, scope=ldap.SCOPE_BASE)
+    assert dns == [DEFAULT_SUFFIX.lower()]
+
+
+def _instance(target):
+    return target.standalone if hasattr(target, 'standalone') else target
+
+
+def eng_summaries(target):
+    """Return all stable lookup-summary ``(nodes, largest)`` pairs."""
+    summaries = []
+    for line in _instance(target).ds_error_log.match(ENG_LOG_PATTERN):
+        match = ENG_LOG_RE.search(line)
+        assert match is not None
+        summaries.append((int(match.group(1)), int(match.group(2))))
+    return summaries
+
+
+def eng_count(target):
     """How many fast-path engagement diagnostics the error log holds."""
-    return len(topo.standalone.ds_error_log.match(ENG_LOG_PATTERN))
+    return len(eng_summaries(target))
 
 
 @contextmanager
-def backend_debug_log(topo):
+def backend_debug_log(target):
     """Raise the error log level so the engagement diagnostic is emitted."""
-    inst = topo.standalone
+    inst = _instance(target)
     level = inst.config.get_attr_val_utf8('nsslapd-errorlog-level')
-    inst.config.set('nsslapd-errorlog-level', ERRORLOG_LEVEL_BACKLDBM)
+    debug_level = int(level or '0') | int(ERRORLOG_LEVEL_BACKLDBM)
+    inst.config.set('nsslapd-errorlog-level', str(debug_level))
     try:
         yield
     finally:
-        inst.config.set('nsslapd-errorlog-level', level)
+        if level is None:
+            inst.config.remove_all('nsslapd-errorlog-level')
+        else:
+            inst.config.set('nsslapd-errorlog-level', level)
 
 
 @contextmanager
-def or_lookup_disabled(topo):
-    inst = topo.standalone
+def or_lookup_disabled(target):
+    inst = _instance(target)
+    original = inst.config.get_attr_val_utf8(OR_LOOKUP_ATTR)
     inst.config.set(OR_LOOKUP_ATTR, 'off')
     try:
         yield
     finally:
-        inst.config.set(OR_LOOKUP_ATTR, 'on')
+        if original is None:
+            inst.config.remove_all(OR_LOOKUP_ATTR)
+        else:
+            inst.config.set(OR_LOOKUP_ATTR, original)
 
 
 def assert_parity(topo, conn, filterstr, base=DEFAULT_SUFFIX,
@@ -242,6 +324,159 @@ def assert_parity(topo, conn, filterstr, base=DEFAULT_SUFFIX,
         without_fast_path = run()
     assert with_fast_path == without_fast_path
     return with_fast_path
+
+
+SYNTH_ATTRS = (
+    {'name': 'olLookupA', 'equality': 'caseIgnoreMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.15'},
+    {'name': 'olLookupB', 'equality': 'caseIgnoreMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.15'},
+    {'name': 'olLookupC', 'equality': 'caseIgnoreMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.15'},
+    {'name': 'olCaseIgnore', 'equality': 'caseIgnoreMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.15'},
+    {'name': 'olCaseExact', 'equality': 'caseExactMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.15'},
+    {'name': 'olCaseExactIA5', 'equality': 'caseExactIA5Match',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.26'},
+    {'name': 'olCaseIgnoreIA5', 'equality': 'caseIgnoreIA5Match',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.26'},
+    {'name': 'olInteger', 'equality': 'integerMatch',
+     'ordering': 'integerOrderingMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.27'},
+    {'name': 'olNumeric', 'equality': 'numericStringMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.36'},
+    {'name': 'olTelephone', 'equality': 'telephoneNumberMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.50'},
+    {'name': 'olDistinguishedName', 'equality': 'distinguishedNameMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.12'},
+    {'name': 'olGeneralizedTime', 'equality': 'generalizedTimeMatch',
+     'ordering': 'generalizedTimeOrderingMatch',
+     'syntax': '1.3.6.1.4.1.1466.115.121.1.24'},
+)
+
+MATCH_RULE_CASES = (
+    {'id': 'case-ignore-directory-string', 'attr': 'olCaseIgnore',
+     'stored': 'Alpha  Value', 'assertion': ' alpha value '},
+    {'id': 'case-exact-directory-string', 'attr': 'olCaseExact',
+     'stored': 'Exact  Value', 'assertion': ' Exact Value '},
+    {'id': 'case-exact-ia5', 'attr': 'olCaseExactIA5',
+     'stored': 'Exact  IA5', 'assertion': ' Exact IA5 '},
+    {'id': 'case-ignore-ia5', 'attr': 'olCaseIgnoreIA5',
+     'stored': 'MiXeD  IA5', 'assertion': ' mixed ia5 '},
+    {'id': 'integer', 'attr': 'olInteger',
+     'stored': '42', 'assertion': '00042'},
+    {'id': 'numeric-string', 'attr': 'olNumeric',
+     'stored': '12 34 5', 'assertion': '12345'},
+    {'id': 'telephone-number', 'attr': 'olTelephone',
+     'stored': '+1 604-555 0100', 'assertion': '+16045550100'},
+    {'id': 'distinguished-name', 'attr': 'olDistinguishedName',
+     'stored': f'uid=OLUSER00001,{PEOPLE}',
+     'assertion': f'UID=oluser00001, OU=people, {DEFAULT_SUFFIX.upper()}'},
+)
+
+
+def matching_rule_absent_values(case_id, count=14):
+    if case_id == 'integer':
+        return [str(1000 + i) for i in range(count)]
+    if case_id == 'numeric-string':
+        return [f'900{i:03d}' for i in range(count)]
+    if case_id == 'telephone-number':
+        return [f'+1 999 555 {i:04d}' for i in range(count)]
+    if case_id == 'distinguished-name':
+        return [f'cn=ol-missing-{i:02d},{DEFAULT_SUFFIX}' for i in range(count)]
+    return [f'ol-missing-{case_id}-{i:02d}' for i in range(count)]
+
+
+@pytest.fixture(scope='module')
+def lookup_schema_data(topo, create_data):
+    """Create synthetic matching-rule attributes and LDAP entries."""
+    inst = topo.standalone
+    schema = Schema(inst)
+    added_attrs = []
+    created = []
+    container = None
+    expected_dns = {}
+    try:
+        for idx, spec in enumerate(SYNTH_ATTRS, start=1):
+            params = OBJECT_MODEL_PARAMS[AttributeType].copy()
+            params.update({
+                'names': (spec['name'],),
+                'oid': f'2.16.840.1.113730.3.8.999.6275.{idx}',
+                'desc': 'large equality OR lookup functional test',
+                'equality': spec['equality'],
+                'ordering': spec.get('ordering'),
+                'syntax': spec['syntax'],
+                'x_origin': ('large equality OR lookup test',),
+            })
+            schema.add_attributetype(params)
+            added_attrs.append(spec['name'])
+
+        container = OrganizationalUnits(inst, DEFAULT_SUFFIX).create(
+            properties={'ou': 'olLookupData'})
+        objects = UnsafeExtensibleObjects(inst, container.dn)
+
+        def add_entry(key, properties):
+            entry = objects.create(properties={
+                'cn': f'ol-{key}',
+                **properties,
+            })
+            expected_dns[key] = f'cn=ol-{key},{container.dn}'.lower()
+            created.append(entry)
+            return entry
+
+        add_entry('family-a', {'olLookupA': 'a-hit'})
+        add_entry('family-b', {'olLookupB': 'b-hit'})
+        add_entry('family-both', {'olLookupA': 'a-hit',
+                                  'olLookupB': 'b-hit'})
+        add_entry('family-c', {'olLookupC': 'c-hit'})
+        add_entry('root-simple', {'olLookupC': 'simple-match'})
+        add_entry('root-complex', {'olLookupC': 'guard-hit'})
+
+        for case in MATCH_RULE_CASES:
+            add_entry(f'match-{case["id"]}', {case['attr']: case['stored']})
+
+        add_entry('unicode-case-ignore', {
+            'olCaseIgnore': 'ÇÉLINE ÅNGSTRÖM',
+        })
+        add_entry('outside-generalized-time', {
+            'olGeneralizedTime': '20240101010203Z',
+        })
+        add_entry('escaped-dn', {
+            'olDistinguishedName': f'cn=Smith\\, Alice,{PEOPLE}',
+        })
+
+        count_assertions = [
+            f'cn=ol-count-{i:02d},{DEFAULT_SUFFIX}' for i in range(16)]
+        add_entry('dn-count-less', {
+            'olDistinguishedName': [
+                count_assertions[0],
+                f'cn=ol-less-extra,{DEFAULT_SUFFIX}',
+            ],
+        })
+        add_entry('dn-count-equal', {
+            'olDistinguishedName': [count_assertions[0]] + [
+                f'cn=ol-equal-extra-{i:02d},{DEFAULT_SUFFIX}' for i in range(15)],
+        })
+        add_entry('dn-count-more', {
+            'olDistinguishedName': [count_assertions[0]] + [
+                f'cn=ol-more-extra-{i:02d},{DEFAULT_SUFFIX}' for i in range(16)],
+        })
+
+        yield {
+            'base': container.dn,
+            'dns': expected_dns,
+            'all_dns': sorted(expected_dns.values()),
+            'dn_count_assertions': count_assertions,
+        }
+    finally:
+        for entry in reversed(created):
+            if entry.exists():
+                entry.delete()
+        if container is not None and container.exists():
+            container.delete()
+        for attr_name in reversed(added_attrs):
+            schema.remove_attributetype(attr_name)
 
 
 def test_or_big_same_attr_exact(topo, create_data):
@@ -487,27 +722,23 @@ def test_or_paged(topo, create_data):
     :setup: Standalone instance with 400 users, groups, and a subentry
     :steps:
         1. Run an OR of 120 live uids as a paged search, page size 30
+        2. Repeat the complete paged search with lookup disabled
     :expectedresults:
-        1. The union of the pages is exactly the 120 named users
+        1. Every page succeeds, the lookup summary is emitted, and the union
+           is exactly the 120 named DNs
+        2. The historical path returns the identical complete DN set
     """
     inst = topo.standalone
     picked = create_data[150:270]
     filt = or_of('uid', picked)
-    req = SimplePagedResultsControl(True, size=30, cookie='')
-    collected = []
-    while True:
-        msgid = inst.search_ext(DEFAULT_SUFFIX, ldap.SCOPE_SUBTREE,
-                                filt, ['uid'], serverctrls=[req])
-        _, rdata, _, rctrls = inst.result3(msgid)
-        for _, attrs in rdata:
-            collected.append(ensure_str(attrs['uid'][0]))
-        pctrls = [c for c in rctrls
-                  if c.controlType == SimplePagedResultsControl.controlType]
-        assert pctrls
-        if not pctrls[0].cookie:
-            break
-        req.cookie = pctrls[0].cookie
-    assert sorted(collected) == sorted(picked)
+    expected = sorted(f'uid={uid},{PEOPLE}'.lower() for uid in picked)
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        assert paged_search_dns(inst, filt, 30) == expected
+        new = eng_summaries(inst)[before:]
+        assert new and all(largest == 120 for _, largest in new)
+        with or_lookup_disabled(inst):
+            assert paged_search_dns(inst, filt, 30) == expected
 
 
 def test_or_after_online_mod(topo, create_data):
@@ -519,17 +750,29 @@ def test_or_after_online_mod(topo, create_data):
     :steps:
         1. Add a new cn value to a user over LDAP
         2. Search a large cn OR naming only that new value
-        3. Remove the value again
+        3. Repeat with lookup disabled
+        4. Remove the value again
     :expectedresults:
         1. Modify succeeds
-        2. Exactly that user is returned
-        3. Cleanup succeeds
+        2. Exactly that user is returned and lookup construction is reported
+        3. The historical path returns the identical DN
+        4. Cleanup succeeds
     """
     user = UserAccount(topo.standalone, user_dn(42))
     user.add('cn', 'olfreshvalue')
     try:
         values = ['olfreshvalue'] + ghosts(20, prefix='olstale')
-        assert search_uids(topo, or_of('cn', values)) == [user_uid(42)]
+        filterstr = or_of('cn', values)
+        expected = [user.dn.lower()]
+        with backend_debug_log(topo.standalone):
+            before = eng_count(topo.standalone)
+            got, _ = search_dns_result(topo.standalone, filterstr)
+            assert got == expected
+            new = eng_summaries(topo.standalone)[before:]
+            assert new and all(largest == 21 for _, largest in new)
+            with or_lookup_disabled(topo.standalone):
+                got_off, _ = search_dns_result(topo.standalone, filterstr)
+            assert got_off == expected
     finally:
         user.remove('cn', 'olfreshvalue')
 
@@ -791,7 +1034,10 @@ def test_or_cos_vattr_fallback(topo, create_data):
     definition.create(properties={
         'cn': 'olcosdef',
         'cosTemplateDn': f'cn=olcostemplate,{DEFAULT_SUFFIX}',
-        'cosAttribute': 'postalCode default operational'})
+        # Use the established pointer-CoS qualifier form.  "default
+        # operational" is not a valid combined qualifier and silently leaves
+        # this ordinary user attribute unserved on current builds.
+        'cosAttribute': 'postalCode default'})
     try:
         values = ['olvirtualzip'] + ghosts(20, prefix='olzip')
         # the CoS definition entry itself sits under People and receives
@@ -941,6 +1187,744 @@ def test_or_vlv_sort_parity(topo, create_data):
     finally:
         conn.unbind_s()
         suffix.remove('aci', deny)
+
+
+def test_or_lookup_threshold_15_16_and_toggle(topo, lookup_schema_data):
+    """Pin the exact lookup threshold and the runtime configuration switch.
+
+    :id: e7b88ea2-c876-41db-92c0-69e411a749d1
+    :setup: Standalone instance with synthetic case-ignore attributes
+    :steps:
+        1. Assert the live default setting is on
+        2. Search equivalent 15- and 16-branch OR filters
+        3. Disable lookup and repeat the 16-branch operation
+        4. Re-enable lookup and repeat without restarting
+    :expectedresults:
+        1. The default is enabled
+        2. Only the 16-branch operation emits a lookup summary
+        3. Disabled lookup emits no summary and returns the same DNs
+        4. Re-enabled lookup emits a summary and returns the same DNs
+    """
+    inst = topo.standalone
+    base = lookup_schema_data['base']
+    dns = lookup_schema_data['dns']
+    expected = sorted([
+        dns['family-a'],
+        dns['family-both'],
+    ])
+    values15 = ['a-hit'] + [f'a-threshold-miss-{i:02d}' for i in range(14)]
+    values16 = values15 + ['a-threshold-miss-14']
+    filter15 = escaped_or_of('olLookupA', values15)
+    filter16 = escaped_or_of('olLookupA', values16)
+    original = inst.config.get_attr_val_utf8(OR_LOOKUP_ATTR)
+    assert original == 'on'
+
+    try:
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            got15, _ = search_dns_result(
+                inst, filter15, base=base, scope=ldap.SCOPE_ONELEVEL)
+            assert got15 == expected
+            assert eng_count(inst) == before
+
+            before = eng_count(inst)
+            got16, _ = search_dns_result(
+                inst, filter16, base=base, scope=ldap.SCOPE_ONELEVEL)
+            assert got16 == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+
+            with or_lookup_disabled(inst):
+                before = eng_count(inst)
+                got_off, _ = search_dns_result(
+                    inst, filter16, base=base, scope=ldap.SCOPE_ONELEVEL)
+                assert got_off == expected
+                assert eng_count(inst) == before
+
+            before = eng_count(inst)
+            got_on, _ = search_dns_result(
+                inst, filter16, base=base, scope=ldap.SCOPE_ONELEVEL)
+            assert got_on == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+    finally:
+        if inst.config.get_attr_val_utf8(OR_LOOKUP_ATTR) != original:
+            inst.config.set(OR_LOOKUP_ATTR, original)
+
+
+def test_or_lookup_dominant_family_order_independent(topo, lookup_schema_data):
+    """Select the 64-branch family regardless of source order.
+
+    :id: 150c2e44-a436-4a0a-b3ed-b60e7ddbf3a2
+    :setup: Standalone instance with three synthetic case-ignore attributes
+    :steps:
+        1. Search one OR containing 16 A and 64 B equality branches
+        2. Repeat with the A and B source runs reversed
+    :expectedresults:
+        1. Exact A-or-B DNs return and the summary reports 64
+        2. The result and selected family size remain unchanged
+    """
+    inst = topo.standalone
+    base = lookup_schema_data['base']
+    dns = lookup_schema_data['dns']
+    expected = sorted([
+        dns['family-a'], dns['family-b'], dns['family-both'],
+    ])
+    a_values = ['a-hit'] + [f'a-dominant-miss-{i:02d}' for i in range(15)]
+    b_values = ['b-hit'] + [f'b-dominant-miss-{i:02d}' for i in range(63)]
+    a_run = escaped_equalities('olLookupA', a_values)
+    b_run = escaped_equalities('olLookupB', b_values)
+
+    with backend_debug_log(inst):
+        for filterstr in (f'(|{a_run}{b_run})', f'(|{b_run}{a_run})'):
+            before = eng_count(inst)
+            got, _ = search_dns_result(
+                inst, filterstr, base=base, scope=ldap.SCOPE_ONELEVEL)
+            assert got == expected
+            new = eng_summaries(inst)[before:]
+            assert new
+            assert all(largest == 64 for _, largest in new)
+
+
+def test_or_lookup_third_family_after_distractors(topo, lookup_schema_data):
+    """Do not hide a large third attribute family behind two distractors.
+
+    :id: 35f3cd38-59c7-41b6-b02d-5e925c844e97
+    :setup: Standalone instance with three synthetic case-ignore attributes
+    :steps:
+        1. Search an OR with one absent A, one absent B, and 64 C branches
+        2. Inspect the operation lookup summary
+    :expectedresults:
+        1. Exactly the live C entry is returned
+        2. The selected family has 64 branches
+    """
+    inst = topo.standalone
+    base = lookup_schema_data['base']
+    dns = lookup_schema_data['dns']
+    c_values = ['c-hit'] + [f'c-third-miss-{i:02d}' for i in range(63)]
+    filterstr = ('(|(olLookupA=a-distractor)(olLookupB=b-distractor)'
+                 f'{escaped_equalities("olLookupC", c_values)})')
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=base, scope=ldap.SCOPE_ONELEVEL)
+        assert got == [dns['family-c']]
+        new = eng_summaries(inst)[before:]
+        assert new
+        assert all(largest == 64 for _, largest in new)
+
+
+def test_or_lookup_two_nodes_in_and(topo, lookup_schema_data):
+    """Build and consume two eligible lookup nodes in one AND.
+
+    :id: b6c49e82-060a-4eef-a128-c6a50d537b6f
+    :setup: Standalone instance with intersecting synthetic A and B values
+    :steps:
+        1. Record the stable node count for one eligible 16-branch A OR
+        2. Search an AND of separate 16-branch A and B OR nodes
+        3. Repeat with lookup disabled
+    :expectedresults:
+        1. The one-node baseline succeeds and is summarized
+        2. Exactly the A-and-B entry returns and the summary node count doubles
+        3. The disabled path returns the identical DN set
+    """
+    inst = topo.standalone
+    base = lookup_schema_data['base']
+    dns = lookup_schema_data['dns']
+    a_values = ['a-hit'] + [f'a-two-node-miss-{i:02d}' for i in range(15)]
+    b_values = ['b-hit'] + [f'b-two-node-miss-{i:02d}' for i in range(15)]
+    filterstr = f'(&{escaped_or_of("olLookupA", a_values)}' \
+                f'{escaped_or_of("olLookupB", b_values)})'
+    expected = [dns['family-both']]
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        baseline_got, _ = search_dns_result(
+            inst, escaped_or_of('olLookupA', a_values), base=base,
+            scope=ldap.SCOPE_ONELEVEL)
+        assert baseline_got == sorted([
+            dns['family-a'], dns['family-both']
+        ])
+        baseline_summaries = eng_summaries(inst)[before:]
+        assert baseline_summaries
+        baseline_nodes = {nodes for nodes, largest in baseline_summaries
+                          if largest == 16}
+        assert len(baseline_nodes) == 1
+        baseline_node_count = baseline_nodes.pop()
+
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=base, scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        new = eng_summaries(inst)[before:]
+        assert new
+        assert all(nodes == baseline_node_count * 2 and largest == 16
+                   for nodes, largest in new)
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=base, scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+@pytest.mark.parametrize('case', MATCH_RULE_CASES,
+                         ids=[case['id'] for case in MATCH_RULE_CASES])
+def test_or_lookup_matching_rule_families(topo, lookup_schema_data, case):
+    """Exercise every equality matching-rule family allowed by the lookup.
+
+    :id: 38d8e03c-4f36-48d5-9211-cc33cda08d8a
+    :parametrized: yes
+    :setup: Standalone instance with one synthetic attribute per allowlisted rule
+    :steps:
+        1. Search 16 assertions containing a duplicate normalized live value
+           and 14 valid absent values
+        2. Inspect the existing operation summary
+        3. Repeat with equality-OR lookup disabled
+    :expectedresults:
+        1. Exactly the independently named matching entry is returned
+        2. A 16-branch lookup family is reported
+        3. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    values = ([case['assertion'], case['assertion']]
+              + matching_rule_absent_values(case['id']))
+    filterstr = escaped_or_of(case['attr'], values)
+    expected = [lookup_schema_data['dns'][f'match-{case["id"]}']]
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=lookup_schema_data['base'],
+            scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        new = eng_summaries(inst)[before:]
+        assert new and all(largest == 16 for _, largest in new)
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+def test_or_lookup_non_ascii_case_ignore(topo, lookup_schema_data):
+    """Normalize non-ASCII DirectoryString values in a lookup family.
+
+    :id: 41273979-fcf8-445d-a0ab-04206bb01677
+    :setup: Standalone instance with a synthetic caseIgnoreMatch attribute
+    :steps:
+        1. Search 16 branches using a lower-case accented live assertion
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the upper-case accented stored value matches and lookup engages
+        2. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    assertion = 'çéline ångström'
+    values = [assertion, assertion] + [f'ø-absent-{i:02d}' for i in range(14)]
+    filterstr = escaped_or_of('olCaseIgnore', values)
+    expected = [lookup_schema_data['dns']['unicode-case-ignore']]
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=lookup_schema_data['base'],
+            scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        new = eng_summaries(inst)[before:]
+        assert new and all(largest == 16 for _, largest in new)
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+def test_or_lookup_dn_escaped_comma(topo, lookup_schema_data):
+    """Normalize a DN assertion whose RDN value contains an escaped comma.
+
+    :id: 66c4dc6a-595c-4624-941b-17463bd41b91
+    :setup: Standalone instance with a synthetic distinguishedNameMatch attribute
+    :steps:
+        1. Search 16 DN branches including a case-mangled escaped-comma DN
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the entry storing the equivalent DN is returned and lookup engages
+        2. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    assertion = f'CN=SMITH\\, ALICE, OU=PEOPLE, {DEFAULT_SUFFIX.upper()}'
+    values = [assertion, assertion] + [
+        f'cn=ol-dn-absent-{i:02d},{DEFAULT_SUFFIX}' for i in range(14)]
+    filterstr = escaped_or_of('olDistinguishedName', values)
+    expected = [lookup_schema_data['dns']['escaped-dn']]
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=lookup_schema_data['base'],
+            scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        new = eng_summaries(inst)[before:]
+        assert new and all(largest == 16 for _, largest in new)
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+def test_or_lookup_dn_value_count_boundaries(topo, lookup_schema_data):
+    """Cover DN entry-value counts below, equal to, and above table size.
+
+    :id: e480c416-53af-46bd-9650-117ba02ac17f
+    :setup: Three entries with 2, 16, and 17 DN values respectively
+    :steps:
+        1. Search a 16-assertion DN equality family matching all three entries
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. The complete three-DN set returns and lookup construction is reported
+        2. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    filterstr = escaped_or_of(
+        'olDistinguishedName', lookup_schema_data['dn_count_assertions'])
+    expected = sorted(
+        lookup_schema_data['dns'][key]
+        for key in ('dn-count-less', 'dn-count-equal', 'dn-count-more'))
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=lookup_schema_data['base'],
+            scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        new = eng_summaries(inst)[before:]
+        assert new and all(largest == 16 for _, largest in new)
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+def test_or_lookup_valid_rule_outside_allowlist(topo, lookup_schema_data):
+    """Keep a valid but non-allowlisted equality rule on the classic path.
+
+    :id: bfe96ed0-f0b5-4920-8908-829d80fd337e
+    :setup: Standalone instance with a generalizedTimeMatch synthetic attribute
+    :steps:
+        1. Search 16 generalized-time equality branches
+        2. Inspect the lookup summary and repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the live generalized-time entry is returned
+        2. No lookup is built and the historical path returns the same DN
+    """
+    inst = topo.standalone
+    values = ['20240101010203Z', '20240101010203Z'] + [
+        f'202402{i + 1:02d}010203Z' for i in range(14)]
+    filterstr = escaped_or_of('olGeneralizedTime', values)
+    expected = [lookup_schema_data['dns']['outside-generalized-time']]
+
+    with backend_debug_log(inst):
+        before = eng_count(inst)
+        got, _ = search_dns_result(
+            inst, filterstr, base=lookup_schema_data['base'],
+            scope=ldap.SCOPE_ONELEVEL)
+        assert got == expected
+        assert eng_count(inst) == before
+        with or_lookup_disabled(inst):
+            got_off, _ = search_dns_result(
+                inst, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+        assert got_off == expected
+
+
+def test_or_lookup_true_root_all_miss(topo, lookup_schema_data):
+    """Verify the unproxied Directory Manager all-miss result and health.
+
+    :id: 29289b81-5f4b-44ac-8e54-ccbe047116bd
+    :setup: Standalone instance and an independent Directory Manager bind
+    :steps:
+        1. Search a 16-branch eligible family whose assertions are all absent
+        2. Repeat with lookup disabled
+        3. Run a base-object health search
+    :expectedresults:
+        1. LDAP success, an exact empty result, and a 16-branch lookup summary
+        2. LDAP success and the same exact empty result
+        3. The suffix entry is returned exactly
+    """
+    inst = topo.standalone
+    conn = DirectoryManager(inst).bind()
+    filterstr = escaped_or_of(
+        'olLookupA', [f'ol-root-miss-{i:02d}' for i in range(16)])
+    try:
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            got, _ = search_dns_result(
+                conn, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+            assert got == []
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+            with or_lookup_disabled(inst):
+                got_off, _ = search_dns_result(
+                    conn, filterstr, base=lookup_schema_data['base'],
+                    scope=ldap.SCOPE_ONELEVEL)
+            assert got_off == []
+        assert_health(conn)
+    finally:
+        conn.unbind_s()
+
+
+def test_or_lookup_true_root_nohit_simple_fallback(topo, lookup_schema_data):
+    """Evaluate a simple outer-OR fallback after a root all-miss family.
+
+    :id: 7304fc93-a9f3-4406-926b-2400c90fa6eb
+    :setup: Standalone instance and an independent Directory Manager bind
+    :steps:
+        1. OR a 16-branch all-miss family with one matching equality
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the independently named fallback entry is returned
+        2. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    conn = DirectoryManager(inst).bind()
+    large_miss = escaped_or_of(
+        'olLookupA', [f'ol-simple-miss-{i:02d}' for i in range(16)])
+    filterstr = f'(|{large_miss}(olLookupC=simple-match))'
+    expected = [lookup_schema_data['dns']['root-simple']]
+    try:
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            got, _ = search_dns_result(
+                conn, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+            assert got == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+            with or_lookup_disabled(inst):
+                got_off, _ = search_dns_result(
+                    conn, filterstr, base=lookup_schema_data['base'],
+                    scope=ldap.SCOPE_ONELEVEL)
+            assert got_off == expected
+    finally:
+        conn.unbind_s()
+
+
+def test_or_lookup_true_root_nohit_complex_fallback(topo, lookup_schema_data):
+    """Evaluate a guarded fallback after a root all-miss family.
+
+    :id: 287c52a2-0a19-4075-bdc7-8b6494eff9a2
+    :setup: Standalone instance and an independent Directory Manager bind
+    :steps:
+        1. OR a 16-branch all-miss family with an AND containing two NOTs
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the guarded fallback entry is returned
+        2. The historical path returns the identical DN set
+    """
+    inst = topo.standalone
+    conn = DirectoryManager(inst).bind()
+    large_miss = escaped_or_of(
+        'olLookupA', [f'ol-complex-miss-{i:02d}' for i in range(16)])
+    filterstr = (f'(|{large_miss}'
+                 '(&(olLookupC=guard-hit)(!(description=*))'
+                 '(!(employeeNumber=*))))')
+    expected = [lookup_schema_data['dns']['root-complex']]
+    try:
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            got, _ = search_dns_result(
+                conn, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+            assert got == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+            with or_lookup_disabled(inst):
+                got_off, _ = search_dns_result(
+                    conn, filterstr, base=lookup_schema_data['base'],
+                    scope=ldap.SCOPE_ONELEVEL)
+            assert got_off == expected
+    finally:
+        conn.unbind_s()
+
+
+def test_or_lookup_true_root_nohit_under_not(topo, lookup_schema_data):
+    """Negate a root all-miss lookup family without changing semantics.
+
+    :id: 6153594a-c923-48c6-a49f-18de69bf8c9a
+    :setup: Standalone instance and an independent Directory Manager bind
+    :steps:
+        1. Search the NOT of a 16-branch all-miss equality OR
+        2. Repeat with lookup disabled
+    :expectedresults:
+        1. Every and only generated one-level entry is returned and the
+           16-branch lookup summary is emitted
+        2. The historical path returns the identical complete DN set
+    """
+    inst = topo.standalone
+    conn = DirectoryManager(inst).bind()
+    large_miss = escaped_or_of(
+        'olLookupA', [f'ol-not-miss-{i:02d}' for i in range(16)])
+    filterstr = f'(!{large_miss})'
+    expected = lookup_schema_data['all_dns']
+    try:
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            got, _ = search_dns_result(
+                conn, filterstr, base=lookup_schema_data['base'],
+                scope=ldap.SCOPE_ONELEVEL)
+            assert got == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 16 for _, largest in new)
+            with or_lookup_disabled(inst):
+                got_off, _ = search_dns_result(
+                    conn, filterstr, base=lookup_schema_data['base'],
+                    scope=ldap.SCOPE_ONELEVEL)
+            assert got_off == expected
+    finally:
+        conn.unbind_s()
+
+
+def test_or_lookup_root_proxy_preserves_acl_semantics(topo, create_data):
+    """Apply proxied-user ACL semantics to a Directory Manager search.
+
+    :id: 563682d4-e96d-44c3-a59f-8611fc41c229
+    :setup: Standalone instance, Directory Manager bind, and uid-read deny ACI
+    :steps:
+        1. Search a large uid OR plus an allowed cn fallback as plain root
+        2. Repeat as root with a proxy authorization control for the denied user
+        3. Repeat the proxied search with lookup disabled
+    :expectedresults:
+        1. All named uid entries and the cn fallback return exactly
+        2. Only the cn fallback visible to the proxied identity returns and
+           the 20-branch lookup summary is emitted
+        3. The historical path returns the same restricted exact DN set
+    """
+    inst = topo.standalone
+    suffix = Domain(inst, DEFAULT_SUFFIX)
+    deny = ('(targetattr="uid")(version 3.0; acl "ol proxy deny uid"; '
+            'deny (read, search, compare)'
+            f'(userdn="ldap:///{user_dn(0)}");)')
+    conn = None
+    aci_added = False
+    try:
+        suffix.add('aci', deny)
+        aci_added = True
+        live = create_data[100:120]
+        filterstr = f'(|{escaped_or_of("uid", live)}(cn=olalt00350))'
+        unrestricted = sorted(
+            [f'uid={uid},{PEOPLE}'.lower() for uid in live]
+            + [user_dn(350).lower()])
+        restricted = [user_dn(350).lower()]
+        proxy_ctrl = ProxyAuthzControl(
+            criticality=True, authzId=ensure_bytes(f'dn: {user_dn(0)}'))
+        conn = DirectoryManager(inst).bind()
+        with backend_debug_log(inst):
+            direct, _ = search_dns_result(conn, filterstr)
+            assert direct == unrestricted
+            before = eng_count(inst)
+            proxied, _ = search_dns_result(
+                conn, filterstr, serverctrls=[proxy_ctrl])
+            assert proxied == restricted
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 20 for _, largest in new)
+            with or_lookup_disabled(inst):
+                proxied_off, _ = search_dns_result(
+                    conn, filterstr, serverctrls=[proxy_ctrl])
+            assert proxied_off == restricted
+    finally:
+        if conn is not None:
+            conn.unbind_s()
+        if aci_added:
+            suffix.remove('aci', deny)
+
+
+def test_or_lookup_paged_cancel_cookie_health(topo, create_data):
+    """Cancel an eligible paged search with its returned cookie.
+
+    :id: 2a860edd-e46b-40ca-84cb-b6d5d4313d03
+    :setup: Standalone instance and an independent Directory Manager bind
+    :steps:
+        1. Verify the complete nonpaged DN set for a 60-value uid OR
+        2. Read the first ten-entry page and retain its cookie
+        3. Send page size zero with that cookie
+        4. Run a base-object health search on the same connection
+    :expectedresults:
+        1. Exactly the 60 independently named entries return
+        2. Ten unique expected DNs, a nonempty cookie, and the 60-branch
+           lookup summary return
+        3. LDAP success, no entries, and an empty response cookie return
+        4. The suffix entry is returned exactly
+    """
+    inst = topo.standalone
+    conn = DirectoryManager(inst).bind()
+    live = create_data[120:180]
+    filterstr = escaped_or_of('uid', live)
+    expected = sorted(f'uid={uid},{PEOPLE}'.lower() for uid in live)
+    req = SimplePagedResultsControl(True, size=10, cookie='')
+    try:
+        with backend_debug_log(inst):
+            complete, _ = search_dns_result(conn, filterstr)
+            assert complete == expected
+            before = eng_count(inst)
+            first_page, rctrls = search_dns_result(
+                conn, filterstr, serverctrls=[req])
+            assert len(first_page) == 10
+            assert len(set(first_page)) == 10
+            assert set(first_page) < set(expected)
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 60 for _, largest in new)
+            pctrls = [
+                c for c in rctrls
+                if c.controlType == SimplePagedResultsControl.controlType
+            ]
+            assert len(pctrls) == 1
+            assert pctrls[0].cookie
+
+            req.size = 0
+            req.cookie = pctrls[0].cookie
+            cancelled, rctrls = search_dns_result(
+                conn, filterstr, serverctrls=[req])
+            assert cancelled == []
+            pctrls = [
+                c for c in rctrls
+                if c.controlType == SimplePagedResultsControl.controlType
+            ]
+            assert len(pctrls) == 1
+            assert not pctrls[0].cookie
+            assert_health(conn)
+    finally:
+        conn.unbind_s()
+
+
+def test_or_lookup_paged_disconnect_reconnect_health(topo, create_data):
+    """Release first-page lookup state on disconnect and reconnect cleanly.
+
+    :id: 2cb0b299-a553-4e98-843e-574880417ea8
+    :setup: Standalone instance and independent Directory Manager binds
+    :steps:
+        1. Verify the complete nonpaged DN set for a 60-value uid OR
+        2. Read one page with a nonempty cookie and disconnect
+        3. Reconnect, run a base health search, and page the search to completion
+    :expectedresults:
+        1. Exactly the 60 independently named entries return
+        2. Ten unique expected DNs, a nonempty cookie, and the 60-branch
+           lookup summary return
+        3. Health succeeds and complete paging returns the exact 60-DN set
+    """
+    inst = topo.standalone
+    live = create_data[180:240]
+    filterstr = escaped_or_of('uid', live)
+    expected = sorted(f'uid={uid},{PEOPLE}'.lower() for uid in live)
+    first_conn = DirectoryManager(inst).bind()
+    req = SimplePagedResultsControl(True, size=10, cookie='')
+    try:
+        with backend_debug_log(inst):
+            complete, _ = search_dns_result(first_conn, filterstr)
+            assert complete == expected
+            before = eng_count(inst)
+            first_page, rctrls = search_dns_result(
+                first_conn, filterstr, serverctrls=[req])
+            assert len(first_page) == 10
+            assert len(set(first_page)) == 10
+            assert set(first_page) < set(expected)
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 60 for _, largest in new)
+            pctrls = [
+                c for c in rctrls
+                if c.controlType == SimplePagedResultsControl.controlType
+            ]
+            assert len(pctrls) == 1
+            assert pctrls[0].cookie
+    finally:
+        first_conn.unbind_s()
+
+    second_conn = DirectoryManager(inst).bind()
+    try:
+        assert_health(second_conn)
+        assert paged_search_dns(second_conn, filterstr, 10) == expected
+    finally:
+        second_conn.unbind_s()
+
+
+def test_or_lookup_tombstone_and_ruv_suppress_build(topology_m2):
+    """Suppress lookup construction for real tombstone and RUV sentinels.
+
+    :id: 5d6d47f7-b512-423a-837c-d3610a2d56ca
+    :setup: Standard two-supplier topology with live users and one tombstone
+    :steps:
+        1. Prove the ordinary eligible uid OR constructs a lookup
+        2. Add a guaranteed-miss nsTombstone branch and search
+        3. Add a guaranteed-miss RUV-uniqueid branch and search
+        4. Repeat both sentinel filters with lookup disabled
+    :expectedresults:
+        1. Exactly the generated live DNs return and lookup is summarized
+        2. The same exact live DNs return, no special entry leaks, and no lookup builds
+        3. The same exact live DNs return, no RUV leaks, and no lookup builds
+        4. Both historical-path results are identical
+    """
+    inst = topology_m2.ms['supplier1']
+    users = UserAccounts(inst, DEFAULT_SUFFIX)
+    tombstones = Tombstones(inst, DEFAULT_SUFFIX)
+    live_users = []
+
+    def properties(uid, number):
+        return {
+            'uid': uid,
+            'cn': uid,
+            'sn': 'ol lookup replicated sentinel',
+            'uidNumber': str(number),
+            'gidNumber': '627500',
+            'homeDirectory': f'/home/{uid}',
+        }
+
+    try:
+        for i in range(20):
+            uid = f'ol-lookup-repl-{i:02d}'
+            live_users.append(users.create(
+                properties=properties(uid, 627500 + i)))
+        tomb_uid = 'ol-lookup-repl-tombstone'
+        tomb_user = users.create(properties=properties(tomb_uid, 627599))
+        tomb_user.delete()
+        created_tombstones = tombstones.filter(
+            f'(uid={escape_filter_chars(tomb_uid)})')
+        assert len(created_tombstones) == 1
+
+        large_or = escaped_or_of(
+            'uid', [f'ol-lookup-repl-{i:02d}' for i in range(20)])
+        tombstone_filter = (
+            f'(|{large_or}'
+            '(&(objectClass=nsTombstone)(uid=ol-special-guaranteed-miss)))')
+        ruv_filter = (
+            f'(|{large_or}'
+            f'(&(nsuniqueid={REPLICA_RUV_UUID})'
+            '(uid=ol-special-guaranteed-miss)))')
+        expected = sorted(
+            f'uid=ol-lookup-repl-{i:02d},{PEOPLE}'.lower()
+            for i in range(20))
+
+        with backend_debug_log(inst):
+            before = eng_count(inst)
+            ordinary, _ = search_dns_result(inst, large_or)
+            assert ordinary == expected
+            new = eng_summaries(inst)[before:]
+            assert new and all(largest == 20 for _, largest in new)
+
+            for filterstr in (tombstone_filter, ruv_filter):
+                before = eng_count(inst)
+                got, _ = search_dns_result(inst, filterstr)
+                assert got == expected
+                assert eng_count(inst) == before
+
+            with or_lookup_disabled(inst):
+                for filterstr in (tombstone_filter, ruv_filter):
+                    got_off, _ = search_dns_result(inst, filterstr)
+                    assert got_off == expected
+    finally:
+        for user in reversed(live_users):
+            if user.exists():
+                user.delete()
 
 
 if __name__ == '__main__':

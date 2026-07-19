@@ -23,6 +23,8 @@ import pytest
 from ldap.controls import SimplePagedResultsControl
 from lib389._constants import DEFAULT_SUFFIX
 from lib389.backend import Backends, DatabaseConfig
+from lib389.config import LDBMConfig
+from lib389.idm.group import Groups
 from lib389.idm.user import UserAccount, UserAccounts
 from lib389.plugins import USNPlugin
 from lib389.utils import ensure_str
@@ -57,6 +59,17 @@ OTHER_SN = 'OtherSn'
 
 CAP_LOG_PATTERN = '.*returned ALLIDS under read cap.*'
 ERRORLOG_LEVEL_BACKLDBM = '524288'
+
+DYNAMIC_ORDINARY_BOUND = 20
+DYNAMIC_EXACT_ORDINARY = 2
+DYNAMIC_CANDIDATES = 20
+DYNAMIC_LOOKTHROUGH_LIMIT = 30
+DYNAMIC_CONFIG_ATTRS = (
+    'nsslapd-dynamic-lists-enabled',
+    'nsslapd-dynamic-lists-attr',
+    'nsslapd-dynamic-lists-oc',
+    'nsslapd-dynamic-lists-url-attr',
+)
 
 
 @pytest.fixture(scope="module")
@@ -111,6 +124,45 @@ def search_uids(topo, filterstr):
     entries = topo.standalone.search_s(DEFAULT_SUFFIX, ldap.SCOPE_SUBTREE,
                                        filterstr, ['uid'])
     return sorted(ensure_str(e.getValue('uid')) for e in entries)
+
+
+def search_dns_result(conn, filterstr, base=DEFAULT_SUFFIX,
+                      scope=ldap.SCOPE_SUBTREE):
+    """Run one search and return its result type and complete sorted DN set."""
+    msgid = conn.search_ext(base, scope, filterstr, ['1.1'])
+    result_type, result_data, _, _ = conn.result3(msgid)
+    dns = sorted(ensure_str(dn).lower() for dn, _ in result_data)
+    return result_type, dns
+
+
+def expected_user_dns(uids):
+    """Construct expected user DNs independently from a fixture's uid list."""
+    return sorted(f'uid={uid},ou=People,{DEFAULT_SUFFIX}'.lower()
+                  for uid in uids)
+
+
+def enable_backend_debug(inst):
+    """Enable the backend diagnostic bit and return the exact prior value."""
+    old_value = inst.config.get_attr_val_utf8('nsslapd-errorlog-level')
+    level = int(old_value or '0') | int(ERRORLOG_LEVEL_BACKLDBM)
+    inst.config.set('nsslapd-errorlog-level', str(level))
+    return old_value
+
+
+def restore_attr_value(obj, attr, old_value):
+    """Restore both the former value and former absence of one attribute."""
+    if old_value is None:
+        obj.remove_all(attr)
+    else:
+        obj.replace(attr, old_value)
+
+
+def assert_health_search(conn):
+    """Assert a complete successful base search after a risky operation."""
+    result_type, dns = search_dns_result(
+        conn, '(objectClass=*)', base=DEFAULT_SUFFIX, scope=ldap.SCOPE_BASE)
+    assert result_type == ldap.RES_SEARCH_RESULT
+    assert dns == [DEFAULT_SUFFIX.lower()]
 
 
 def cap_log_count(topo):
@@ -253,6 +305,64 @@ def test_cap_engages_and_logs(topo, create_users):
         assert cap_log_count(topo) > before
     finally:
         inst.config.set('nsslapd-errorlog-level', errorlog_level)
+
+
+def test_nested_all_and_inherits_cap_to_compound_leaves(topo, create_users):
+    """Verify the literal nested all-AND source shape has exact cap parity.
+
+    Normal filter optimisation flattens a direct child AND before candidate
+    generation.  This therefore covers the required source shape, its broad
+    indexed leaves, cap engagement, and override parity, but it cannot by
+    itself discriminate recursive-frame inheritance from the equivalent
+    flattened AND.
+
+    :id: 5705c05c-58a8-4bfa-b662-7b7d98a16eaa
+    :setup: Standalone instance with 4300 users sharing broad cn substring and
+            objectClass equality index keys
+    :steps:
+        1. Enable the existing backend cap diagnostic
+        2. Search a selective equality plus a nested AND of a broad substring
+           and a broad indexed objectClass equality
+        3. Set the supported global ID-list scan limit override to unlimited
+        4. Repeat the same source filter and run a base health search
+        5. Restore the scan limit and error-log level
+    :expectedresults:
+        1. The diagnostic is enabled without clearing other log-level bits
+        2. LDAP succeeds, the exact golden DN set is returned, and the cap
+           diagnostic is emitted
+        3. The override is applied
+        4. LDAP succeeds with the same exact DNs, no new cap diagnostic is
+           emitted, and the server remains healthy
+        5. Both configuration values are restored
+    """
+    inst = topo.standalone
+    db_cfg = DatabaseConfig(inst)
+    scanlimit = db_cfg.get_attr_val_utf8('nsslapd-idlistscanlimit')
+    errorlog_level = enable_backend_debug(inst)
+    expected = expected_user_dns(create_users)
+    filterstr = (f'(&(sn={GOLDEN_SN})'
+                 '(&(cn=*xanadu*)(objectClass=inetOrgPerson)))')
+
+    try:
+        before = cap_log_count(topo)
+        result_type, dns = search_dns_result(inst, filterstr)
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert dns == expected
+        assert cap_log_count(topo) > before
+
+        db_cfg.set([('nsslapd-idlistscanlimit', '-1')])
+        before = cap_log_count(topo)
+        result_type, override_dns = search_dns_result(inst, filterstr)
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert override_dns == expected
+        assert cap_log_count(topo) == before
+        assert_health_search(inst)
+    finally:
+        try:
+            db_cfg.set([('nsslapd-idlistscanlimit', scanlimit)])
+        finally:
+            restore_attr_value(inst.config, 'nsslapd-errorlog-level',
+                               errorlog_level)
 
 
 def test_costly_first_order_stays_exact(topo, create_users):
@@ -512,6 +622,223 @@ def test_lookthrough_waiver_reads_component_in_full(topo, create_users):
         conn.close()
         inst.config.set('nsslapd-errorlog-level', errorlog_level)
         bind_user.remove_all('nsLookThroughLimit')
+
+
+def test_bounded_and_dynamic_candidates_respect_lookthrough(topo,
+                                                            create_users):
+    """Verify dynamic candidates cannot turn a safe cap into ADMINLIMIT.
+
+    The deterministic cohorts satisfy E + D < L <= B + D and B < L, where
+    E=2 exact ordinary candidates, B=20 ordinary candidates after a capped
+    substring widens to ALLIDS, D=20 appended dynamic candidates, and L=30.
+    The current implementation is expected to expose this invariant as a
+    failing regression; the assertion is deliberately not weakened or xfailed.
+
+    :id: b20ac53d-f832-4450-89de-bb48694451f5
+    :setup: Standalone instance with the module's saturated cn substring key,
+            20 stored groups, and 20 groupOfURLs dynamic entries
+    :steps:
+        1. Verify the existing member equality index and create the two exact
+           ordinary, eighteen wider ordinary, and twenty dynamic entries
+        2. Configure dynamic lists with member and memberURL while disabled
+        3. Bind two users with L=30; give the control an unlimited ID-list
+           scan limit and the bounded user a 10000-entry scan limit
+        4. With dynamic lists disabled, assert the exact E, B, and D DN sets
+        5. Enable dynamic lists and assert the exact B+D member DN set
+        6. Run the supported unbounded control and assert LDAP success, exact
+           DNs, and no cap diagnostic
+        7. Run the normal bounded path and require the same successful exact
+           result without LDAP_ADMINLIMIT_EXCEEDED
+        8. Run a base health search and restore all entry and server settings
+    :expectedresults:
+        1. The index and all deterministic entries exist
+        2. Dynamic-list configuration succeeds
+        3. Both binds succeed with E+D < L <= B+D and B < L
+        4. The independently constructed E, B, and D sets match exactly
+        5. Exactly all stored and dynamic member groups are returned
+        6. LDAP succeeds with exactly the two expected stored group DNs and
+           the cap diagnostic is absent
+        7. LDAP also succeeds with those exact DNs and ADMINLIMIT is not
+           introduced, whether the server declines the cap or accounts for
+           the appended dynamic candidates by another correct mechanism
+        8. The server remains healthy and every changed value is restored
+    """
+    assert (DYNAMIC_EXACT_ORDINARY + DYNAMIC_CANDIDATES <
+            DYNAMIC_LOOKTHROUGH_LIMIT <=
+            DYNAMIC_ORDINARY_BOUND + DYNAMIC_CANDIDATES)
+    assert DYNAMIC_ORDINARY_BOUND < DYNAMIC_LOOKTHROUGH_LIMIT
+    assert DYNAMIC_ORDINARY_BOUND > 10
+
+    inst = topo.standalone
+    config = LDBMConfig(inst)
+    groups = Groups(inst, DEFAULT_SUFFIX, rdn='ou=People')
+    target_dn = f'uid=defuser00000,ou=People,{DEFAULT_SUFFIX}'
+    control_user = UserAccount(
+        inst, f'uid=defuser00003,ou=People,{DEFAULT_SUFFIX}')
+    bounded_user = UserAccount(
+        inst, f'uid=defuser00004,ou=People,{DEFAULT_SUFFIX}')
+    dynamic_config = {
+        attr: config.get_attr_val_utf8(attr)
+        for attr in DYNAMIC_CONFIG_ATTRS
+    }
+    user_limits = [
+        (control_user, 'nsLookThroughLimit',
+         control_user.get_attr_val_utf8('nsLookThroughLimit')),
+        (control_user, 'nsIDListScanLimit',
+         control_user.get_attr_val_utf8('nsIDListScanLimit')),
+        (bounded_user, 'nsLookThroughLimit',
+         bounded_user.get_attr_val_utf8('nsLookThroughLimit')),
+        (bounded_user, 'nsIDListScanLimit',
+         bounded_user.get_attr_val_utf8('nsIDListScanLimit')),
+    ]
+    created_groups = []
+    static_dns = []
+    dynamic_dns = []
+    expected_dns = []
+    control_conn = None
+    bounded_conn = None
+    errorlog_level = None
+    errorlog_enabled = False
+
+    try:
+        member_index = Backends(inst).get('userRoot').get_index('member')
+        assert member_index.exists()
+        assert 'eq' in {
+            value.lower()
+            for value in member_index.get_attr_vals_utf8('nsIndexType')
+        }
+
+        for i in range(DYNAMIC_ORDINARY_BOUND):
+            if i < DYNAMIC_EXACT_ORDINARY:
+                cn = f'Common Xanadu Dynamic Budget Static {i:02d}'
+            else:
+                cn = f'Dynamic Budget Plain Static {i:02d}'
+            group = groups.create(properties={
+                'cn': f'dynamic-budget-static-{i:02d}',
+                'objectClass': ['top', 'groupOfNames', 'extensibleObject'],
+                'member': target_dn,
+                'sn': 'DynamicBudgetSn',
+                'description': cn,
+            })
+            created_groups.append(group)
+            # cn is the saturated substring attribute; description keeps a
+            # human-readable cohort label without changing filter semantics.
+            group.replace('cn', [f'dynamic-budget-static-{i:02d}', cn])
+            static_dns.append(group.dn.lower())
+            if i < DYNAMIC_EXACT_ORDINARY:
+                expected_dns.append(group.dn.lower())
+
+        for i in range(DYNAMIC_CANDIDATES):
+            group = groups.create(properties={
+                'cn': f'Dynamic Budget Plain URL {i:02d}',
+                'objectClass': ['top', 'groupOfURLs', 'extensibleObject'],
+                'memberURL': (f'ldap:///{target_dn}??base?'
+                              '(objectClass=*)'),
+                'sn': 'DynamicBudgetSn',
+            })
+            created_groups.append(group)
+            dynamic_dns.append(group.dn.lower())
+
+        static_dns.sort()
+        dynamic_dns.sort()
+        expected_dns.sort()
+
+        config.replace('nsslapd-dynamic-lists-enabled', 'off')
+        config.replace('nsslapd-dynamic-lists-attr', 'member')
+        config.replace('nsslapd-dynamic-lists-oc', 'groupOfUrls')
+        config.replace('nsslapd-dynamic-lists-url-attr', 'memberURL')
+
+        control_user.replace('nsLookThroughLimit',
+                             str(DYNAMIC_LOOKTHROUGH_LIMIT))
+        control_user.replace('nsIDListScanLimit', '-1')
+        bounded_user.replace('nsLookThroughLimit',
+                             str(DYNAMIC_LOOKTHROUGH_LIMIT))
+        bounded_user.replace('nsIDListScanLimit', '10000')
+        control_conn = control_user.bind('password00003')
+        bounded_conn = bounded_user.bind('password00004')
+
+        filterstr = (f'(&(sn=DynamicBudgetSn)(member={target_dn})'
+                     '(cn=*xanadu*))')
+        result_type, ordinary_bound_dns = search_dns_result(
+            inst, f'(member={target_dn})')
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert ordinary_bound_dns == static_dns
+
+        result_type, ordinary_exact_dns = search_dns_result(
+            control_conn, filterstr)
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert ordinary_exact_dns == expected_dns
+
+        result_type, stored_dynamic_dns = search_dns_result(
+            inst, '(&(objectClass=groupOfUrls)(memberURL=*))')
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert stored_dynamic_dns == dynamic_dns
+
+        config.replace('nsslapd-dynamic-lists-enabled', 'on')
+        result_type, augmented_dns = search_dns_result(
+            inst, f'(member={target_dn})')
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert augmented_dns == sorted(static_dns + dynamic_dns)
+
+        errorlog_level = enable_backend_debug(inst)
+        errorlog_enabled = True
+        before = cap_log_count(topo)
+        result_type, control_dns = search_dns_result(control_conn, filterstr)
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert control_dns == expected_dns
+        assert cap_log_count(topo) == before
+
+        before = cap_log_count(topo)
+        bounded_error = None
+        bounded_result_type = None
+        bounded_dns = []
+        try:
+            bounded_result_type, bounded_dns = search_dns_result(
+                bounded_conn, filterstr)
+        except ldap.ADMINLIMIT_EXCEEDED as error:
+            bounded_error = error
+        bounded_cap_count = cap_log_count(topo)
+
+        assert_health_search(bounded_conn)
+        assert bounded_error is None, (
+            'bounded dynamic-list search introduced '
+            f'LDAP_ADMINLIMIT_EXCEEDED: {bounded_error!r}; cap diagnostics '
+            f'advanced by {bounded_cap_count - before}'
+        )
+        assert bounded_result_type == ldap.RES_SEARCH_RESULT
+        assert bounded_dns == expected_dns
+    finally:
+        cleanup_errors = []
+
+        def cleanup(label, action):
+            try:
+                action()
+            except Exception as error:
+                cleanup_errors.append(f'{label}: {error}')
+
+        if bounded_conn is not None:
+            cleanup('close bounded connection', bounded_conn.close)
+        if control_conn is not None:
+            cleanup('close control connection', control_conn.close)
+        if errorlog_enabled:
+            cleanup(
+                'restore error log level',
+                lambda: restore_attr_value(
+                    inst.config, 'nsslapd-errorlog-level', errorlog_level))
+        for user, attr, old_value in user_limits:
+            cleanup(
+                f'restore {user.dn} {attr}',
+                lambda user=user, attr=attr, old_value=old_value:
+                restore_attr_value(user, attr, old_value))
+        for attr, old_value in dynamic_config.items():
+            cleanup(
+                f'restore {attr}',
+                lambda attr=attr, old_value=old_value:
+                restore_attr_value(config, attr, old_value))
+        for group in reversed(created_groups):
+            cleanup(f'delete {group.dn}', group.delete)
+        if cleanup_errors:
+            raise AssertionError('; '.join(cleanup_errors))
 
 
 def test_or_of_ands_not_capped(topo, create_users):
