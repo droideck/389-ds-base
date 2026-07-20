@@ -1020,7 +1020,7 @@ list_candidates(
                                   "<= NULL\n");
                     idl_free(&idl);
                     idl = NULL;
-                    goto out;
+                    goto abort_set;
                 }
             }
             /* Proceed as normal */
@@ -1031,7 +1031,7 @@ list_candidates(
                               "<=  NULL 2\n");
                 idl_free(&idl);
                 idl = NULL;
-                goto out;
+                goto abort_set;
             }
         }
 
@@ -1111,6 +1111,10 @@ apply_set_op:
     }
 
     slapi_log_err(SLAPI_LOG_TRACE, "list_candidates", "<= idl len %lu\n", (u_long)IDL_NIDS(idl));
+    goto out;
+
+abort_set:
+    idl_set_discard(idl_set);
 out:
     idl_set_destroy(idl_set);
     if (is_and) {

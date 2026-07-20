@@ -245,6 +245,8 @@ int64_t idl_compare(IDList *a, IDList *b);
  * idl_set.c
  */
 IDListSet *idl_set_create(void);
+/* Free unconsumed IDLs when candidate generation aborts. */
+void idl_set_discard(IDListSet *idl_set);
 void idl_set_destroy(IDListSet *idl_set);
 void idl_set_insert_idl(IDListSet *idl_set, IDList *idl);
 void idl_set_insert_complement_idl(IDListSet *idl_set, IDList *idl);

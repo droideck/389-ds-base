@@ -166,6 +166,14 @@ idl_set_free_idls(IDListSet *idl_set)
 }
 
 void
+idl_set_discard(IDListSet *idl_set)
+{
+    if (idl_set != NULL) {
+        idl_set_free_idls(idl_set);
+    }
+}
+
+void
 idl_set_destroy(IDListSet *idl_set)
 {
     slapi_ch_free((void **)&(idl_set));
