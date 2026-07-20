@@ -23,7 +23,7 @@ extern const char *indextype_SUB;
 static IDList *ava_candidates(Slapi_PBlock *pb, backend *be, Slapi_Filter *f, int ftype, Slapi_Filter *nextf, int range, int *err, int allidslimit);
 static IDList *presence_candidates(Slapi_PBlock *pb, backend *be, Slapi_Filter *f, int *err, int allidslimit);
 static IDList *extensible_candidates(Slapi_PBlock *pb, backend *be, Slapi_Filter *f, int *err, int allidslimit);
-static IDList *list_candidates(Slapi_PBlock *pb, backend *be, const char *base, Slapi_Filter *flist, int ftype, int *err, int allidslimit);
+static IDList *list_candidates(Slapi_PBlock *pb, backend *be, const char *base, Slapi_Filter *flist, int ftype, int *err, int allidslimit, int and_chain);
 static IDList *substring_candidates(Slapi_PBlock *pb, backend *be, Slapi_Filter *f, int *err, int allidslimit);
 static IDList *range_candidates(
     Slapi_PBlock *pb,
@@ -55,7 +55,8 @@ filter_candidates_ext(
     Slapi_Filter *nextf,
     int range,
     int *err,
-    int allidslimit)
+    int allidslimit,
+    int and_chain)
 {
     struct ldbminfo *li = (struct ldbminfo *)be->be_database->plg_private;
     IDList *result;
@@ -124,12 +125,12 @@ filter_candidates_ext(
 
     case LDAP_FILTER_AND:
         slapi_log_err(SLAPI_LOG_FILTER, "filter_candidates_ext", "\tAND\n");
-        result = list_candidates(pb, be, base, f, LDAP_FILTER_AND, err, allidslimit);
+        result = list_candidates(pb, be, base, f, LDAP_FILTER_AND, err, allidslimit, and_chain);
         break;
 
     case LDAP_FILTER_OR:
         slapi_log_err(SLAPI_LOG_FILTER, "filter_candidates_ext", "\tOR\n");
-        result = list_candidates(pb, be, base, f, LDAP_FILTER_OR, err, allidslimit);
+        result = list_candidates(pb, be, base, f, LDAP_FILTER_OR, err, allidslimit, and_chain);
         break;
 
     case LDAP_FILTER_NOT:
@@ -159,7 +160,8 @@ filter_candidates(
     int range,
     int *err)
 {
-    return filter_candidates_ext(pb, be, base, f, nextf, range, err, 0);
+    /* A top-level frame has (vacuously) pure-AND ancestry: and_chain = 1. */
+    return filter_candidates_ext(pb, be, base, f, nextf, range, err, 0, 1);
 }
 
 static IDList *
@@ -725,6 +727,91 @@ filter_is_subtype(Slapi_Filter *f)
     return issubtype;
 }
 
+/*
+ * Return 1 if the filter or any of its descendants is a substring or
+ * approximate component. Candidate generation for these expands to one
+ * index read per generated key, whose ID lists can dwarf the result set.
+ * Range (GE/LE) components are a single contiguous scan and unindexed
+ * presence/equality reads return ALLIDS without per-key reads, so they
+ * are not costly in this sense; this is deliberately narrower than the
+ * frontend optimizer's expensive class (filter.c).
+ */
+static int
+filter_has_costly_component(Slapi_Filter *f)
+{
+    Slapi_Filter *fc;
+
+    switch (slapi_filter_get_choice(f)) {
+    case LDAP_FILTER_SUBSTRINGS:
+    case LDAP_FILTER_APPROX:
+        return 1;
+    case LDAP_FILTER_AND:
+    case LDAP_FILTER_OR:
+    case LDAP_FILTER_NOT:
+        for (fc = slapi_filter_list_first(f); fc != NULL;
+             fc = slapi_filter_list_next(f, fc)) {
+            if (filter_has_costly_component(fc)) {
+                return 1;
+            }
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Cap the index reads of a substring/approx-bearing AND component relative
+ * to the smallest candidate list the preceding components produced
+ * (idl_set->minimum, so the bound tightens as the walk collects results).
+ * Explicit per-index nsIndexIDListScanLimit rules still override this cap
+ * (index_get_allids).
+ */
+static int
+bounded_allidslimit(IDListSet *idl_set, int allidslimit, int lookthroughlimit)
+{
+    uint64_t bound;
+    uint64_t dyn;
+
+    /*
+     * allidslimit -1 is an explicit "unlimited" configuration (global
+     * nsslapd-idlistscanlimit or a per-user nsIDListScanLimit reslimit)
+     * and 0 means "use the per-attribute default"; both win over this
+     * heuristic.
+     */
+    if (allidslimit <= 0) {
+        return allidslimit;
+    }
+    if (idl_set->minimum == NULL) {
+        return allidslimit;
+    }
+    bound = idl_set->minimum->b_nids;
+    /*
+     * The floor doubles as an eligibility ceiling. The cap's fallback cost
+     * is up to `bound` extra entry fetches, ACL checks, and filter tests,
+     * so the trade is taken only while that is small in absolute terms AND
+     * within what this operation may look through anyway; above either
+     * line the component is read in full - it may be the only one able to
+     * narrow the candidate set. The absolute ceiling is what bounds the
+     * fallback for unlimited-lookthrough operations too (root binds get
+     * lookthroughlimit -1, so the lookthrough clause alone never fires
+     * for them).
+     */
+    if (bound >= BOUNDED_LIMIT_FLOOR ||
+        (lookthroughlimit > 0 && bound >= (uint64_t)lookthroughlimit)) {
+        return allidslimit;
+    }
+    /* bound < FLOOR, so dyn < FACTOR * FLOOR and the int cast is safe */
+    dyn = bound * BOUNDED_LIMIT_FACTOR;
+    if (dyn < BOUNDED_LIMIT_FLOOR) {
+        dyn = BOUNDED_LIMIT_FLOOR;
+    }
+    if ((uint64_t)allidslimit <= dyn) {
+        return allidslimit;
+    }
+    return (int)dyn;
+}
+
 static IDList *
 list_candidates(
     Slapi_PBlock *pb,
@@ -733,7 +820,8 @@ list_candidates(
     Slapi_Filter *flist,
     int ftype,
     int *err,
-    int allidslimit)
+    int allidslimit,
+    int and_chain)
 {
     IDList *idl;
     IDList *tmp;
@@ -747,7 +835,9 @@ list_candidates(
     char *tpairs[2] = {NULL, NULL};
     struct berval *vpairs[2] = {NULL, NULL};
     int is_and = 0;
+    int cap_costly = 0;
     IDListSet *idl_set = NULL;
+    Slapi_Filter *top_filter = NULL;
     back_search_result_set *sr = NULL;
 
     slapi_pblock_get(pb, SLAPI_SEARCH_RESULT_SET, &sr);
@@ -850,8 +940,35 @@ list_candidates(
 
     idl = NULL;
     nextf = NULL;
+    /*
+     * For an AND list whose every enclosing frame is also an AND
+     * (and_chain), cap the index reads of substring/approx-bearing
+     * components relative to the bound the already-collected components
+     * established (see bounded_allidslimit); the frontend optimizer has
+     * hoisted equalities (except objectClass) ahead of them
+     * (slapi_filter_optimise). The ancestry requirement is what makes an
+     * engaged bound absolute for the whole search: every ancestor
+     * intersects this frame's result downward, so the final candidate list
+     * stays a subset of this frame's minimum. An AND nested under an OR is
+     * never capped - under a union a discarded component genuinely adds
+     * candidates, and per-branch fallbacks would add up across the OR.
+     * Tombstone searches are exempt: tombstones are absent from ordinary
+     * attribute indexes and their results depend on component order and
+     * the filter-test threshold, so no read of theirs may change (the
+     * optimizer refuses to reorder those filters for the same reason).
+     */
+    slapi_pblock_get(pb, SLAPI_SEARCH_FILTER, &top_filter);
+    cap_costly = (ftype == LDAP_FILTER_AND) && and_chain &&
+                 (top_filter == NULL ||
+                  !filter_flag_is_set(top_filter, SLAPI_FILTER_TOMBSTONE));
     for (f_head = f = slapi_filter_list_first(flist); f != NULL;
          f = slapi_filter_list_next(flist, f)) {
+        int component_allidslimit = allidslimit;
+
+        if (cap_costly && filter_has_costly_component(f)) {
+            component_allidslimit = bounded_allidslimit(idl_set, allidslimit,
+                                                        sr->sr_lookthroughlimit);
+        }
 
         /* Look for NOT foo type filter elements where foo is simple equality */
         isnot = (LDAP_FILTER_NOT == slapi_filter_get_choice(f)) &&
@@ -864,8 +981,7 @@ list_candidates(
              * subtract from.
              */
             if (f == f_head) {
-                idl = idl_allids(be);
-                idl_set_insert_idl(idl_set, idl);
+                idl_set_insert_idl(idl_set, idl_allids(be));
             }
             /*
              * Not the first filter - good! Get the indexed type out.
@@ -884,7 +1000,7 @@ list_candidates(
                 tmp = idl_allids(be);
             } else {
                 tmp = ava_candidates(pb, be, slapi_filter_list_first(f),
-                                     LDAP_FILTER_EQUALITY, nextf, range, err, allidslimit);
+                                     LDAP_FILTER_EQUALITY, nextf, range, err, component_allidslimit);
             }
         } else {
             if (fpairs[0] == f) {
@@ -894,7 +1010,7 @@ list_candidates(
 
                 slapi_attr_init(&sattr, tpairs[0]);
                 tmp = range_candidates(pb, be, tpairs[0],
-                                       vpairs[0], vpairs[1], err, &sattr, allidslimit);
+                                       vpairs[0], vpairs[1], err, &sattr, component_allidslimit);
                 attr_done(&sattr);
                 if (tmp == NULL && ftype == LDAP_FILTER_AND) {
                     slapi_log_err(SLAPI_LOG_TRACE, "list_candidates",
@@ -905,7 +1021,9 @@ list_candidates(
                 }
             }
             /* Proceed as normal */
-            else if ((tmp = filter_candidates_ext(pb, be, base, f, nextf, range, err, allidslimit)) == NULL && ftype == LDAP_FILTER_AND) {
+            else if ((tmp = filter_candidates_ext(pb, be, base, f, nextf, range, err, component_allidslimit,
+                                                  and_chain && (ftype == LDAP_FILTER_AND))) == NULL &&
+                     ftype == LDAP_FILTER_AND) {
                 slapi_log_err(SLAPI_LOG_TRACE, "list_candidates",
                               "<=  NULL 2\n");
                 idl_free(&idl);
@@ -920,6 +1038,15 @@ list_candidates(
          */
         if (tmp == NULL) {
             tmp = idl_alloc(0);
+        }
+
+        if (component_allidslimit != allidslimit && ALLIDS(tmp)) {
+            /* "returned", not "degraded": a capped-eligible component can be
+             * ALLIDS for other reasons too (unindexed, NOT-of-substring). */
+            slapi_log_err(SLAPI_LOG_BACKLDBM, "list_candidates",
+                          "costly AND component returned ALLIDS under read cap %d "
+                          "- relying on the other components and the filter test\n",
+                          component_allidslimit);
         }
 
         /*

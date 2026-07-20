@@ -159,7 +159,7 @@ struct backentry *uniqueid2entry(backend *be, const char *uniqueid, back_txn *tx
  * filterindex.c
  */
 IDList *filter_candidates(Slapi_PBlock *pb, backend *be, const char *base, Slapi_Filter *f, Slapi_Filter *nextf, int range, int *err);
-IDList *filter_candidates_ext(Slapi_PBlock *pb, backend *be, const char *base, Slapi_Filter *f, Slapi_Filter *nextf, int range, int *err, int allidslimit);
+IDList *filter_candidates_ext(Slapi_PBlock *pb, backend *be, const char *base, Slapi_Filter *f, Slapi_Filter *nextf, int range, int *err, int allidslimit, int and_chain);
 
 /*
  * findentry.c
