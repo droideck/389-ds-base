@@ -37,11 +37,17 @@ pytestmark = pytest.mark.tier1
 
 OR_LOOKUP_ATTR = 'nsslapd-enable-or-filter-lookup'
 ERRORLOG_LEVEL_BACKLDBM = '524288'
+ERRORLOG_LEVEL_FILTER = '32'
 ENG_LOG_PATTERN = '.*OR filter equality lookup engaged.*'
 ENG_LOG_RE = re.compile(
     r'OR filter equality lookup engaged: (\d+) node\(s\), largest (\d+) branches')
+AVA_LOG_RE = re.compile(
+    r'^\[[^\r\n]+\]\s+-\s+DEBUG\s+-\s+test_ava_filter\s+-\s+'
+    r'=>\s*AVA:\s*(?P<attr>[^~<>=\s]+)=(?P<value>[^\r\n]*)\r?$',
+    re.MULTILINE | re.IGNORECASE)
 
 FEATURE_ATTRS = ('olFeatureLookupA', 'olFeatureLookupB', 'olFeatureLookupC')
+FEATURE_TIME_ATTR = 'olFeatureLookupTime'
 
 
 def escaped_equalities(attr, values):
@@ -75,10 +81,68 @@ def eng_summaries(inst):
 
 
 @contextmanager
+def error_log_window(inst):
+    """Capture bytes appended to one stable active error log."""
+    path = inst.ds_paths.error_log
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+    window = {'text': None}
+    try:
+        initial = os.fstat(fd)
+        identity = (initial.st_dev, initial.st_ino)
+        begin = initial.st_size
+        guard_at = max(0, begin - 4096)
+        guard = os.pread(fd, begin - guard_at, guard_at)
+
+        yield window
+
+        active = os.stat(path)
+        assert (active.st_dev, active.st_ino) == identity, \
+            'error log rotated during strict operation window'
+        assert active.st_size >= begin, \
+            'error log was truncated during strict operation window'
+        assert os.pread(fd, begin - guard_at, guard_at) == guard, \
+            'error log prefix changed during strict operation window'
+
+        end = active.st_size
+        chunks = []
+        offset = begin
+        while offset < end:
+            chunk = os.pread(fd, end - offset, offset)
+            assert chunk, 'error log shrank while reading strict operation window'
+            chunks.append(chunk)
+            offset += len(chunk)
+
+        final_fd = os.fstat(fd)
+        final_active = os.stat(path)
+        assert (final_fd.st_dev, final_fd.st_ino) == identity
+        assert (final_active.st_dev, final_active.st_ino) == identity
+        assert final_fd.st_size >= end and final_active.st_size >= end, \
+            'error log shrank while closing strict operation window'
+        assert os.pread(fd, begin - guard_at, guard_at) == guard, \
+            'error log prefix changed while reading strict operation window'
+        window['text'] = b''.join(chunks).decode('utf-8', errors='replace')
+    finally:
+        os.close(fd)
+
+
+def window_summaries(text):
+    """Parse lookup summaries from one strict operation log window."""
+    return [(int(match.group(1)), int(match.group(2)))
+            for match in ENG_LOG_RE.finditer(text)]
+
+
+def window_avas(text):
+    """Parse equality evaluations from one strict operation log window."""
+    return [(match.group('attr').lower(), match.group('value'))
+            for match in AVA_LOG_RE.finditer(text)]
+
+
+@contextmanager
 def backend_debug_log(inst):
-    """Enable the back-ldbm log level needed for lookup summaries."""
+    """Enable lookup summaries and filter AVA diagnostics."""
     level = inst.config.get_attr_val_utf8('nsslapd-errorlog-level')
-    debug_level = int(level or '0') | int(ERRORLOG_LEVEL_BACKLDBM)
+    debug_level = (int(level or '0') | int(ERRORLOG_LEVEL_BACKLDBM) |
+                   int(ERRORLOG_LEVEL_FILTER))
     inst.config.set('nsslapd-errorlog-level', str(debug_level))
     try:
         yield
@@ -126,6 +190,18 @@ def lookup_feature_data(topo):
             schema.add_attributetype(params)
             added_attrs.append(name)
 
+        params = OBJECT_MODEL_PARAMS[AttributeType].copy()
+        params.update({
+            'names': (FEATURE_TIME_ATTR,),
+            'oid': '2.16.840.1.113730.3.8.999.6275.104',
+            'desc': 'unsupported large equality OR lookup family',
+            'equality': 'generalizedTimeMatch',
+            'syntax': '1.3.6.1.4.1.1466.115.121.1.24',
+            'x_origin': ('large equality OR lookup feature test',),
+        })
+        schema.add_attributetype(params)
+        added_attrs.append(FEATURE_TIME_ATTR)
+
         container = OrganizationalUnits(inst, DEFAULT_SUFFIX).create(
             properties={'ou': 'olLookupFeatureData'})
         objects = UnsafeExtensibleObjects(inst, container.dn)
@@ -145,6 +221,14 @@ def lookup_feature_data(topo):
             'olFeatureLookupB': 'b-hit',
         })
         add_entry('family-c', {'olFeatureLookupC': 'c-hit'})
+        add_entry('tie-probe', {
+            'olFeatureLookupA': 'a-tie-hit',
+            'olFeatureLookupB': 'b-tie-hit',
+        })
+        add_entry('fallback-probe', {
+            'olFeatureLookupA': 'a-fallback-hit',
+            FEATURE_TIME_ATTR: '20260101000000Z',
+        })
 
         yield {
             'base': container.dn,
@@ -251,13 +335,91 @@ def test_or_lookup_dominant_family_order_independent(topo,
 
     with backend_debug_log(inst):
         for filterstr in (f'(|{a_run}{b_run})', f'(|{b_run}{a_run})'):
-            before = len(eng_summaries(inst))
+            with error_log_window(inst) as window:
+                assert search_dns_result(
+                    inst, filterstr, base=base,
+                    scope=ldap.SCOPE_ONELEVEL) == expected
+            summaries = window_summaries(window['text'])
+            assert len(summaries) == 1
+            assert summaries[0][0] > 0 and summaries[0][1] == 64
+
+
+def test_or_lookup_equal_family_tie_uses_first_source(topo,
+                                                       lookup_feature_data):
+    """Require first source occurrence as the equal-size family tie-breaker.
+
+    :id: 468d35ed-03be-4794-bf92-0da6cdaf10e0
+    :setup: A base object that matches one branch in the A and B families
+    :steps:
+        1. Search equal 16-branch A and B families with A first
+        2. Repeat the equivalent filter with B first
+        3. Inspect only each search's appended error-log bytes
+    :expectedresults:
+        1. The exact base DN returns and only the A sentinel is evaluated
+        2. The exact base DN returns and only the B sentinel is evaluated
+        3. Each search reports one selected family of 16 usable branches
+    """
+    inst = topo.standalone
+    probe_dn = lookup_feature_data['dns']['tie-probe']
+    a_values = ['a-tie-hit'] + [f'a-tie-miss-{i:02d}' for i in range(15)]
+    b_values = ['b-tie-hit'] + [f'b-tie-miss-{i:02d}' for i in range(15)]
+    a_run = escaped_equalities('olFeatureLookupA', a_values)
+    b_run = escaped_equalities('olFeatureLookupB', b_values)
+
+    with backend_debug_log(inst):
+        for filterstr, expected_ava in (
+                (f'(|{a_run}{b_run})', ('olfeaturelookupa', 'a-tie-hit')),
+                (f'(|{b_run}{a_run})', ('olfeaturelookupb', 'b-tie-hit'))):
+            with error_log_window(inst) as window:
+                assert search_dns_result(
+                    inst, filterstr, base=probe_dn,
+                    scope=ldap.SCOPE_BASE) == [probe_dn]
+
+            summaries = window_summaries(window['text'])
+            assert len(summaries) == 1
+            assert summaries[0][0] > 0 and summaries[0][1] == 16
+            avas = window_avas(window['text'])
+            assert avas and all(ava == expected_ava for ava in avas)
+
+
+def test_or_lookup_larger_unsupported_family_falls_back(topo,
+                                                         lookup_feature_data):
+    """Select a supported family over a larger unsupported family.
+
+    :id: 6e01be9a-f869-45c6-b7d5-cf11f72decdb
+    :setup: A base object matching generalizedTime and supported A families
+    :steps:
+        1. Put 64 generalizedTime branches before 16 supported A branches
+        2. Search the dedicated base object
+        3. Inspect only the search's appended error-log bytes
+    :expectedresults:
+        1. The larger family is plausible but unsupported for byte lookup
+        2. The exact base DN returns through the selected A family
+        3. The summary reports 16 and only the A sentinel is evaluated
+    """
+    inst = topo.standalone
+    probe_dn = lookup_feature_data['dns']['fallback-probe']
+    time_values = ['20260101000000Z'] + [
+        f'202602{1 + i // 24:02d}{i % 24:02d}0000Z' for i in range(63)
+    ]
+    a_values = ['a-fallback-hit'] + [
+        f'a-fallback-miss-{i:02d}' for i in range(15)
+    ]
+    filterstr = f'(|{escaped_equalities(FEATURE_TIME_ATTR, time_values)}' \
+                f'{escaped_equalities("olFeatureLookupA", a_values)})'
+
+    with backend_debug_log(inst):
+        with error_log_window(inst) as window:
             assert search_dns_result(
-                inst, filterstr, base=base,
-                scope=ldap.SCOPE_ONELEVEL) == expected
-            summaries = eng_summaries(inst)[before:]
-            assert summaries and all(largest == 64
-                                     for _, largest in summaries)
+                inst, filterstr, base=probe_dn,
+                scope=ldap.SCOPE_BASE) == [probe_dn]
+
+    summaries = window_summaries(window['text'])
+    assert len(summaries) == 1
+    assert summaries[0][0] > 0 and summaries[0][1] == 16
+    avas = window_avas(window['text'])
+    expected_ava = ('olfeaturelookupa', 'a-fallback-hit')
+    assert avas and all(ava == expected_ava for ava in avas)
 
 
 def test_or_lookup_third_family_after_distractors(topo,

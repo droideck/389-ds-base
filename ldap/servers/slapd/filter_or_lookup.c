@@ -102,7 +102,26 @@ static const char *const or_lookup_mr_oids[] = {
 struct or_lookup_family {
     const char *type; /* borrowed from the first branch of this family */
     size_t eligible;
+    size_t usable;
+    size_t first_ord;
+    int32_t is_dn;
+    int32_t supported;
 };
+
+static int
+or_lookup_family_cmp(const void *ap, const void *bp)
+{
+    const struct or_lookup_family *a = (const struct or_lookup_family *)ap;
+    const struct or_lookup_family *b = (const struct or_lookup_family *)bp;
+
+    if (a->usable != b->usable) {
+        return (a->usable > b->usable) ? -1 : 1;
+    }
+    if (a->first_ord != b->first_ord) {
+        return (a->first_ord < b->first_ord) ? -1 : 1;
+    }
+    return 0;
+}
 
 static int32_t
 or_lookup_oid_in_list(const char *const *list, const char *oid)
@@ -200,6 +219,57 @@ or_lookup_dn_key_valid(const char *key, size_t key_len)
     return valid;
 }
 
+/* Resolve whether a family has byte-equality semantics safe for lookup. */
+static int32_t
+or_lookup_type_supported(const char *type, int32_t *is_dn)
+{
+    Slapi_Attr sattr = {0};
+    const char *syntax_oid = NULL;
+    int32_t supported = 0;
+
+    *is_dn = 0;
+    slapi_attr_init(&sattr, type);
+    if (sattr.a_plugin == NULL) {
+        slapi_attr_init_syntax(&sattr);
+    }
+    if (sattr.a_plugin != NULL) {
+        syntax_oid = sattr.a_plugin->plg_syntax_oid;
+    }
+    if (!or_lookup_oid_in_list(or_lookup_syntax_oids, syntax_oid)) {
+        goto done;
+    }
+    if (sattr.a_mr_eq_plugin != NULL &&
+        !or_lookup_mr_in_list(sattr.a_mr_eq_plugin->plg_mr_names)) {
+        goto done;
+    }
+    *is_dn = (strcmp(syntax_oid, DN_SYNTAX_OID) == 0);
+    supported = 1;
+
+done:
+    attr_done(&sattr);
+    return supported;
+}
+
+/* Return the exact table-key length, or zero when this branch must remain. */
+static size_t
+or_lookup_child_key_len(const struct slapi_filter *fc, const char *type,
+                        int32_t is_dn)
+{
+    size_t key_len;
+
+    if (!or_lookup_child_hashable(fc, type)) {
+        return 0;
+    }
+
+    /* filter_normalize_ava can shrink the value without refreshing bv_len. */
+    key_len = strlen(fc->f_ava.ava_value.bv_val);
+    if (key_len == 0 ||
+        (is_dn && !or_lookup_dn_key_valid(fc->f_ava.ava_value.bv_val, key_len))) {
+        return 0;
+    }
+    return key_len;
+}
+
 /* Sort by key (length, then bytes); equal keys by list position. */
 static int
 or_lookup_key_cmp(const void *ap, const void *bp)
@@ -263,52 +333,22 @@ filter_or_lookup_free(struct slapi_filter_or_lookup **ol)
  * have paid) on success, 0 if the node does not qualify for this type.
  */
 static int32_t
-or_lookup_annotate_type(struct slapi_filter *f, const char *type)
+or_lookup_annotate_type(struct slapi_filter *f, const char *type, int32_t is_dn)
 {
-    Slapi_Attr sattr = {0};
     struct slapi_filter *fc;
     struct slapi_filter_or_key *tab = NULL;
     struct slapi_filter **rest = NULL;
     struct slapi_filter_or_lookup *ol = NULL;
-    const char *syntax_oid = NULL;
     size_t n_children = 0;
     size_t tab_n = 0;
     size_t rest_n = 0;
     size_t uniq;
     size_t i;
     uint32_t ord = 0;
-    int32_t is_dn = 0;
-    int32_t eligible = 0;
 
     for (fc = f->f_or; fc != NULL; fc = fc->f_next) {
         n_children++;
-        if (or_lookup_child_hashable(fc, type)) {
-            eligible++;
-        }
     }
-    if (eligible < FILTER_OR_LOOKUP_THRESHOLD) {
-        return 0;
-    }
-
-    /* Resolve the type once; refuse anything outside the audited families. */
-    slapi_attr_init(&sattr, type);
-    if (sattr.a_plugin == NULL) {
-        slapi_attr_init_syntax(&sattr);
-    }
-    if (sattr.a_plugin != NULL) {
-        syntax_oid = sattr.a_plugin->plg_syntax_oid;
-    }
-    if (!or_lookup_oid_in_list(or_lookup_syntax_oids, syntax_oid)) {
-        attr_done(&sattr);
-        return 0;
-    }
-    if (sattr.a_mr_eq_plugin != NULL &&
-        !or_lookup_mr_in_list(sattr.a_mr_eq_plugin->plg_mr_names)) {
-        attr_done(&sattr);
-        return 0;
-    }
-    is_dn = (strcmp(syntax_oid, DN_SYNTAX_OID) == 0);
-    attr_done(&sattr);
 
     tab = (struct slapi_filter_or_key *)slapi_ch_calloc(n_children, sizeof(*tab));
     rest = (struct slapi_filter **)slapi_ch_calloc(n_children, sizeof(*rest));
@@ -318,12 +358,9 @@ or_lookup_annotate_type(struct slapi_filter *f, const char *type)
          * without refreshing bv_len when the value shrinks (trimmed
          * blanks, stripped integer zeros), and the classic walk compares
          * NUL-terminated strings. */
-        size_t key_len = (or_lookup_child_hashable(fc, type))
-                             ? strlen(fc->f_ava.ava_value.bv_val)
-                             : 0;
+        size_t key_len = or_lookup_child_key_len(fc, type, is_dn);
 
-        if (key_len > 0 &&
-            (!is_dn || or_lookup_dn_key_valid(fc->f_ava.ava_value.bv_val, key_len))) {
+        if (key_len > 0) {
             tab[tab_n].ok_key = fc->f_ava.ava_value.bv_val;
             tab[tab_n].ok_len = key_len;
             tab[tab_n].ok_branch = fc;
@@ -334,7 +371,7 @@ or_lookup_annotate_type(struct slapi_filter *f, const char *type)
         }
     }
 
-    /* DN validation may have demoted members below the threshold. */
+    /* Guard against any divergence between preflight and table building. */
     if (tab_n < FILTER_OR_LOOKUP_THRESHOLD) {
         slapi_ch_free((void **)&tab);
         slapi_ch_free((void **)&rest);
@@ -377,6 +414,7 @@ or_lookup_annotate(struct slapi_filter *f)
     PLHashTable *by_type = NULL;
     size_t n_children = 0;
     size_t n_families = 0;
+    size_t ord = 0;
     size_t i;
     int32_t k = 0;
 
@@ -403,7 +441,7 @@ or_lookup_annotate(struct slapi_filter *f)
         goto done;
     }
 
-    for (fc = f->f_or; fc != NULL; fc = fc->f_next) {
+    for (fc = f->f_or; fc != NULL; fc = fc->f_next, ord++) {
         const char *type;
 
         if (fc->f_choice != LDAP_FILTER_EQUALITY || fc->f_ava.ava_type == NULL ||
@@ -416,6 +454,7 @@ or_lookup_annotate(struct slapi_filter *f)
         if (family == NULL) {
             family = &families[n_families];
             family->type = type;
+            family->first_ord = ord;
             if (PL_HashTableAdd(by_type, family->type, family) == NULL) {
                 goto done;
             }
@@ -426,13 +465,36 @@ or_lookup_annotate(struct slapi_filter *f)
         }
     }
 
-    /* Preserve the existing first-buildable policy for this correction;
-     * usable-family ranking is a separate selection decision. */
+    /* Preflight through the same support and key rules table construction
+     * uses, then rank by exact usable members. */
     for (i = 0; i < n_families; i++) {
         if (families[i].eligible < FILTER_OR_LOOKUP_THRESHOLD) {
             continue;
         }
-        k = or_lookup_annotate_type(f, families[i].type);
+        families[i].supported = or_lookup_type_supported(families[i].type,
+                                                         &families[i].is_dn);
+    }
+    for (fc = f->f_or; fc != NULL; fc = fc->f_next) {
+        if (fc->f_choice != LDAP_FILTER_EQUALITY || fc->f_ava.ava_type == NULL ||
+            strchr(fc->f_ava.ava_type, ';') != NULL) {
+            continue;
+        }
+        family = (struct or_lookup_family *)PL_HashTableLookup(by_type,
+                                                               fc->f_ava.ava_type);
+        if (family != NULL && family->supported &&
+            or_lookup_child_key_len(fc, family->type, family->is_dn) > 0) {
+            family->usable++;
+        }
+    }
+
+    PL_HashTableDestroy(by_type);
+    by_type = NULL;
+    qsort(families, n_families, sizeof(*families), or_lookup_family_cmp);
+
+    for (i = 0;
+         i < n_families && families[i].usable >= FILTER_OR_LOOKUP_THRESHOLD;
+         i++) {
+        k = or_lookup_annotate_type(f, families[i].type, families[i].is_dn);
         if (k > 0) {
             break;
         }
