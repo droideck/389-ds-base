@@ -18,12 +18,14 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include "slap.h"
+#include "slapi-private.h"
 
 static int test_filter_list(Slapi_PBlock *pb, Slapi_Entry *e, struct slapi_filter *flist, int ftype, int verify_access, int only_check_access, int *access_check_done);
 static int test_extensible_filter(Slapi_PBlock *callers_pb, Slapi_Entry *e, mr_filter_t *mrf, int verify_access, int only_check_access, int *access_check_done);
 
 static int vattr_test_filter_list_and(Slapi_PBlock *pb, Slapi_Entry *e, struct slapi_filter *flist, int ftype, int verify_access, int only_check_access, int *access_check_done);
 static int vattr_test_filter_list_or(Slapi_PBlock *pb, Slapi_Entry *e, struct slapi_filter *flist, int ftype, int verify_access, int only_check_access, int *access_check_done);
+static int vattr_test_filter_or_lookup(Slapi_PBlock *pb, Slapi_Entry *e, struct slapi_filter *f, int verify_access, int *access_check_done, int32_t *decided);
 
 static int test_filter_access(Slapi_PBlock *pb, Slapi_Entry *e, char *attr_type, struct berval *attr_val);
 static int slapi_vattr_filter_test_ext_internal(Slapi_PBlock *pb, Slapi_Entry *e, struct slapi_filter *f, int verify_access, int only_check_access, int *access_check_done);
@@ -942,10 +944,20 @@ slapi_vattr_filter_test_ext_internal(
                                         LDAP_FILTER_AND, verify_access, only_check_access, access_check_done);
         break;
 
-    case LDAP_FILTER_OR:
-        rc = vattr_test_filter_list_or(pb, e, f->f_or,
-                                       LDAP_FILTER_OR, verify_access, only_check_access, access_check_done);
+    case LDAP_FILTER_OR: {
+        int32_t decided = 0;
+        /* only_check_access mode must visit every component's ACL, so the
+         * lookup shortcut never applies there. */
+        if (f->f_or_lookup != NULL && only_check_access == 0) {
+            rc = vattr_test_filter_or_lookup(pb, e, f, verify_access,
+                                             access_check_done, &decided);
+        }
+        if (!decided) {
+            rc = vattr_test_filter_list_or(pb, e, f->f_or,
+                                           LDAP_FILTER_OR, verify_access, only_check_access, access_check_done);
+        }
         break;
+    }
 
     case LDAP_FILTER_NOT:
         slapi_log_err(SLAPI_LOG_FILTER, "vattr_test_filter_list_NOT", "=>\n");
@@ -1125,4 +1137,180 @@ vattr_test_filter_list_or(
     if (nomatch == 1)
         return undefined;
     return (nomatch);
+}
+
+/*
+ * vattr_test_filter_or_lookup - evaluate a large OR through its
+ * per-operation equality-lookup table (filter_or_lookup.c).
+ *
+ * Contract: identical three-valued semantics to
+ * vattr_test_filter_list_or - 0 iff some component is access-allowed
+ * AND matches; else -1 if any component is defined-false; else the
+ * undefined (>0) class.  The table only selects WHICH components to
+ * test: every returned 0 has been re-verified through the same
+ * per-component access-check and match calls the linear walk makes, and
+ * every situation the table cannot decide exactly leaves *decided at 0
+ * so the caller runs the untouched linear walk.  In particular, under
+ * verify_access a no-winner outcome always falls back: unvisited
+ * components carry their own access outcomes, which legitimately decide
+ * -1 vs undefined (ticket 48275 semantics).
+ */
+static int
+vattr_test_filter_or_lookup(
+    Slapi_PBlock *pb,
+    Slapi_Entry *e,
+    struct slapi_filter *f,
+    int verify_access,
+    int *access_check_done,
+    int32_t *decided)
+{
+    const struct slapi_filter_or_lookup *ol = f->f_or_lookup;
+    Slapi_Attr *a;
+    size_t probe_hits = 0;
+    int nomatch_seen = 0; /* some table component confirmed defined-false */
+    int rc;
+
+    *decided = 0;
+
+    /* A virtually-suppliable type must use the classic walk, which
+     * consults the service providers per component. */
+    if (vattr_type_sp_registered(e, ol->ol_type)) {
+        return 0;
+    }
+
+    /* DN-syntax entries with more values than the table has keys are
+     * cheaper on the classic walk: the sorted-valueset find there is
+     * O(log m) per component, while probing costs one DN normalization
+     * per value.  (String-family components re-normalize the entry
+     * values on every component today, so no such guard applies.) */
+    if (ol->ol_type_is_dn) {
+        size_t m = 0;
+        for (a = e->e_attrs; a != NULL; a = a->a_next) {
+            if (slapi_attr_type_cmp(ol->ol_type, a->a_type, SLAPI_TYPE_CMP_SUBTYPE) == 0) {
+                int n = 0;
+                slapi_attr_get_numvalues(a, &n);
+                m += (size_t)n;
+            }
+        }
+        if (m > ol->ol_tab_len) {
+            return 0;
+        }
+    }
+
+    for (a = e->e_attrs; a != NULL; a = a->a_next) {
+        Slapi_Value **va;
+        size_t i;
+
+        /* Same subtype predicate as the per-component scan in
+         * test_ava_filter: a base-type component matches values of
+         * subtyped instances too. */
+        if (slapi_attr_type_cmp(ol->ol_type, a->a_type, SLAPI_TYPE_CMP_SUBTYPE) != 0) {
+            continue;
+        }
+        va = attr_get_present_values(a);
+        for (i = 0; va != NULL && va[i] != NULL; i++) {
+            const struct berval *bv = slapi_value_get_berval(va[i]);
+            struct berval probe = {0, NULL};
+            struct slapi_filter *branch;
+            char *copy;
+            char *norm = NULL;
+            int32_t norm_failed = 0;
+
+            if (bv == NULL || bv->bv_val == NULL) {
+                return 0;
+            }
+            /* The normalizers modify their input in place - never hand
+             * them the cached entry's own value buffer. */
+            copy = slapi_ch_malloc(bv->bv_len + 1);
+            memcpy(copy, bv->bv_val, bv->bv_len);
+            copy[bv->bv_len] = '\0';
+            if (ol->ol_type_is_dn) {
+                char *dest = NULL;
+                size_t dlen = 0;
+                int nrc = slapi_dn_normalize_case_ext(copy, bv->bv_len, &dest, &dlen);
+                if (nrc < 0) {
+                    /* Unparseable stored value: today's walk compares it
+                     * raw-vs-raw, which the table cannot reproduce. */
+                    norm_failed = 1;
+                } else if (nrc == 0) {
+                    probe.bv_val = dest; /* in place, not NUL terminated */
+                    probe.bv_len = dlen;
+                } else {
+                    norm = dest;
+                    probe.bv_val = dest;
+                    probe.bv_len = dlen;
+                }
+            } else {
+                /* Identical normalizer + filter type to what
+                 * filter_normalize_ava applied to the table keys. */
+                slapi_attr_value_normalize_ext(NULL, a, NULL, copy, 1, &norm,
+                                               LDAP_FILTER_EQUALITY);
+                probe.bv_val = norm ? norm : copy;
+                probe.bv_len = strlen(probe.bv_val);
+            }
+            if (norm_failed) {
+                slapi_ch_free_string(&copy);
+                return 0;
+            }
+            branch = filter_or_lookup_probe(ol, &probe);
+            if (norm != NULL && norm != copy) {
+                slapi_ch_free_string(&norm);
+            }
+            slapi_ch_free_string(&copy);
+
+            if (branch == NULL) {
+                continue;
+            }
+            probe_hits++;
+            if (verify_access) {
+                /* Access first, on exactly the component the value hit -
+                 * same (type, value) pair the linear walk would check. */
+                rc = slapi_vattr_filter_test_ext_internal(pb, e, branch, verify_access,
+                                                          -1, access_check_done);
+                if (rc != 0) {
+                    /* No access to this component: ignore it and keep
+                     * probing - another value may hit an allowed one. */
+                    continue;
+                }
+            }
+            rc = slapi_vattr_filter_test_ext_internal(pb, e, branch, 0, 0,
+                                                      access_check_done);
+            if (rc == 0) {
+                *decided = 1;
+                return 0;
+            } else if (rc < 0) {
+                nomatch_seen = 1;
+            }
+            /* rc > 0, or the confirm disagreed with the probe: keep
+             * scanning; the no-winner logic below decides. */
+        }
+    }
+
+    /* No winning component. */
+    if (verify_access) {
+        return 0;
+    }
+    if (probe_hits >= ol->ol_tab_len && !nomatch_seen) {
+        /* Cannot prove an unvisited table component exists, and no
+         * defined-false in hand: the -1/undefined class is unknown. */
+        return 0;
+    }
+    /* At least one table component is defined-false for this entry:
+     * either a confirmed non-match above, or a component whose assertion
+     * value the entry does not have (probe_hits < table size), which
+     * test_ava_filter scores -1 today.  A defined-false forces -1 unless
+     * some non-table component matches. */
+    {
+        size_t i;
+        for (i = 0; i < ol->ol_rest_len; i++) {
+            rc = slapi_vattr_filter_test_ext_internal(pb, e, ol->ol_rest[i], 0, 0,
+                                                      access_check_done);
+            if (rc == 0) {
+                *decided = 1;
+                return 0;
+            }
+        }
+    }
+    *decided = 1;
+    return -1;
 }
