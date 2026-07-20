@@ -36,9 +36,10 @@ static back_search_result_set *new_search_result_set(IDList *idl, int vlv, int l
 static void delete_search_result_set(Slapi_PBlock *pb, back_search_result_set **sr);
 static int can_skip_filter_test(Slapi_PBlock *pb, struct slapi_filter *f, int scope, IDList *idl);
 static void stat_add_srch_lookup(Op_stat *op_stat,  struct component_keys_lookup *key_stat, char * attribute_type, const char* index_type, char *key_value, int lookup_cnt);
-static bool dynamic_lists_filter_matches(Slapi_Filter *filter, struct ldbminfo *li);
-static void dynamic_candidates(Slapi_PBlock *pb, struct ldbminfo *li, const char *base, IDList **candidates, int *err);
-static void dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entry, struct ldbminfo *li);
+static bool dynamic_lists_filter_matches(Slapi_Filter *filter, const char *dynamic_lists_attr);
+static void dynamic_lists_config_snapshot(Slapi_PBlock *pb, struct ldbminfo *li, back_search_result_set *sr);
+static void dynamic_candidates(Slapi_PBlock *pb, struct ldbminfo *li, const char *base, IDList **candidates, int *err, const back_search_result_set *sr);
+static void dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entry, struct ldbminfo *li, const back_search_result_set *sr);
 
 /* This is for performance testing, allows us to disable ACL checking altogether */
 #if defined(DISABLE_ACL_CHECK)
@@ -51,11 +52,16 @@ static void dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entr
 
 /* Recursively walk the filter to see if it contains our dynamic attribute */
 static bool
-dynamic_lists_filter_matches(Slapi_Filter *filter, struct ldbminfo *li)
+dynamic_lists_filter_matches(Slapi_Filter *filter, const char *dynamic_lists_attr)
 {
+    if (filter == NULL || dynamic_lists_attr == NULL) {
+        return false;
+    }
+
     switch (filter->f_choice) {
     case LDAP_FILTER_EQUALITY:
-        if (strcasecmp(filter->f_avtype, li->li_dynamic_lists_attr) == 0) {
+        if (filter->f_avtype != NULL &&
+            strcasecmp(filter->f_avtype, dynamic_lists_attr) == 0) {
             return true;
         }
         break;
@@ -66,7 +72,7 @@ dynamic_lists_filter_matches(Slapi_Filter *filter, struct ldbminfo *li)
              sub_filter;
              sub_filter = sub_filter->f_next)
         {
-            if (dynamic_lists_filter_matches(sub_filter, li)) {
+            if (dynamic_lists_filter_matches(sub_filter, dynamic_lists_attr)) {
                 return true;
             }
         }
@@ -76,12 +82,48 @@ dynamic_lists_filter_matches(Slapi_Filter *filter, struct ldbminfo *li)
 }
 
 static void
-dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entry, struct ldbminfo *li)
+dynamic_lists_config_snapshot(
+    Slapi_PBlock *pb,
+    struct ldbminfo *li,
+    back_search_result_set *sr)
+{
+    Slapi_Operation *operation = NULL;
+
+    if (pb == NULL || li == NULL || sr == NULL) {
+        return;
+    }
+
+    slapi_pblock_get(pb, SLAPI_OPERATION, &operation);
+    if (operation != NULL && operation_is_flag_set(operation, OP_FLAG_INTERNAL)) {
+        return;
+    }
+
+    /* Runtime configuration changes replace these strings.  Keep one
+     * protected snapshot for candidate generation and entry filtering. */
+    PR_Lock(li->li_config_mutex);
+    if (li->li_dynamic_lists_enabled &&
+        li->li_dynamic_lists_attr != NULL &&
+        li->li_dynamic_lists_oc != NULL &&
+        li->li_dynamic_lists_url_attr != NULL) {
+        sr->sr_dynamic_lists_attr = slapi_ch_strdup(li->li_dynamic_lists_attr);
+        sr->sr_dynamic_lists_oc = slapi_ch_strdup(li->li_dynamic_lists_oc);
+        sr->sr_dynamic_lists_url_attr = slapi_ch_strdup(li->li_dynamic_lists_url_attr);
+        sr->sr_dynamic_lists_enabled = true;
+    }
+    PR_Unlock(li->li_config_mutex);
+}
+
+static void
+dynamic_lists_buildup_entry(
+    Slapi_PBlock *pb,
+    struct backentry *entry,
+    struct ldbminfo *li,
+    const back_search_result_set *sr)
 {
     const Slapi_Value **urls = NULL;
 
     if (slapi_entry_attr_hasvalue(entry->ep_entry, "objectclass",
-                                  li->li_dynamic_lists_oc) == 0)
+                                  sr->sr_dynamic_lists_oc) == 0)
     {
          /* Entry does not have the groupOfUrls objectclass */
          return;
@@ -89,7 +131,7 @@ dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entry, struct ld
 
     /* The entry could have multiple urls, so we need to loop here */
     urls = slapi_entry_attr_get_valuearray(entry->ep_entry,
-                                           li->li_dynamic_lists_url_attr);
+                                           sr->sr_dynamic_lists_url_attr);
     for (size_t i = 0; urls && urls[i]; i++) {
         Slapi_PBlock *search_pb = NULL;
         Slapi_ValueSet *list_set = NULL;
@@ -173,7 +215,7 @@ dynamic_lists_buildup_entry(Slapi_PBlock *pb, struct backentry *entry, struct ld
         }
         if (slapi_valueset_isempty(list_set) == 0) {
             slapi_entry_add_valueset(entry->ep_entry,
-                                     list_attr ? list_attr : li->li_dynamic_lists_attr,
+                                     list_attr ? list_attr : sr->sr_dynamic_lists_attr,
                                      list_set);
             entry->ep_is_dynamic = true;
         }
@@ -536,6 +578,7 @@ ldbm_back_search(Slapi_PBlock *pb)
     /* Beware that if we exit this routine sideways, we might leak this structure */
     sr = new_search_result_set(NULL, 0,
                                compute_lookthrough_limit(pb, li));
+    dynamic_lists_config_snapshot(pb, li, sr);
     slapi_pblock_set(pb, SLAPI_SEARCH_RESULT_SET, sr);
     slapi_pblock_set(pb, SLAPI_SEARCH_RESULT_SET_SIZE_ESTIMATE, &estimate);
 
@@ -1220,7 +1263,7 @@ build_candidate_list(Slapi_PBlock *pb, backend *be, struct backentry *e, const c
     int r = 0;
     char logbuf[1024] = {0};
     Slapi_Operation *operation;
-    int32_t internal_op = 0;
+    back_search_result_set *sr = NULL;
 
     slapi_pblock_get(pb, SLAPI_SEARCH_FILTER, &filter);
     if (NULL == filter) {
@@ -1231,8 +1274,11 @@ build_candidate_list(Slapi_PBlock *pb, backend *be, struct backentry *e, const c
 
     slapi_pblock_get(pb, SLAPI_MANAGEDSAIT, &managedsait);
     slapi_pblock_get(pb, SLAPI_OPERATION, &operation);
-
-    internal_op = operation && operation_is_flag_set(operation, OP_FLAG_INTERNAL);
+    slapi_pblock_get(pb, SLAPI_SEARCH_RESULT_SET, &sr);
+    if (sr != NULL && sr->sr_dynamic_lists_enabled) {
+        sr->sr_dynamic_candidate_augmentation =
+            dynamic_lists_filter_matches(filter, sr->sr_dynamic_lists_attr);
+    }
 
     switch (scope) {
     case LDAP_SCOPE_BASE:
@@ -1250,7 +1296,8 @@ build_candidate_list(Slapi_PBlock *pb, backend *be, struct backentry *e, const c
         slapi_log_err(SLAPI_LOG_FILTER, "ldbm_back_search", "Optimised ONE filter to - %s\n",
              slapi_filter_to_string(filter_exec, logbuf, sizeof(logbuf)));
 
-        *candidates = onelevel_candidates(pb, be, base, filter_exec, lookup_returned_allidsp, &err);
+        *candidates = onelevel_candidates(pb, be, base, filter_exec,
+                                         lookup_returned_allidsp, &err);
 
         slapi_pblock_set(pb, SLAPI_SEARCH_FILTER, filter_exec);
         slapi_pblock_set(pb, SLAPI_SEARCH_FILTER_INTENDED, filter);
@@ -1276,7 +1323,8 @@ build_candidate_list(Slapi_PBlock *pb, backend *be, struct backentry *e, const c
         slapi_log_err(SLAPI_LOG_FILTER, "ldbm_back_search", "Optimised SUB filter to - %s\n",
              slapi_filter_to_string(filter_exec, logbuf, sizeof(logbuf)));
 
-        *candidates = subtree_candidates(pb, be, base, e, filter_exec, lookup_returned_allidsp, &err);
+        *candidates = subtree_candidates(pb, be, base, e, filter_exec,
+                                        lookup_returned_allidsp, &err);
 
         slapi_pblock_set(pb, SLAPI_SEARCH_FILTER, filter_exec);
         slapi_pblock_set(pb, SLAPI_SEARCH_FILTER_INTENDED, filter);
@@ -1313,12 +1361,11 @@ bail:
         }
     }
 
-    if (!internal_op && li->li_dynamic_lists_enabled &&
-        dynamic_lists_filter_matches(filter, li))
+    if (sr != NULL && sr->sr_dynamic_candidate_augmentation)
     {
         /* Filter includes the dynamic attribute, so we need to build up the
          * candidates list */
-        dynamic_candidates(pb, li, base, candidates, &err);
+        dynamic_candidates(pb, li, base, candidates, &err, sr);
     }
 
     slapi_log_err(SLAPI_LOG_TRACE, "build_candidate_list", "Candidate list has %lu ids\n",
@@ -1336,13 +1383,14 @@ dynamic_candidates(
     struct ldbminfo *li,
     const char *base,
     IDList **candidates,
-    int *err)
+    int *err,
+    const back_search_result_set *sr)
 {
     int rc = 0;
     Slapi_Entry **entries = NULL;
     char *dynamic_filter = slapi_ch_smprintf("(&(objectclass=%s)(%s=*))",
-                                             li->li_dynamic_lists_oc,
-                                             li->li_dynamic_lists_url_attr);
+                                             sr->sr_dynamic_lists_oc,
+                                             sr->sr_dynamic_lists_url_attr);
     Slapi_PBlock *search_pb = slapi_pblock_new();
 
     slapi_search_internal_set_pb(search_pb, base, LDAP_SCOPE_SUBTREE, dynamic_filter,
@@ -1766,7 +1814,6 @@ ldbm_back_next_search_entry(Slapi_PBlock *pb)
     Slapi_Connection *conn;
     Slapi_Operation *op;
     int reverse_list = 0;
-    int32_t internal_op = 0;
 
     slapi_pblock_get(pb, SLAPI_SEARCH_TARGET_SDN, &basesdn);
     if (NULL == basesdn) {
@@ -1793,8 +1840,6 @@ ldbm_back_next_search_entry(Slapi_PBlock *pb)
     slapi_pblock_get(pb, SLAPI_TXN, &txn.back_txn_txn);
     slapi_pblock_get(pb, SLAPI_CONNECTION, &conn);
     slapi_pblock_get(pb, SLAPI_OPERATION, &op);
-
-    internal_op = op && operation_is_flag_set(op, OP_FLAG_INTERNAL);
 
     if ((reverse_list = operation_is_flag_set(op, OP_FLAG_REVERSE_CANDIDATE_ORDER))) {
         /*
@@ -1993,9 +2038,9 @@ ldbm_back_next_search_entry(Slapi_PBlock *pb)
             continue;
         }
 
-        if (li->li_dynamic_lists_enabled && !internal_op) {
+        if (sr->sr_dynamic_lists_enabled) {
             /* Need to build up any dynamic content for the entry */
-            dynamic_lists_buildup_entry(pb, e, li);
+            dynamic_lists_buildup_entry(pb, e, li, sr);
         }
 
         e->ep_vlventry = NULL;
@@ -2292,6 +2337,9 @@ delete_search_result_set(Slapi_PBlock *pb, back_search_result_set **sr)
 
     slapi_filter_free((*sr)->sr_norm_filter, 1);
     slapi_filter_free((*sr)->sr_norm_filter_intent, 1);
+    slapi_ch_free_string(&(*sr)->sr_dynamic_lists_attr);
+    slapi_ch_free_string(&(*sr)->sr_dynamic_lists_oc);
+    slapi_ch_free_string(&(*sr)->sr_dynamic_lists_url_attr);
     memset(*sr, 0, sizeof(back_search_result_set));
     slapi_ch_free((void **)sr);
     return;

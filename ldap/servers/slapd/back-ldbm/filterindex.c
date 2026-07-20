@@ -958,9 +958,12 @@ list_candidates(
      * optimizer refuses to reorder those filters for the same reason).
      */
     slapi_pblock_get(pb, SLAPI_SEARCH_FILTER, &top_filter);
-    cap_costly = (ftype == LDAP_FILTER_AND) && and_chain &&
+    cap_costly = (sr != NULL) && (ftype == LDAP_FILTER_AND) && and_chain &&
                  (top_filter == NULL ||
-                  !filter_flag_is_set(top_filter, SLAPI_FILTER_TOMBSTONE));
+                  !filter_flag_is_set(top_filter, SLAPI_FILTER_TOMBSTONE)) &&
+                 /* A later dynamic-candidate union can exceed this AND's
+                  * bound and invalidate the lookthrough safety proof. */
+                 !sr->sr_dynamic_candidate_augmentation;
     for (f_head = f = slapi_filter_list_first(flist); f != NULL;
          f = slapi_filter_list_next(flist, f)) {
         int component_allidslimit = allidslimit;
