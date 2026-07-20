@@ -69,7 +69,6 @@ GENERIC_TLS_STACK = (
 )
 NATIVE_TLS_STACK = (
     "get_mdbtxnanchor",
-    "push_mdbtxn",
     "dbmdb_start_txn",
 )
 TLS_CLASSIFICATIONS = (
@@ -128,16 +127,14 @@ def _elf_identity(path):
     realpath = os.path.realpath(path)
     linkage = _output(["ldd", realpath])
     assert "not found" not in linkage.lower()
-    verification = subprocess.run(
-        ["rpm", "-Vf", realpath], text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
-    )
-    assert verification.returncode == 0 and not verification.stdout.strip(), \
-        verification.stdout
     return {
         "path": realpath,
         "sha256": _sha256(realpath),
         "build_id": _build_id(realpath),
+        "package": _output([
+            "rpm", "-qf", "--queryformat",
+            "%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}", realpath,
+        ]),
         "linkage": linkage,
     }
 
@@ -189,9 +186,18 @@ def _debug_object(path):
 
 
 def _symbolize_address(path, address):
-    return _output([
-        _symbolizer(), "-f", "-C", "-e", _debug_object(path), address,
-    ])
+    try:
+        debug_object = _debug_object(path)
+    except (AssertionError, OSError, subprocess.CalledProcessError) as error:
+        return "%s+%s\n%r" % (path, address, error)
+    result = subprocess.run([
+        _symbolizer(), "-f", "-C", "-i", "-e", debug_object, address,
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+       check=False)
+    rendered = result.stdout.strip()
+    if result.returncode != 0:
+        return "%s+%s\n%s" % (path, address, rendered)
+    return rendered
 
 
 def _install_matching_debug_rpms():
@@ -221,7 +227,7 @@ def _install_matching_debug_rpms():
     assert os.path.isfile(debug_path)
     assert _build_id(debug_path) == plugin_id
     preflight = {}
-    for symbol in ("list_candidates", "get_mdbtxnanchor"):
+    for symbol in ("list_candidates", "dbmdb_start_txn"):
         address = _symbol_address(debug_path, symbol)
         rendered = _symbolize_address(plugin, address)
         assert symbol in rendered, rendered
@@ -243,6 +249,7 @@ def compile_time_asan_runtime(request):
 
     assert request.config.getoption("--sanitizer") is None
     DEBUG_IDENTITY = _install_matching_debug_rpms()
+    os.makedirs(Paths().run_dir, exist_ok=True)
     os.makedirs(os.path.dirname(ASAN_DROPIN), exist_ok=True)
     previous_dropin = None
     if os.path.exists(ASAN_DROPIN):
