@@ -99,6 +99,11 @@ static const char *const or_lookup_mr_oids[] = {
     NULL
 };
 
+struct or_lookup_family {
+    const char *type; /* borrowed from the first branch of this family */
+    size_t eligible;
+};
+
 static int32_t
 or_lookup_oid_in_list(const char *const *list, const char *oid)
 {
@@ -367,39 +372,78 @@ static int32_t
 or_lookup_annotate(struct slapi_filter *f)
 {
     struct slapi_filter *fc;
-    const char *t1 = NULL;
-    const char *t2 = NULL;
-    int32_t k;
+    struct or_lookup_family *families = NULL;
+    struct or_lookup_family *family;
+    PLHashTable *by_type = NULL;
+    size_t n_children = 0;
+    size_t n_families = 0;
+    size_t i;
+    int32_t k = 0;
 
     if (f->f_or_lookup != NULL) {
         return 0;
     }
 
-    /* Candidate types: the first two distinct base types found on
-     * plausible components.  One retry covers "a few odd leading
-     * components, then the big same-type run". */
-    for (fc = f->f_or; fc != NULL && t2 == NULL; fc = fc->f_next) {
+    for (fc = f->f_or; fc != NULL; fc = fc->f_next) {
+        n_children++;
+    }
+    if (n_children < FILTER_OR_LOOKUP_THRESHOLD) {
+        return 0;
+    }
+
+    /* The array preserves first-occurrence order; the private hash only
+     * finds an existing family without imposing an arbitrary family limit. */
+    families = (struct or_lookup_family *)slapi_ch_calloc(n_children,
+                                                           sizeof(*families));
+    by_type = PL_NewHashTable((PRUint32)n_children,
+                              hashNocaseString,
+                              hashNocaseCompare,
+                              PL_CompareValues, 0, 0);
+    if (by_type == NULL) {
+        goto done;
+    }
+
+    for (fc = f->f_or; fc != NULL; fc = fc->f_next) {
+        const char *type;
+
         if (fc->f_choice != LDAP_FILTER_EQUALITY || fc->f_ava.ava_type == NULL ||
             strchr(fc->f_ava.ava_type, ';') != NULL) {
             continue;
         }
-        if (t1 == NULL) {
-            t1 = fc->f_ava.ava_type;
-        } else if (strcasecmp(t1, fc->f_ava.ava_type) != 0) {
-            t2 = fc->f_ava.ava_type;
+
+        type = fc->f_ava.ava_type;
+        family = (struct or_lookup_family *)PL_HashTableLookup(by_type, type);
+        if (family == NULL) {
+            family = &families[n_families];
+            family->type = type;
+            if (PL_HashTableAdd(by_type, family->type, family) == NULL) {
+                goto done;
+            }
+            n_families++;
+        }
+        if (or_lookup_child_hashable(fc, family->type)) {
+            family->eligible++;
         }
     }
 
-    if (t1 != NULL) {
-        k = or_lookup_annotate_type(f, t1);
+    /* Preserve the existing first-buildable policy for this correction;
+     * usable-family ranking is a separate selection decision. */
+    for (i = 0; i < n_families; i++) {
+        if (families[i].eligible < FILTER_OR_LOOKUP_THRESHOLD) {
+            continue;
+        }
+        k = or_lookup_annotate_type(f, families[i].type);
         if (k > 0) {
-            return k;
+            break;
         }
     }
-    if (t2 != NULL) {
-        return or_lookup_annotate_type(f, t2);
+
+done:
+    if (by_type != NULL) {
+        PL_HashTableDestroy(by_type);
     }
-    return 0;
+    slapi_ch_free((void **)&families);
+    return k;
 }
 
 static int32_t
