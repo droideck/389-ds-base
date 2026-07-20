@@ -6,11 +6,10 @@
 # See LICENSE for details.
 # --- END COPYRIGHT BLOCK ---
 
-"""Shared synthetic data and helpers for large-filter interaction tests.
+"""Shared synthetic data and helpers for large-filter tests.
 
-This module deliberately contains no tests.  The implementation-independent
-baseline and the patch-only mechanism checks consume the same entries, filter
-builders, and result helper without importing one test module from another.
+This module contains no tests. Functional and sanitizer modules share its
+workloads without importing one test module from another.
 """
 
 import ldap
@@ -19,11 +18,12 @@ import pytest
 from contextlib import contextmanager
 from ldap.filter import escape_filter_chars
 from ldap.schema.models import AttributeType, ObjectClass
-from lib389._constants import DEFAULT_SUFFIX
+from lib389._constants import DEFAULT_SUFFIX, TASK_WAIT
 from lib389._mapped_object import DSLdapObject, DSLdapObjects
 from lib389.backend import Backends
 from lib389.idm.organizationalunit import OrganizationalUnits
 from lib389.schema import OBJECT_MODEL_PARAMS, ObjectclassKind, Schema
+from lib389.tasks import Tasks
 from lib389.utils import ensure_str
 
 
@@ -55,6 +55,16 @@ LIVE_DNS = tuple(
 )
 
 OR_LOOKUP_ATTR = "nsslapd-enable-or-filter-lookup"
+
+OWNERSHIP_TEST_OU = "LargeFilterOwnership"
+OWNERSHIP_TEST_BASE = f"ou={OWNERSHIP_TEST_OU},{DEFAULT_SUFFIX}"
+OWNERSHIP_EMPTY_RANGE_ATTR = "lfEmptyRange"
+OWNERSHIP_AUX_OC = "lfOwnershipAux"
+OWNERSHIP_ENTRY_COUNT = 16
+NOT_FIRST_EMPTY_RANGE_FILTER = (
+    f"(&(!(uid=lf-ownership-absent))(objectClass=person)"
+    f"({OWNERSHIP_EMPTY_RANGE_ATTR}>=0))"
+)
 
 
 ATTRIBUTE_SPECS = (
@@ -132,6 +142,31 @@ class LargeFilterEntries(DSLdapObjects):
         self._basedn = basedn
 
 
+class OwnershipEntry(DSLdapObject):
+    """One person used by the NOT-first ownership workload."""
+
+    def __init__(self, instance, dn=None):
+        super(OwnershipEntry, self).__init__(instance, dn)
+        self._rdn_attribute = "uid"
+        self._must_attributes = ["uid", "cn", "sn"]
+        self._create_objectclasses = [
+            "top", "person", "organizationalPerson", "inetOrgPerson",
+            OWNERSHIP_AUX_OC,
+        ]
+        self._protected = False
+
+
+class OwnershipEntries(DSLdapObjects):
+    """Collection used to create NOT-first ownership entries."""
+
+    def __init__(self, instance, basedn):
+        super(OwnershipEntries, self).__init__(instance)
+        self._objectclasses = [OWNERSHIP_AUX_OC]
+        self._filterattrs = ["uid"]
+        self._childobject = OwnershipEntry
+        self._basedn = basedn
+
+
 def entry_uid(index):
     return f"lf-interaction-{index:05d}"
 
@@ -169,6 +204,109 @@ def search_dns(inst, filterstr, base=TEST_BASE, scope=ldap.SCOPE_SUBTREE):
     result_type, result_data, _, _ = inst.result3(msgid)
     dns = sorted(ensure_str(dn).lower() for dn, _ in result_data if dn)
     return result_type, dns
+
+
+@contextmanager
+def ownership_workload(inst, remove_on_exit=True):
+    """Create the exact NOT-first workload and optionally remove it on exit."""
+    schema = Schema(inst)
+    backend = Backends(inst).get("userRoot")
+    attr_added = False
+    objectclass_added = False
+    index_added = False
+    setup_succeeded = False
+    container = None
+
+    try:
+        attr_params = OBJECT_MODEL_PARAMS[AttributeType].copy()
+        attr_params.update({
+            "names": (OWNERSHIP_EMPTY_RANGE_ATTR,),
+            "oid": "1.3.6.1.4.1.2312.999.2026.20",
+            "desc": "emptied indexed range for NOT-first ownership test",
+            "equality": "integerMatch",
+            "ordering": "integerOrderingMatch",
+            "syntax": "1.3.6.1.4.1.1466.115.121.1.27",
+            "single_value": 1,
+            "x_origin": ("389-ds large filter tests",),
+        })
+        schema.add_attributetype(attr_params)
+        attr_added = True
+
+        oc_params = OBJECT_MODEL_PARAMS[ObjectClass].copy()
+        oc_params.update({
+            "names": (OWNERSHIP_AUX_OC,),
+            "oid": "1.3.6.1.4.1.2312.999.2026.21",
+            "desc": "auxiliary class for NOT-first ownership test",
+            "kind": ObjectclassKind.AUXILIARY.value,
+            "sup": ("top",),
+            "may": (OWNERSHIP_EMPTY_RANGE_ATTR,),
+            "x_origin": ("389-ds large filter tests",),
+        })
+        schema.add_objectclass(oc_params)
+        objectclass_added = True
+
+        backend.add_index(
+            OWNERSHIP_EMPTY_RANGE_ATTR, ["eq"],
+            matching_rules=["integerOrderingMatch"]
+        )
+        index_added = True
+        assert Tasks(inst).reindex(
+            benamebase="userRoot",
+            attrname=[OWNERSHIP_EMPTY_RANGE_ATTR],
+            args={TASK_WAIT: True},
+        ) == 0
+        index = backend.get_index(OWNERSHIP_EMPTY_RANGE_ATTR)
+        assert index is not None
+        assert index.get_attr_vals_utf8_l("nsIndexType") == ["eq"]
+        assert index.get_attr_vals_utf8_l("nsMatchingRule") == [
+            "integerorderingmatch"
+        ]
+
+        container = OrganizationalUnits(inst, DEFAULT_SUFFIX).create(
+            properties={"ou": OWNERSHIP_TEST_OU}
+        )
+        entries = OwnershipEntries(inst, OWNERSHIP_TEST_BASE)
+        created = []
+        for entry_index in range(OWNERSHIP_ENTRY_COUNT):
+            uid = f"lf-ownership-{entry_index:03d}"
+            created.append(entries.create(properties={
+                "uid": uid,
+                "cn": f"Large Filter Ownership {entry_index:03d}",
+                "sn": f"Ownership{entry_index:03d}",
+            }))
+
+        result_type, dns = search_dns(
+            inst, f"(objectClass={OWNERSHIP_AUX_OC})",
+            base=OWNERSHIP_TEST_BASE, scope=ldap.SCOPE_ONELEVEL
+        )
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert dns == sorted(entry.dn.lower() for entry in created)
+
+        created[0].add(OWNERSHIP_EMPTY_RANGE_ATTR, "0")
+        created[0].remove_all(OWNERSHIP_EMPTY_RANGE_ATTR)
+        result_type, dns = search_dns(
+            inst, f"({OWNERSHIP_EMPTY_RANGE_ATTR}>=0)",
+            base=OWNERSHIP_TEST_BASE, scope=ldap.SCOPE_SUBTREE
+        )
+        assert result_type == ldap.RES_SEARCH_RESULT
+        assert dns == []
+
+        setup_succeeded = True
+        yield {"backend": backend, "entries": created}
+    finally:
+        if remove_on_exit or not setup_succeeded:
+            try:
+                if container is not None:
+                    container.delete(recursive=True)
+            finally:
+                try:
+                    if index_added:
+                        backend.del_index(OWNERSHIP_EMPTY_RANGE_ATTR)
+                finally:
+                    if objectclass_added:
+                        schema.remove_objectclass(OWNERSHIP_AUX_OC)
+                    if attr_added:
+                        schema.remove_attributetype(OWNERSHIP_EMPTY_RANGE_ATTR)
 
 
 def dn_or(assertions):
