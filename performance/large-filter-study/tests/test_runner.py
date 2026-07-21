@@ -2664,6 +2664,20 @@ class NativeSafetyTests(unittest.TestCase):
             FINAL_PRODUCTION_REVISION,
         )
 
+    def test_openldap_package_revisions_resolve_their_role(self) -> None:
+        self.assertEqual(
+            resolve_revision("fedora-package", "openldap"),
+            ("fedora-package", "openldap-fedora-package"),
+        )
+        self.assertEqual(
+            resolve_revision("packaged-openldap", "openldap"),
+            ("packaged-openldap", "openldap-fedora-package"),
+        )
+        with self.assertRaisesRegex(StudyError, "fedora-package for OpenLDAP"):
+            resolve_revision("packaged-openldap", "389ds")
+        with self.assertRaisesRegex(StudyError, "fedora-package for OpenLDAP"):
+            resolve_revision("not-a-revision", "openldap")
+
     def test_final_study_tip_requires_final_mechanism_diagnostics(self) -> None:
         scenario = {
             "groups": ["combined-features"],

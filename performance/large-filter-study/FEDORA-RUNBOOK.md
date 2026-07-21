@@ -355,8 +355,9 @@ not release-ordering evidence.
 
 ### Full timed directional screen
 
-To repeat that same installed-custom/off, identical-custom/on, downgrade, and
-Fedora-stable sequence across the entire timed scenario/index matrix, run:
+To run the full back-to-back sequence — packaged OpenLDAP over the same
+generated data, then installed-custom/off, identical-custom/on, downgrade, and
+Fedora-stable — across the entire timed scenario/index matrix, run:
 
 ```bash
 bin/run-full-fedora-screen
@@ -366,10 +367,20 @@ The command runs all 116 timed scenarios under their six required index
 configurations for each state. The two remaining generated scenarios are
 dynamic-list correctness controls, not timing comparisons, and are intentionally
 excluded from this arbitrary-git-build screen. No RPM is built or staged. The
-script uses bounded scenario batches and writes 30 self-contained raw bundles
-for the normal off/on/stable sequence, plus `REPORT.md`, `summary.csv`,
-`comparisons.csv`, and `screen-summary.json`. Every report row includes the
-manifest's short description of the filter structure.
+script uses bounded scenario batches and writes 40 self-contained raw bundles
+for the normal openldap/off/on/stable sequence (30 with `LF_OPENLDAP=off`),
+plus `REPORT.md`, `summary.csv`, `comparisons.csv`, `openldap-context.csv`,
+and `screen-summary.json`. Every report row includes the manifest's short
+description of the filter structure.
+
+The OpenLDAP state requires the packaged `openldap-servers` and
+`openldap-clients` RPMs (never a custom OpenLDAP build) and runs first, before
+any 389 DS package operation. Its rows are a contextual comparison in the sense
+of section 9: cross-server differences are unavoidable implementation
+differences, so the report presents OpenLDAP medians and custom-to-openldap
+ratios, never benefit percentages, and none of it is release evidence. The
+formal matched cross-server instrument remains the
+`final-on-vs-openldap-acceptance` ABBA block in section 9.
 
 The command is resumable: rerun it with the same output directory. Matching
 complete bundles are skipped, incomplete bundles are archived under
@@ -384,8 +395,8 @@ invalid off/on states. That layout writes 20 raw bundles.
 The defaults are 15 measured searches, two warm-ups, CPU 2, and perf/profile
 collection off, so this works on the PMU-limited Fedora VM used for the minimal
 screen. Optional overrides are `LF_REPEAT`, `LF_WARMUPS`, `LF_PREWARM_PASSES`,
-`LF_CPU`, `LF_PERF`, `LF_PROFILE`, and `LF_WORKLOAD`. For example, a host with
-usable counters can request `LF_PERF=auto LF_PROFILE=auto
+`LF_OPENLDAP`, `LF_CPU`, `LF_PERF`, `LF_PROFILE`, and `LF_WORKLOAD`. For
+example, a host with usable counters can request `LF_PERF=auto LF_PROFILE=auto
 bin/run-full-fedora-screen`.
 
 Every warm-cache native invocation begins with a state pre-warm: after server
