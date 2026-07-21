@@ -1,0 +1,63 @@
+{
+  "format_version": 1,
+  "study": "389ds-complete-large-filter-series",
+  "seed": 38920260720,
+  "base_dn": "ou=people,dc=example,dc=com",
+  "suffix_dn": "dc=example,dc=com",
+  "primary": {
+    "dn_branches": 355,
+    "long_dn_length": 110,
+    "filter_bytes_min": 41000,
+    "filter_bytes_max": 44000,
+    "expected_node_count": 368,
+    "outer_values": ["asd", "ff", "vv"],
+    "guard_value": "QWEQWEQWE",
+    "simple_sdn2_assertion": "cn=account1,ou=accounts,o=data,dc=example,dc=com"
+  },
+  "matrices": {
+    "branch_counts": [15, 16, 32, 64, 128, 355, 500, 1000],
+    "branch_distributions": ["all-absent", "mostly-live", "mixed", "duplicates"],
+    "multivalue_counts": [1, 4, 16, 64],
+    "dn_modes": ["short-canonical", "long-canonical", "case-equivalent", "escaped-comma", "invalid-remainder"],
+    "presence_variants": ["baseline-no-presence", "presence-sdn1", "presence-sdn2", "presence-both"]
+  },
+  "dynamic_list": {
+    "stored_candidates": 20,
+    "stored_matches": 2,
+    "dynamic_entries": 20,
+    "lookthrough_limit": 30,
+    "finite_scan_limit": 10000,
+    "unlimited_scan_limit": -1
+  },
+  "profiles": {
+    "full": {
+      "people": 100000,
+      "principal_cohort": 612,
+      "scenario_cohort": 612,
+      "dn_mode_cohort": 64,
+      "candidate_counts": [0, 1, 10, 100, 612, 1000, 10000],
+      "host_intent": "native_fedora_timing"
+    },
+    "smoke": {
+      "people": 12000,
+      "principal_cohort": 612,
+      "scenario_cohort": 20,
+      "dn_mode_cohort": 12,
+      "candidate_counts": [0, 1, 10, 100, 612, 1000, 10000],
+      "host_intent": "correctness_only"
+    },
+    "tiny": {
+      "people": 512,
+      "principal_cohort": 32,
+      "scenario_cohort": 16,
+      "dn_mode_cohort": 4,
+      "candidate_counts": [0, 1, 4, 16, 64],
+      "host_intent": "correctness_only"
+    }
+  },
+  "static_files": {
+    "schema_389ds": "schema/99large-filter-study.ldif",
+    "schema_openldap": "schema/large-filter-study.schema",
+    "index_config": "indexes/index-configurations.json"
+  }
+}

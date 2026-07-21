@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+# Run every timed 389 DS scenario against an already installed custom git RPM,
+# then downgrade once to Fedora stable.  Builds containing the OR lookup switch
+# are measured off/on; builds without it are measured once as unsupported.
+# This script never builds or stages an RPM.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: run-full-fedora-screen [OUTPUT_DIRECTORY]
+
+Runs the full 116-scenario timed matrix for the installed custom git RPM and
+Fedora stable after one dnf downgrade. If the custom source contains the OR
+lookup switch, it runs the identical custom binary with lookup off and on. If
+the switch was reverted, it runs that custom binary once as unsupported.
+
+Rerunning with the same output directory skips matching complete bundles.
+Incomplete bundles are archived, and referral-boundary failures are retried once.
+
+The two dynamic-list scenarios are correctness-only and are not part of the
+timed comparison matrix.
+
+Optional environment variables:
+  LF_WORKLOAD  generated full workload directory
+  LF_CPU       pinned CPU (default: 2)
+  LF_REPEAT    measured searches per stratum (default: 15; minimum: 15)
+  LF_WARMUPS   warm-ups per stratum (default: 2; allowed: 2 or 3)
+  LF_PERF      auto, on, or off (default: off)
+  LF_PROFILE   auto, on, or off (default: off)
+EOF
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    usage
+    exit 0
+fi
+if (( $# > 1 )); then
+    usage >&2
+    exit 2
+fi
+
+study_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(git -C "$study_root" rev-parse --show-toplevel)
+workload=${LF_WORKLOAD:-/mnt/tests/large-filter-workload-full}
+output=${1:-/mnt/tests/large-filter-full-screen-$(date -u +%Y%m%dT%H%M%SZ)}
+results="$output/results"
+incomplete="$output/incomplete"
+runner_logs="$output/logs"
+
+cpu=${LF_CPU:-2}
+repeat=${LF_REPEAT:-15}
+warmups=${LF_WARMUPS:-2}
+perf=${LF_PERF:-off}
+profile=${LF_PROFILE:-off}
+
+if [[ ! $cpu =~ ^[0-9]+$ ]]; then
+    echo "LF_CPU must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! $repeat =~ ^[0-9]+$ ]] || (( repeat < 15 )); then
+    echo "LF_REPEAT must be an integer of at least 15" >&2
+    exit 2
+fi
+if [[ $warmups != 2 && $warmups != 3 ]]; then
+    echo "LF_WARMUPS must be 2 or 3" >&2
+    exit 2
+fi
+if [[ $perf != auto && $perf != on && $perf != off ]]; then
+    echo "LF_PERF must be auto, on, or off" >&2
+    exit 2
+fi
+if [[ $profile != auto && $profile != on && $profile != off ]]; then
+    echo "LF_PROFILE must be auto, on, or off" >&2
+    exit 2
+fi
+
+packages=(
+    389-ds-base
+    389-ds-base-libs
+    389-ds-base-robdb-libs
+    python3-lib389
+)
+
+custom_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $custom_vr =~ git([[:xdigit:]]{7,40}) ]]; then
+    custom_token=${BASH_REMATCH[1],,}
+else
+    echo "installed 389-ds-base has no git hash; custom build required" >&2
+    exit 1
+fi
+if ! custom_sha=$(git -C "$repo_root" rev-parse --verify "${custom_token}^{commit}"); then
+    echo "installed RPM git hash $custom_token is absent from this repository" >&2
+    exit 1
+fi
+if git -C "$repo_root" grep -q \
+        CONFIG_ENABLE_OR_FILTER_LOOKUP "$custom_sha" -- \
+        ldap/servers/slapd/libglobs.c; then
+    custom_lookup_layout=toggle
+else
+    custom_lookup_layout=unsupported
+fi
+
+assert_package_set() {
+    local expected=$1
+    local package actual
+
+    for package in "${packages[@]}"; do
+        actual=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package")
+        if [[ $actual != "$expected" ]]; then
+            echo "mixed packages: $package is $actual, expected $expected" >&2
+            exit 1
+        fi
+    done
+}
+
+assert_package_set "$custom_vr"
+if [[ -e $output && ! -d $output ]]; then
+    echo "output exists and is not a directory: $output" >&2
+    exit 1
+fi
+mkdir -p "$results" "$incomplete" "$runner_logs"
+
+sudo rpm --restore "${packages[@]}"
+custom_binary=$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')
+
+if [[ ! -f $workload/workload-manifest.json ]]; then
+    if [[ -e $workload ]]; then
+        echo "incomplete workload directory exists: $workload" >&2
+        exit 1
+    fi
+    "$study_root/bin/generate-workload" --profile full --output "$workload"
+fi
+
+completed_bundle_matches() {
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" \
+        "$repeat" "$warmups" "$cpu" "$perf" "$profile" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source, lookup, index, position, binary = sys.argv[2:7]
+repeat, warmups, cpu = map(int, sys.argv[7:10])
+perf, profile = sys.argv[10:12]
+run = json.loads((path / "run-manifest.json").read_text())
+artifact = json.loads((path / "artifact-manifest.json").read_text())
+expected = {
+    "status": "complete", "expected_source_sha": source,
+    "lookup_mode_requested": lookup, "lookup_mode_actual": lookup,
+    "index_config": index, "repeat_count": repeat, "warmup_count": warmups,
+    "cpu_affinity": cpu, "perf_mode": perf, "profile_mode": profile,
+    "backend_actual": "mdb", "cache_policy": "warm",
+    "schedule_design": "screen", "schedule_position": position,
+}
+wrong = [key for key, value in expected.items() if run.get(key) != value]
+observed_binary = artifact.get("server_executable", {}).get("executable_sha256")
+if wrong or observed_binary != binary:
+    detail = ", ".join(wrong) or "server binary"
+    raise SystemExit(f"{path}: completed bundle mismatch: {detail}")
+PY
+}
+
+archive_incomplete_bundle() {
+    local destination=$1
+    local state=$2
+    local bundle=$3
+    local reason=$4
+    local stamp archive
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archive="$incomplete/${state}-${bundle}-${reason}-${stamp}-$$-$RANDOM"
+    test ! -e "$archive"
+    sudo mv -- "$destination" "$archive"
+    echo "Archived incomplete bundle at: $archive"
+}
+
+retryable_referral_boundary() {
+    local log=$1
+    grep -Eq \
+        'log window is contaminated by the periodic referral monitor|controlled background-quiet window expired|collection crossed the controlled background-quiet deadline|final server start crossed a referral-monitor boundary|referral quiet-window setup crossed a monitor boundary' \
+        "$log"
+}
+
+run_bundle() {
+    local state=$1
+    local label=$2
+    local source=$3
+    local assertion=$4
+    local lookup=$5
+    local index_config=$6
+    local bundle=$7
+    shift 7
+
+    local destination="$results/$state/$bundle"
+    local schedule_position="$state-$bundle"
+    local binary_sha attempt attempt_log status tee_status
+    local -a statuses
+
+    binary_sha=$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')
+    if [[ -f $destination/COMPLETE ]]; then
+        if [[ -e $destination/INCOMPLETE ]]; then
+            echo "completed bundle also contains INCOMPLETE: $destination" >&2
+            exit 1
+        fi
+        if ! completed_bundle_matches \
+                "$destination" "$source" "$lookup" "$index_config" \
+                "$schedule_position" "$binary_sha"; then
+            echo "completed bundle does not match this run: $destination" >&2
+            exit 1
+        fi
+        echo "Skipping completed $state / $bundle"
+        return
+    fi
+    if [[ -e $destination ]]; then
+        archive_incomplete_bundle \
+            "$destination" "$state" "$bundle" preexisting
+    fi
+
+    for attempt in 1 2; do
+        attempt_log="$runner_logs/${state}-${bundle}-attempt${attempt}.log"
+        echo "Running $state / $bundle ($index_config), attempt $attempt/2"
+        if sudo "$study_root/bin/run-fedora-study" \
+                --server 389ds \
+                --build-label "$label-$bundle" \
+                --expected-source-sha "$source" \
+                --operator-assertion "$assertion" \
+                --lookup "$lookup" \
+                --workload "$workload" \
+                --output "$destination" \
+                --index-config "$index_config" \
+                --backend mdb \
+                --repeat "$repeat" \
+                --warmups "$warmups" \
+                --cache-policy warm \
+                --cpu "$cpu" \
+                --perf "$perf" \
+                --profile "$profile" \
+                --scenario-order randomized \
+                --order-seed 38920260720 \
+                --schedule-design screen \
+                --schedule-position "$schedule_position" \
+                --cleanup \
+                "$@" 2>&1 | tee "$attempt_log"; then
+            status=0
+            tee_status=0
+        else
+            statuses=("${PIPESTATUS[@]}")
+            status=${statuses[0]}
+            tee_status=${statuses[1]}
+        fi
+
+        if (( status == 0 )) && [[ -f $destination/COMPLETE ]] \
+                && [[ ! -e $destination/INCOMPLETE ]]; then
+            if (( tee_status != 0 )); then
+                echo "warning: could not save runner log: $attempt_log" >&2
+            fi
+            return
+        fi
+        if (( status == 0 )); then
+            status=1
+        fi
+        if (( tee_status != 0 )); then
+            echo "could not save runner log: $attempt_log" >&2
+        fi
+        if [[ -e $destination ]]; then
+            archive_incomplete_bundle \
+                "$destination" "$state" "$bundle" "attempt${attempt}"
+        fi
+        if (( tee_status == 0 && attempt == 1 )) \
+                && retryable_referral_boundary "$attempt_log"; then
+            echo "Referral-monitor boundary reached; retrying the whole bundle"
+            continue
+        fi
+        echo "Bundle failed; runner log: $attempt_log" >&2
+        return "$status"
+    done
+}
+
+run_matrix() {
+    local state=$1
+    local label=$2
+    local source=$3
+    local assertion=$4
+    local lookup=$5
+
+    # Keep the 110 baseline-index scenarios in bounded batches so a full run
+    # does not approach the runner's one-hour background-operation boundary.
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-core \
+        --scenario-group acceptance \
+        --scenario-group candidate-scaling \
+        --scenario-group hit-position \
+        --scenario-group fallbacks \
+        --scenario-group multivalue-scaling
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-branch-scaling \
+        --scenario-group branch-scaling
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-dn-and-decomposition \
+        --scenario-group dn-normalization \
+        --scenario-group decomposition
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-combined-and-family \
+        --scenario-group combined-substring \
+        --scenario-group combined-approximate \
+        --scenario-group flat-family \
+        --scenario order-principal-assertions-reversed \
+        --scenario order-principal-or-dn-sdn2-fallback \
+        --scenario order-principal-or-fallback-sdn2-dn \
+        --scenario order-principal-or-sdn2-dn-fallback \
+        --scenario order-principal-outer-abc \
+        --scenario order-principal-outer-bca \
+        --scenario order-principal-outer-cba
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-index-controls \
+        --scenario presence-primary-none \
+        --scenario presence-no-sdn2-none \
+        --scenario candidate-index-all-equality
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-sdn1 presence-sdn1 \
+        --scenario presence-primary-sdn1
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-sdn2 presence-sdn2 \
+        --scenario presence-primary-sdn2
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-both presence-both \
+        --scenario presence-primary-both \
+        --scenario presence-no-sdn2-both
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        without-sdn1-equality without-sdn1-equality \
+        --scenario candidate-index-without-sdn1
+
+    run_bundle \
+        "$state" "$label" "$source" "$assertion" "$lookup" \
+        without-sdn2-equality without-sdn2-equality \
+        --scenario candidate-index-without-sdn2
+}
+
+if [[ $custom_lookup_layout == toggle ]]; then
+    run_matrix \
+        custom-off \
+        "custom-${custom_token}-off" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr" \
+        off
+
+    sudo rpm --restore "${packages[@]}"
+    assert_package_set "$custom_vr"
+    test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+    run_matrix \
+        custom-on \
+        "custom-${custom_token}-on" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr" \
+        on
+else
+    echo "Custom source has no OR lookup switch; running lookup unsupported"
+    run_matrix \
+        custom-unsupported \
+        "custom-${custom_token}-unsupported" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr without OR lookup switch" \
+        unsupported
+fi
+
+assert_package_set "$custom_vr"
+test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+sudo dnf downgrade -y 389-ds-base
+
+stable_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $stable_vr =~ git[[:xdigit:]]{7,40} ]]; then
+    echo "dnf left a custom git build installed: $stable_vr" >&2
+    exit 1
+fi
+assert_package_set "$stable_vr"
+sudo rpm --restore "${packages[@]}"
+
+run_matrix \
+    fedora-stable \
+    fedora-stable \
+    fedora-stable-package \
+    "Fedora stable packages installed by dnf downgrade 389-ds-base" \
+    unsupported
+
+python3 - \
+    "$results" "$repeat" "$custom_sha" "$custom_vr" "$stable_vr" \
+    "$custom_lookup_layout" <<'PY'
+import csv
+import json
+import math
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+root = Path(sys.argv[1])
+repeat = int(sys.argv[2])
+custom_sha = sys.argv[3]
+custom_vr = sys.argv[4]
+stable_vr = sys.argv[5]
+custom_lookup_layout = sys.argv[6]
+state_paths = {"stable": root / "fedora-stable"}
+if custom_lookup_layout == "toggle":
+    state_paths.update({
+        "custom-off": root / "custom-off",
+        "custom-on": root / "custom-on",
+    })
+elif custom_lookup_layout == "unsupported":
+    state_paths["custom-unsupported"] = root / "custom-unsupported"
+else:
+    raise RuntimeError(f"unknown custom lookup layout: {custom_lookup_layout}")
+expected_bundles = {
+    "baseline-core",
+    "baseline-branch-scaling",
+    "baseline-dn-and-decomposition",
+    "baseline-combined-and-family",
+    "baseline-index-controls",
+    "presence-sdn1",
+    "presence-sdn2",
+    "presence-both",
+    "without-sdn1-equality",
+    "without-sdn2-equality",
+}
+
+
+def nearest_rank_p95(values):
+    ordered = sorted(values)
+    return ordered[math.ceil(0.95 * len(ordered)) - 1]
+
+
+def median_optional(values):
+    present = [value for value in values if value is not None]
+    return statistics.median(present) if present else None
+
+
+def benefit(baseline, candidate):
+    if baseline in (None, 0) or candidate is None:
+        return None
+    return 100.0 * (baseline - candidate) / baseline
+
+
+manifest = None
+rows_by_key = defaultdict(list)
+binary_hashes = defaultdict(set)
+build_labels = defaultdict(set)
+harness_content_hashes = set()
+measurement_harness_files = None
+
+for state, state_path in state_paths.items():
+    bundles = {path.name for path in state_path.iterdir() if path.is_dir()}
+    if bundles != expected_bundles:
+        raise RuntimeError(
+            f"{state}: expected bundles {sorted(expected_bundles)}, "
+            f"found {sorted(bundles)}"
+        )
+    for bundle in sorted(state_path.iterdir()):
+        if not (bundle / "COMPLETE").is_file():
+            raise RuntimeError(f"incomplete bundle: {bundle}")
+        current_manifest = json.loads(
+            (bundle / "workload-manifest.json").read_text()
+        )
+        if manifest is None:
+            manifest = current_manifest
+        elif current_manifest["workload_sha256"] != manifest["workload_sha256"]:
+            raise RuntimeError(f"workload mismatch in {bundle}")
+        artifact = json.loads((bundle / "artifact-manifest.json").read_text())
+        harness = artifact.get("harness_identity", {})
+        harness_files = dict(harness.get("files", {}))
+        if harness_files.pop("bin/run-full-fedora-screen", None) is None:
+            raise RuntimeError(f"{bundle}: full-screen wrapper identity is missing")
+        if measurement_harness_files is None:
+            measurement_harness_files = harness_files
+        elif harness_files != measurement_harness_files:
+            raise RuntimeError(
+                f"{bundle}: measurement harness differs beyond the outer "
+                "full-screen wrapper"
+            )
+        harness_content_hashes.add(harness.get("content_sha256"))
+        binary_hashes[state].add(
+            artifact["server_executable"]["executable_sha256"]
+        )
+        payload = json.loads((bundle / "raw-results.json").read_text())
+        for row in payload["rows"]:
+            if row["phase"] != "measured":
+                continue
+            key = (
+                state,
+                row["index_config"],
+                row["scenario"],
+                row["attribute_variant"],
+            )
+            rows_by_key[key].append(row)
+            build_labels[state].add(row["build_label"])
+
+for state, hashes in binary_hashes.items():
+    if len(hashes) != 1:
+        raise RuntimeError(f"{state}: bundles used different server binaries")
+if (
+    custom_lookup_layout == "toggle"
+    and binary_hashes["custom-off"] != binary_hashes["custom-on"]
+):
+    raise RuntimeError("custom off/on executable hashes differ")
+
+assert manifest is not None
+descriptions = {}
+for scenario, value in manifest["scenarios"].items():
+    description = value.get("description") or "generated filter"
+    descriptions[scenario] = (
+        f"{description}; {value['node_count']} nodes, "
+        f"{value['branch_count']} leaves, {value['expected_count']} result(s)"
+    )
+metrics = {}
+for key, rows in rows_by_key.items():
+    if len(rows) != repeat:
+        raise RuntimeError(f"{key}: expected {repeat} measured rows, got {len(rows)}")
+    elapsed = [row["client_elapsed_ns"] / 1_000_000_000 for row in rows]
+    cpu = [row["server_cpu_seconds"] for row in rows]
+    etime = [row["server_etime_seconds"] for row in rows]
+    metrics[key] = {
+        "n": len(rows),
+        "elapsed": statistics.median(elapsed),
+        "p95": nearest_rank_p95(elapsed),
+        "cpu": median_optional(cpu),
+        "etime": median_optional(etime),
+        "rss": median_optional([row["rss_kib"] for row in rows]),
+        "high_water": median_optional([row["high_water_kib"] for row in rows]),
+    }
+
+state_keys = {
+    state: {(index, scenario, attrs) for row_state, index, scenario, attrs in metrics
+            if row_state == state}
+    for state in state_paths
+}
+if len({frozenset(keys) for keys in state_keys.values()}) != 1:
+    raise RuntimeError("stable/custom states do not contain identical scenario strata")
+strata = sorted(state_keys["stable"])
+scenario_count = len({scenario for _, scenario, _ in strata})
+if scenario_count != 116:
+    raise RuntimeError(f"expected 116 timed scenarios, got {scenario_count}")
+
+summary_path = root.parent / "summary.csv"
+with summary_path.open("w", newline="") as stream:
+    fieldnames = [
+        "state", "index_config", "scenario", "attribute_variant",
+        "filter_structure", "measured_runs", "median_elapsed_seconds",
+        "p95_elapsed_seconds", "median_server_cpu_seconds",
+        "median_server_etime_seconds", "median_rss_kib",
+        "median_high_water_kib",
+    ]
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    for state in state_paths:
+        for index, scenario, attrs in strata:
+            value = metrics[state, index, scenario, attrs]
+            writer.writerow({
+                "state": state,
+                "index_config": index,
+                "scenario": scenario,
+                "attribute_variant": attrs,
+                "filter_structure": descriptions[scenario],
+                "measured_runs": value["n"],
+                "median_elapsed_seconds": value["elapsed"],
+                "p95_elapsed_seconds": value["p95"],
+                "median_server_cpu_seconds": value["cpu"],
+                "median_server_etime_seconds": value["etime"],
+                "median_rss_kib": value["rss"],
+                "median_high_water_kib": value["high_water"],
+            })
+
+if custom_lookup_layout == "toggle":
+    comparison_specs = (
+        ("stable-to-custom-off", "stable", "custom-off"),
+        ("stable-to-custom-on", "stable", "custom-on"),
+        ("custom-off-to-custom-on", "custom-off", "custom-on"),
+    )
+else:
+    comparison_specs = ((
+        "stable-to-custom-unsupported", "stable", "custom-unsupported",
+    ),)
+comparison_path = root.parent / "comparisons.csv"
+with comparison_path.open("w", newline="") as stream:
+    fieldnames = [
+        "comparison", "baseline_state", "candidate_state", "index_config",
+        "scenario", "attribute_variant", "filter_structure",
+        "baseline_median_elapsed_seconds", "candidate_median_elapsed_seconds",
+        "elapsed_benefit_percent", "baseline_median_server_cpu_seconds",
+        "candidate_median_server_cpu_seconds", "cpu_benefit_percent",
+    ]
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    for comparison, baseline_state, candidate_state in comparison_specs:
+        for index, scenario, attrs in strata:
+            baseline = metrics[baseline_state, index, scenario, attrs]
+            candidate = metrics[candidate_state, index, scenario, attrs]
+            writer.writerow({
+                "comparison": comparison,
+                "baseline_state": baseline_state,
+                "candidate_state": candidate_state,
+                "index_config": index,
+                "scenario": scenario,
+                "attribute_variant": attrs,
+                "filter_structure": descriptions[scenario],
+                "baseline_median_elapsed_seconds": baseline["elapsed"],
+                "candidate_median_elapsed_seconds": candidate["elapsed"],
+                "elapsed_benefit_percent": benefit(
+                    baseline["elapsed"], candidate["elapsed"]
+                ),
+                "baseline_median_server_cpu_seconds": baseline["cpu"],
+                "candidate_median_server_cpu_seconds": candidate["cpu"],
+                "cpu_benefit_percent": benefit(baseline["cpu"], candidate["cpu"]),
+            })
+
+
+def number(value, digits=6):
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def percent(value):
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def markdown(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+report_path = root.parent / "REPORT.md"
+with report_path.open("w") as stream:
+    stream.write("# Full native Fedora directional screen\n\n")
+    stream.write(f"- Custom source: `{custom_sha}`\n")
+    stream.write(f"- Custom package: `{custom_vr}`\n")
+    stream.write(f"- Fedora stable package: `{stable_vr}`\n")
+    stream.write(f"- Timed scenarios: {scenario_count} ({len(strata)} attribute strata)\n")
+    stream.write(f"- Measured searches per stratum: {repeat}\n")
+    if custom_lookup_layout == "toggle":
+        stream.write(
+            "- Scope: custom/off, identical custom/on, then Fedora stable; "
+            "directional screen, not an ABBA release decision\n"
+        )
+    else:
+        stream.write(
+            "- Scope: custom/unsupported (OR switch absent), then Fedora "
+            "stable; directional screen, not an ABBA release decision\n"
+        )
+    stream.write(
+        "- Benefit sign: positive means the candidate state used less time/CPU\n\n"
+    )
+    if len(harness_content_hashes) > 1:
+        stream.write(
+            "- Resume note: bundles span an outer-wrapper-only update; all "
+            "measurement runner, study, and workload files are identical\n\n"
+        )
+    stream.write("## Binary identity\n\n")
+    for state in state_paths:
+        stream.write(
+            f"- {state}: `{next(iter(binary_hashes[state]))}` "
+            f"({len(build_labels[state])} bundle labels)\n"
+        )
+    stream.write("\n## Per-filter results\n\n")
+    if custom_lookup_layout == "toggle":
+        stream.write(
+            "| Index | Scenario | Attributes | Short filter structure | "
+            "stable elapsed/CPU | custom-off elapsed/CPU | custom-on elapsed/CPU | "
+            "stable -> off benefit | off -> on benefit |\n"
+        )
+        stream.write("|---|---|---|---|---:|---:|---:|---:|---:|\n")
+        for index, scenario, attrs in strata:
+            stable = metrics["stable", index, scenario, attrs]
+            off = metrics["custom-off", index, scenario, attrs]
+            on = metrics["custom-on", index, scenario, attrs]
+            stable_off = (
+                f"{percent(benefit(stable['elapsed'], off['elapsed']))} / "
+                f"{percent(benefit(stable['cpu'], off['cpu']))}"
+            )
+            off_on = (
+                f"{percent(benefit(off['elapsed'], on['elapsed']))} / "
+                f"{percent(benefit(off['cpu'], on['cpu']))}"
+            )
+            stream.write(
+                f"| {markdown(index)} | {markdown(scenario)} | {markdown(attrs)} | "
+                f"{markdown(descriptions[scenario])} | "
+                f"{number(stable['elapsed'])} / {number(stable['cpu'])} | "
+                f"{number(off['elapsed'])} / {number(off['cpu'])} | "
+                f"{number(on['elapsed'])} / {number(on['cpu'])} | "
+                f"{stable_off} | {off_on} |\n"
+            )
+    else:
+        stream.write(
+            "| Index | Scenario | Attributes | Short filter structure | "
+            "stable elapsed/CPU | custom elapsed/CPU | benefit |\n"
+        )
+        stream.write("|---|---|---|---|---:|---:|---:|\n")
+        for index, scenario, attrs in strata:
+            stable = metrics["stable", index, scenario, attrs]
+            custom = metrics["custom-unsupported", index, scenario, attrs]
+            change = (
+                f"{percent(benefit(stable['elapsed'], custom['elapsed']))} / "
+                f"{percent(benefit(stable['cpu'], custom['cpu']))}"
+            )
+            stream.write(
+                f"| {markdown(index)} | {markdown(scenario)} | {markdown(attrs)} | "
+                f"{markdown(descriptions[scenario])} | "
+                f"{number(stable['elapsed'])} / {number(stable['cpu'])} | "
+                f"{number(custom['elapsed'])} / {number(custom['cpu'])} | "
+                f"{change} |\n"
+            )
+    stream.write(
+        "\nEach elapsed/CPU cell is the median in seconds. Nearest-rank p95, "
+        "server etime, RSS, and high-water values are retained in `summary.csv`.\n"
+    )
+
+screen_summary = {
+    "format_version": 1,
+    "custom_source_sha": custom_sha,
+    "custom_package_version_release": custom_vr,
+    "custom_lookup_layout": custom_lookup_layout,
+    "stable_package_version_release": stable_vr,
+    "scenario_count": scenario_count,
+    "attribute_strata_count": len(strata),
+    "measured_searches_per_stratum": repeat,
+    "outer_wrapper_only_resume_update": len(harness_content_hashes) > 1,
+    "states": {
+        state: {
+            "server_executable_sha256": next(iter(binary_hashes[state])),
+            "bundle_count": len(expected_bundles),
+        }
+        for state in state_paths
+    },
+    "summary_csv": summary_path.name,
+    "comparisons_csv": comparison_path.name,
+    "report": report_path.name,
+}
+(root.parent / "screen-summary.json").write_text(
+    json.dumps(screen_summary, indent=2, sort_keys=True) + "\n"
+)
+
+print()
+print(
+    f"Completed: {scenario_count} timed scenarios, {len(strata)} strata, "
+    f"{repeat} measured searches per state/stratum"
+)
+print(f"Report:      {report_path}")
+print(f"Summary CSV: {summary_path}")
+print(f"Comparisons: {comparison_path}")
+print(f"Raw bundles: {root}")
+PY

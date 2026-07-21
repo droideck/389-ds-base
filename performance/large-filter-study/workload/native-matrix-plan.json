@@ -1,0 +1,121 @@
+{
+  "format_version": 1,
+  "matrix_id": "large-filter-native-fedora-v1",
+  "description": "Frozen native-Fedora coverage and causal-ordering contract for the complete large-filter series.",
+  "authoritative_workload": {
+    "workload_id": "full-62af05addd159340",
+    "workload_sha256": "62af05addd1593408106f1ebdddac4067af82f8295cda9ee5a194555b6a68163",
+    "workload_manifest_sha256": "2ee3f029d2e05d756a1de3282d43a9af2388b777473b1a63c01bdd1f763eaad7",
+    "canonical_workload_manifest_sha256": "ac2c3e24a17a6494bf960e45b5119d1259154a8648d9bda51b2654d4f9e21591",
+    "scenario_count": 118
+  },
+  "timing_protocol": {
+    "required_evidence_contract_version": 2,
+    "minimum_repeats_per_run": 15,
+    "allowed_warmups": [2, 3],
+    "required_cache_policy": "warm",
+    "required_backend": "mdb",
+    "required_perf_collection_class": "hardware-events",
+    "required_schedule_design": "abba"
+  },
+  "all_timed_scenario_groups": [
+    "acceptance",
+    "candidate-scaling",
+    "branch-scaling",
+    "hit-position",
+    "fallbacks",
+    "multivalue-scaling",
+    "dn-normalization",
+    "decomposition",
+    "combined-substring",
+    "combined-approximate",
+    "branch-order",
+    "flat-family",
+    "presence-index",
+    "candidate-index-controls"
+  ],
+  "profile_required_groups": [
+    "acceptance",
+    "combined-features",
+    "flat-family",
+    "decline-paths"
+  ],
+  "timed_pair_rules": [
+    {
+      "id": "pre-series-to-final-on",
+      "scenario_groups_ref": "all_timed_scenario_groups",
+      "a": {"server": "389ds", "revision_role": "pre-series", "lookup_mode": "unsupported"},
+      "b": {"server": "389ds", "revision_role": "final", "lookup_mode": "on"}
+    },
+    {
+      "id": "final-lookup-off-to-on",
+      "scenario_groups_ref": "all_timed_scenario_groups",
+      "a": {"server": "389ds", "revision_role": "final", "lookup_mode": "off"},
+      "b": {"server": "389ds", "revision_role": "final", "lookup_mode": "on"}
+    },
+    {
+      "id": "final-on-to-packaged-openldap",
+      "scenario_groups_ref": "all_timed_scenario_groups",
+      "a": {"server": "389ds", "revision_role": "final", "lookup_mode": "on"},
+      "b": {"server": "openldap", "revision_role": "openldap-fedora-package", "lookup_mode": "unsupported"}
+    },
+    {
+      "id": "pre-series-to-bounded-feature",
+      "scenario_groups": ["combined-substring", "combined-approximate"],
+      "a": {"server": "389ds", "revision_role": "pre-series", "lookup_mode": "unsupported"},
+      "b": {"server": "389ds", "revision_role": "bounded-feature", "lookup_mode": "unsupported"}
+    },
+    {
+      "id": "combined-diagnostic-to-all-family-fix",
+      "scenario_groups": ["flat-family"],
+      "a": {"server": "389ds", "revision_role": "combined-diagnostic", "lookup_mode": "on"},
+      "b": {"server": "389ds", "revision_role": "all-family-fix", "lookup_mode": "on"}
+    },
+    {
+      "id": "all-family-to-largest-family-fix",
+      "scenario_groups": ["flat-family"],
+      "a": {"server": "389ds", "revision_role": "all-family-fix", "lookup_mode": "on"},
+      "b": {"server": "389ds", "revision_role": "largest-family-fix", "lookup_mode": "on"}
+    },
+    {
+      "id": "largest-family-fix-to-final-success",
+      "scenarios": [
+        "fallback-simple-hit",
+        "combined-substring-gain",
+        "flat-family-ranking-b64-a16"
+      ],
+      "a": {"server": "389ds", "revision_role": "largest-family-fix", "lookup_mode": "on"},
+      "b": {"server": "389ds", "revision_role": "final", "lookup_mode": "on"}
+    }
+  ],
+  "correctness_control_rules": [
+    {
+      "id": "dynamic-parent-control",
+      "server": "389ds",
+      "revision_role": "combined-diagnostic",
+      "scenario_group": "dynamic-list-correctness",
+      "expected_historical_failure": true
+    },
+    {
+      "id": "dynamic-fix-control",
+      "server": "389ds",
+      "revision_role": "dynamic-list-fix",
+      "scenario_group": "dynamic-list-correctness",
+      "expected_historical_failure": false
+    },
+    {
+      "id": "dynamic-final-control",
+      "server": "389ds",
+      "revision_role": "final",
+      "scenario_group": "dynamic-list-correctness",
+      "expected_historical_failure": false
+    }
+  ],
+  "release_conclusion_policy": {
+    "requires_matrix_complete": true,
+    "requires_schedule_complete": true,
+    "requires_all_acceptance_gates_pass": true,
+    "failure_precedence": "fail",
+    "otherwise": "pending"
+  }
+}

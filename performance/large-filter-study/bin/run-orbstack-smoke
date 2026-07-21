@@ -1,0 +1,2618 @@
+#!/usr/bin/env python3
+"""Run the large-filter correctness smoke matrix in owned OrbStack containers.
+
+This entry point is intentionally incapable of native timing.  It accepts only
+locally supplied Fedora 42 389 DS RPMs, creates linux/amd64 containers under
+OrbStack/Rosetta, and delegates every search to ``bin/run-study`` in
+``correctness-only`` mode.  Numeric measurements produced along the way are
+non-release execution artifacts and must not be used for timing claims.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+
+STUDY_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = STUDY_ROOT.parents[1]
+GENERATOR = STUDY_ROOT / "bin" / "generate-workload"
+RUN_STUDY = STUDY_ROOT / "bin" / "run-study"
+MERGE_RESULTS = STUDY_ROOT / "bin" / "merge-results"
+FINAL_STUDY_SHA = "e0161d0e61d0cdef22175418f0d4a1e126216a86"
+HOST_CLASS = "macos_orbstack_emulated"
+DOCKER_CONTEXT = "orbstack"
+CONTAINER_PLATFORM = "linux/amd64"
+FEDORA_VERSION = "42"
+ORBSTACK_DIRSRV_SERVICE_OVERRIDES = {
+    "MemoryDenyWriteExecute": "no",
+    # ns-slapd running through Rosetta can remain alive after SIGTERM even
+    # after it has become idle.  This is scoped to the disposable,
+    # correctness-only container; the native Fedora runner never installs it.
+    "KillSignal": "SIGKILL",
+}
+NORMAL_PRIMARY_ATTRIBUTES = [
+    "uid", "cn", "sString1", "sString2", "sString3", "sString4",
+    "sDN1", "sDN2",
+]
+LDAP_SUCCESS = 0
+VATTR_CHECK_SOURCE_FUNCTION = "vattr_check/vattr_check_thread"
+VATTR_CHECK_DELAY_SECONDS = 3
+VATTR_CHECK_FILTER = (
+    "(&(objectclass=ldapsubentry)"
+    "(|(objectclass=nsRoleDefinition)(objectclass=cosSuperDefinition)))"
+)
+VATTR_CHECK_MINIMUM_STABILITY_SECONDS = 1.0
+EXPECTED_ACCEPTANCE_GATES = {
+    "exact-result-parity",
+    "no-new-result-or-admin-limit",
+    "principal-consumed-lookup-cost",
+    "branch-count-scaling",
+    "adverse-and-small-shape-no-regression",
+    "table-build-and-memory-overhead",
+    "decline-path-parity",
+    "final-success-path-no-regression",
+    "sdn2-pair-attribution",
+    "selection-fix-retention",
+}
+
+LABEL_MANAGED_BY = "org.389ds.large-filter-study.managed-by"
+LABEL_RUN_ID = "org.389ds.large-filter-study.run-id"
+LABEL_EVIDENCE = "org.389ds.large-filter-study.evidence"
+MANAGED_BY_VALUE = "run-orbstack-smoke"
+EVIDENCE_VALUE = "correctness-only"
+
+RPM_GIT_RE = re.compile(r"(?i)git([0-9a-f]{7,40})(?=[^0-9a-f]|$)")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+CANDIDATE_TRACE_RE = re.compile(r"Candidate list has (\d+) ids")
+
+
+BASELINE_SCENARIOS = (
+    "principal-with-sdn2-equality",
+    "principal-without-sdn2-equality",
+    "branch-count-15-all-absent",
+    "branch-count-16-all-absent",
+    "candidate-count-0",
+    "candidate-count-10000",
+    "hit-position-early",
+    "hit-position-middle",
+    "hit-position-late",
+    "assertion-order-all-miss-forward",
+    "assertion-order-all-miss-reversed",
+    "assertion-order-positive-forward",
+    "assertion-order-positive-reversed",
+    "fallback-simple-hit",
+    "fallback-complex-hit",
+    "multivalue-sdn1-1",
+    "multivalue-sdn1-64",
+    "multivalue-m-gt-k-17-vs-16",
+    "dn-case-equivalent-positive",
+    "dn-escaped-comma-positive",
+    "dn-invalid-remainder-positive",
+    "dn-invalid-remainder-all-miss",
+    "decomposition-a-outer-only",
+    "decomposition-b-one-absent-equality",
+    "decomposition-c-large-sdn1-only",
+    "decomposition-d-sdn2-and-complex-only",
+    "decomposition-e-full-primary",
+    "decomposition-f-full-no-sdn2",
+    "decomposition-g-complex-only",
+    "combined-substring-gain",
+    "combined-substring-adverse",
+    "combined-approximate-gain",
+    "flat-family-third-after-distractors",
+    "flat-family-ranking-a16-b64",
+    "flat-family-ranking-b64-a16",
+    "flat-family-tie-a-first",
+    "flat-family-tie-b-first",
+    "flat-family-unsupported-fallback",
+    "dynamic-list-lookthrough-finite",
+    "dynamic-list-lookthrough-unlimited",
+)
+
+LOOKUP_OFF_SCENARIOS = (
+    "principal-with-sdn2-equality",
+    "principal-without-sdn2-equality",
+    "branch-count-15-all-absent",
+    "branch-count-16-all-absent",
+    "candidate-count-0",
+    "candidate-count-10000",
+    "hit-position-early",
+    "hit-position-late",
+    "assertion-order-all-miss-forward",
+    "assertion-order-all-miss-reversed",
+    "combined-substring-gain",
+    "combined-substring-adverse",
+    "flat-family-ranking-a16-b64",
+    "flat-family-ranking-b64-a16",
+    "multivalue-m-gt-k-17-vs-16",
+)
+
+PRESENCE_BOTH_SCENARIOS = (
+    "presence-primary-both",
+    "presence-no-sdn2-both",
+)
+
+OPENLDAP_SCENARIOS = (
+    "principal-with-sdn2-equality",
+    "principal-without-sdn2-equality",
+    "branch-count-15-all-absent",
+    "branch-count-16-all-absent",
+    "candidate-count-0",
+    "candidate-count-10000",
+    "hit-position-early",
+    "hit-position-late",
+    "assertion-order-all-miss-reversed",
+    "fallback-simple-hit",
+    "fallback-complex-hit",
+    "multivalue-m-gt-k-17-vs-16",
+    "dn-case-equivalent-positive",
+    "dn-invalid-remainder-positive",
+    "decomposition-e-full-primary",
+    "decomposition-f-full-no-sdn2",
+    "combined-substring-gain",
+    "combined-substring-adverse",
+    "combined-approximate-gain",
+    "flat-family-third-after-distractors",
+    "flat-family-ranking-a16-b64",
+    "flat-family-ranking-b64-a16",
+    "flat-family-tie-a-first",
+    "flat-family-unsupported-fallback",
+)
+
+
+class SmokeError(RuntimeError):
+    """A user-facing smoke orchestration failure."""
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    name: str
+    server: str
+    lookup: str
+    index_config: str
+    scenarios: tuple[str, ...]
+
+
+RUN_SPECS = (
+    RunSpec(
+        "389ds-lookup-on-baseline",
+        "389ds",
+        "on",
+        "baseline-no-presence",
+        BASELINE_SCENARIOS,
+    ),
+    RunSpec(
+        "389ds-lookup-off-subset",
+        "389ds",
+        "off",
+        "baseline-no-presence",
+        LOOKUP_OFF_SCENARIOS,
+    ),
+    RunSpec(
+        "389ds-lookup-on-presence-both",
+        "389ds",
+        "on",
+        "presence-both",
+        PRESENCE_BOTH_SCENARIOS,
+    ),
+    RunSpec(
+        "openldap-parity-subset",
+        "openldap",
+        "unsupported",
+        "baseline-no-presence",
+        OPENLDAP_SCENARIOS,
+    ),
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def dns_digest(dns: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "".join(f"{dn}\n" for dn in dns).encode("utf-8")
+    ).hexdigest()
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SmokeError(f"cannot read JSON {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SmokeError(f"expected a JSON object in {path}")
+    return value
+
+
+def run_process(
+    argv: Sequence[str | os.PathLike[str]],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    announce: bool = True,
+    echo_output: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    args = [os.fspath(value) for value in argv]
+    if announce:
+        print(f"+ {shlex.join(args)}", flush=True)
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SmokeError(f"could not run {args[0]}: {error}") from error
+    if capture and echo_output:
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(
+                result.stderr,
+                end="" if result.stderr.endswith("\n") else "\n",
+                file=sys.stderr,
+            )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+        raise SmokeError(
+            f"command failed ({result.returncode}): {shlex.join(args)}: {detail}"
+        )
+    return result
+
+
+def current_head() -> str:
+    result = run_process(
+        ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+        capture=True,
+        announce=False,
+        echo_output=False,
+        timeout=30,
+    )
+    sha = result.stdout.strip().lower()
+    if not SHA_RE.fullmatch(sha):
+        raise SmokeError(f"git returned an invalid HEAD revision: {sha!r}")
+    return sha
+
+
+def normalize_expected_sha(value: str | None) -> str:
+    sha = (value or current_head()).lower()
+    if not SHA_RE.fullmatch(sha):
+        raise SmokeError("--expected-source-sha must be a complete 40-hex commit SHA")
+    return sha
+
+
+def _is_389_rpm(name: str) -> bool:
+    return name.startswith(("389-ds-base-", "python3-lib389-", "cockpit-389-ds-"))
+
+
+def validate_rpms(rpm_dir: Path, expected_sha: str) -> dict[str, Any]:
+    root = rpm_dir.resolve()
+    if not root.is_dir():
+        raise SmokeError(
+            f"RPM directory does not exist: {root}; supply externally built Fedora 42 "
+            "RPMs with --rpm-dir (the smoke launcher never builds them)"
+        )
+    candidates = sorted(path for path in root.glob("*.rpm") if _is_389_rpm(path.name))
+    if not candidates:
+        raise SmokeError(f"no locally supplied 389 DS RPMs found in {root}")
+
+    inventory: list[dict[str, Any]] = []
+    stale: list[str] = []
+    for path in candidates:
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise SmokeError(f"RPM symlink escapes --rpm-dir: {path}") from error
+        if not resolved.is_file() or resolved.stat().st_size == 0:
+            raise SmokeError(f"RPM is missing or empty: {path}")
+        if ".fc42." not in path.name:
+            raise SmokeError(f"RPM is not identified as a Fedora 42 build: {path.name}")
+        if not path.name.endswith((".x86_64.rpm", ".noarch.rpm")):
+            raise SmokeError(f"RPM is not linux/amd64-compatible: {path.name}")
+        tokens = sorted(set(token.lower() for token in RPM_GIT_RE.findall(path.name)))
+        if not tokens:
+            raise SmokeError(
+                f"RPM filename does not expose a git<sha> source token: {path.name}"
+            )
+        mismatches = [token for token in tokens if not expected_sha.startswith(token)]
+        if mismatches:
+            stale.append(f"{path.name} (git{','.join(mismatches)})")
+        inventory.append(
+            {
+                "filename": path.name,
+                "path": str(path),
+                "bytes": resolved.stat().st_size,
+                "sha256": sha256_file(resolved),
+                "source_tokens": tokens,
+            }
+        )
+    if stale:
+        raise SmokeError(
+            "refusing stale RPM filenames: expected source "
+            f"{expected_sha}, found " + "; ".join(stale)
+        )
+
+    roles = {
+        "389-ds-base": [
+            path for path in candidates if re.match(r"^389-ds-base-(?=\d)", path.name)
+        ],
+        "389-ds-base-libs": [
+            path for path in candidates if re.match(r"^389-ds-base-libs-(?=\d)", path.name)
+        ],
+        "python3-lib389": [
+            path for path in candidates if re.match(r"^python3-lib389-(?=\d)", path.name)
+        ],
+    }
+    for role, paths in roles.items():
+        if len(paths) != 1:
+            names = ", ".join(path.name for path in paths) or "none"
+            raise SmokeError(f"expected exactly one {role} RPM in {root}; found {names}")
+    install = [roles[name][0] for name in ("389-ds-base-libs", "python3-lib389", "389-ds-base")]
+    return {
+        "directory": str(root),
+        "expected_source_sha": expected_sha,
+        "inventory": inventory,
+        "install_filenames": [path.name for path in install],
+    }
+
+
+def verify_rpm_inputs_unchanged(
+        expected: Mapping[str, Any], rpm_dir: Path,
+        expected_sha: str) -> str:
+    observed = validate_rpms(rpm_dir, expected_sha)
+    expected_identity = canonical_json_sha256(expected)
+    if canonical_json_sha256(observed) != expected_identity:
+        raise SmokeError("locally supplied RPM inputs changed during the smoke run")
+    return expected_identity
+
+
+def validate_workload(workload: Path) -> dict[str, Any]:
+    root = workload.resolve()
+    manifest = load_json(root / "workload-manifest.json")
+    if manifest.get("format_version") != 1:
+        raise SmokeError(f"unsupported workload format in {root}")
+    if manifest.get("correctness_only") is not True:
+        raise SmokeError("OrbStack smoke requires workload correctness_only=true")
+    if manifest.get("release_timing_evidence") is not False:
+        raise SmokeError("OrbStack smoke requires workload release_timing_evidence=false")
+    scenarios = manifest.get("scenarios")
+    if not isinstance(scenarios, Mapping):
+        raise SmokeError("workload manifest has no scenario mapping")
+    import_oracles = manifest.get("dataset_import_oracles")
+    entry_counts = manifest.get("entry_counts")
+    if not isinstance(import_oracles, Mapping) or not isinstance(
+            entry_counts, Mapping):
+        raise SmokeError("workload is missing live dataset import oracles")
+    for oracle_id, count_key in (
+            ("people", "people"),
+            ("principal_outer_cohort", "principal_cohort")):
+        oracle = import_oracles.get(oracle_id)
+        if (
+                not isinstance(oracle, Mapping)
+                or oracle.get("expected_count") != entry_counts.get(count_key)
+                or oracle.get("expected_result_code") != "LDAP_SUCCESS"
+                or not isinstance(oracle.get("expected_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", oracle["expected_sha256"])):
+            raise SmokeError(f"workload import oracle {oracle_id} is invalid")
+    for spec in RUN_SPECS:
+        if len(spec.scenarios) != len(set(spec.scenarios)):
+            raise SmokeError(f"internal smoke matrix {spec.name} contains duplicate scenarios")
+        for scenario_id in spec.scenarios:
+            scenario = scenarios.get(scenario_id)
+            if not isinstance(scenario, Mapping):
+                raise SmokeError(f"workload is missing smoke scenario {scenario_id}")
+            if spec.server not in scenario.get("server_support", []):
+                raise SmokeError(f"scenario {scenario_id} does not support {spec.server}")
+            if scenario.get("index_variant", "baseline-no-presence") != spec.index_config:
+                raise SmokeError(
+                    f"scenario {scenario_id} requires index configuration "
+                    f"{scenario.get('index_variant')}, not {spec.index_config}"
+                )
+    return manifest
+
+
+def docker_base(docker: str) -> list[str]:
+    return [docker, "--context", DOCKER_CONTEXT]
+
+
+def host_preflight() -> dict[str, Any]:
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system != "Darwin":
+        raise SmokeError(
+            f"run-orbstack-smoke requires an Apple macOS host; detected {system}"
+        )
+    if machine not in {"arm64", "aarch64"}:
+        raise SmokeError(
+            f"run-orbstack-smoke requires Apple Silicon/Rosetta; detected {machine}"
+        )
+    docker = shutil.which("docker")
+    orb = shutil.which("orb") or shutil.which("orbctl")
+    if not docker:
+        raise SmokeError("docker is missing")
+    if not orb:
+        raise SmokeError("OrbStack's orb/orbctl command is missing")
+
+    context = run_process(
+        [docker, "context", "show"], announce=False, echo_output=False, timeout=30
+    ).stdout.strip()
+    if context != DOCKER_CONTEXT:
+        raise SmokeError(
+            f"Docker context must be exactly {DOCKER_CONTEXT!r}, not {context!r}"
+        )
+    info_result = run_process(
+        [*docker_base(docker), "info", "--format", "{{json .}}"],
+        announce=False,
+        echo_output=False,
+        timeout=60,
+    )
+    try:
+        info = json.loads(info_result.stdout)
+    except json.JSONDecodeError as error:
+        raise SmokeError(f"Docker returned malformed info JSON: {error}") from error
+    if info.get("OperatingSystem") != "OrbStack" or info.get("OSType") != "linux":
+        raise SmokeError(
+            "Docker context orbstack is not backed by the OrbStack Linux engine"
+        )
+    if str(info.get("Architecture", "")).lower() not in {"arm64", "aarch64"}:
+        raise SmokeError(
+            "OrbStack engine is not arm64; refusing to mislabel a native execution"
+        )
+    rosetta = run_process(
+        [orb, "config", "get", "rosetta"],
+        announce=False,
+        echo_output=False,
+        timeout=30,
+    ).stdout.strip().lower()
+    if rosetta not in {"true", "1", "yes", "on"}:
+        raise SmokeError("OrbStack Rosetta support must be enabled")
+    return {
+        "system": system,
+        "machine": machine,
+        "docker": docker,
+        "docker_context": context,
+        "docker_server": {
+            "name": info.get("Name"),
+            "operating_system": info.get("OperatingSystem"),
+            "architecture": info.get("Architecture"),
+            "kernel_version": info.get("KernelVersion"),
+            "server_version": info.get("ServerVersion"),
+        },
+        "orb_command": orb,
+        "rosetta": True,
+    }
+
+
+def ownership_labels(run_id: str) -> dict[str, str]:
+    return {
+        LABEL_MANAGED_BY: MANAGED_BY_VALUE,
+        LABEL_RUN_ID: run_id,
+        LABEL_EVIDENCE: EVIDENCE_VALUE,
+    }
+
+
+def labels_match(observed: Mapping[str, Any], expected: Mapping[str, str]) -> bool:
+    return all(observed.get(key) == value for key, value in expected.items())
+
+
+class OwnedContainers:
+    def __init__(self, docker: str, run_id: str, retain: bool) -> None:
+        self.docker = docker
+        self.run_id = run_id
+        self.retain = retain
+        self.labels = ownership_labels(run_id)
+        self.names: list[str] = []
+        self.records: list[dict[str, Any]] = []
+        self.cleanup_evidence: dict[str, Any] = {"status": "pending"}
+
+    def _label_args(self) -> list[str]:
+        args: list[str] = []
+        for key, value in sorted(self.labels.items()):
+            args.extend(["--label", f"{key}={value}"])
+        return args
+
+    def start(
+        self,
+        *,
+        name: str,
+        image: str,
+        mounts: Sequence[tuple[Path, str, bool]],
+        systemd: bool,
+    ) -> dict[str, Any]:
+        argv = [
+            *docker_base(self.docker),
+            "run",
+            "--detach",
+            "--platform",
+            CONTAINER_PLATFORM,
+            "--name",
+            name,
+            "--hostname",
+            "server.example.com",
+            *self._label_args(),
+        ]
+        if systemd:
+            argv.extend(
+                [
+                    "--privileged",
+                    "--shm-size",
+                    "4g",
+                    "--ulimit",
+                    "core=-1",
+                ]
+            )
+        else:
+            argv.append("--init")
+        for source, target, readonly in mounts:
+            mount = f"type=bind,src={source.resolve()},dst={target}"
+            if readonly:
+                mount += ",readonly"
+            argv.extend(["--mount", mount])
+        argv.append(image)
+        if not systemd:
+            argv.extend(["sleep", "infinity"])
+        result = run_process(argv, timeout=300)
+        container_id = result.stdout.strip().splitlines()[-1]
+        if not container_id:
+            raise SmokeError(f"Docker did not return an id for container {name}")
+        self.names.append(name)
+        record = {
+            "name": name,
+            "id": container_id,
+            "image": image,
+            "platform": CONTAINER_PLATFORM,
+            "labels": dict(self.labels),
+            "status": "running",
+        }
+        self.records.append(record)
+        return record
+
+    def exec(
+        self,
+        name: str,
+        argv: Sequence[str],
+        *,
+        check: bool = True,
+        capture: bool = True,
+        announce: bool = True,
+        echo_output: bool = True,
+        timeout: float | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [*docker_base(self.docker), "exec"]
+        for key, value in sorted((env or {}).items()):
+            command.extend(["--env", f"{key}={value}"])
+        command.append(name)
+        command.extend(argv)
+        return run_process(
+            command,
+            check=check,
+            capture=capture,
+            announce=announce,
+            echo_output=echo_output,
+            timeout=timeout,
+        )
+
+    def inspect_image(self, name: str) -> dict[str, Any]:
+        result = run_process(
+            [
+                *docker_base(self.docker),
+                "inspect",
+                "--format",
+                "{{json .}}",
+                name,
+            ],
+            announce=False,
+            echo_output=False,
+            timeout=30,
+        )
+        try:
+            record = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise SmokeError(f"could not parse container inspection for {name}") from error
+        return {
+            "container_image_id": record.get("Image"),
+            "configured_image": record.get("Config", {}).get("Image"),
+        }
+
+    def cleanup(self) -> list[str]:
+        errors: list[str] = []
+        if self.retain:
+            for record in self.records:
+                inspected = run_process(
+                    [
+                        *docker_base(self.docker), "inspect", "--format",
+                        "{{json .}}", record["name"],
+                    ],
+                    check=False,
+                    announce=False,
+                    echo_output=False,
+                    timeout=30,
+                )
+                try:
+                    observed = json.loads(inspected.stdout)
+                except json.JSONDecodeError:
+                    observed = None
+                observed_config = (
+                    observed.get("Config", {})
+                    if isinstance(observed, Mapping) else {}
+                )
+                observed_labels = (
+                    observed_config.get("Labels", {})
+                    if isinstance(observed_config, Mapping) else {}
+                )
+                if (
+                        inspected.returncode != 0
+                        or not isinstance(observed, Mapping)
+                        or observed.get("Id") != record["id"]
+                        or not isinstance(observed_labels, Mapping)
+                        or not labels_match(observed_labels, self.labels)):
+                    record["status"] = "retain-verification-failed"
+                    errors.append(
+                        f"could not prove retained owned container {record['name']}"
+                    )
+                    continue
+                record["status"] = "retained"
+                record["retention_verified"] = True
+                observed_state = observed.get("State", {})
+                record["retained_state"] = (
+                    observed_state.get("Status")
+                    if isinstance(observed_state, Mapping) else None
+                )
+            self.cleanup_evidence = {
+                "status": "pass" if not errors else "failed",
+                "policy": "retain",
+                "expected_container_count": len(self.records),
+                "verified_retained_count": sum(
+                    record.get("retention_verified") is True
+                    for record in self.records
+                ),
+                "zero_owned_containers_remaining": False,
+            }
+            return errors
+        for name in reversed(self.names):
+            inspect = run_process(
+                [
+                    *docker_base(self.docker),
+                    "inspect",
+                    "--format",
+                    "{{json .Config.Labels}}",
+                    name,
+                ],
+                check=False,
+                announce=False,
+                echo_output=False,
+                timeout=30,
+            )
+            if inspect.returncode != 0:
+                errors.append(f"could not inspect owned container {name}; it was not removed")
+                continue
+            try:
+                observed = json.loads(inspect.stdout)
+            except json.JSONDecodeError:
+                errors.append(f"could not decode ownership labels for {name}; it was not removed")
+                continue
+            if not isinstance(observed, Mapping) or not labels_match(observed, self.labels):
+                errors.append(f"ownership labels changed for {name}; refusing to remove it")
+                continue
+            removed = run_process(
+                [*docker_base(self.docker), "rm", "--force", name],
+                check=False,
+                timeout=120,
+            )
+            if removed.returncode != 0:
+                errors.append(f"failed to remove owned container {name}")
+                continue
+            for record in self.records:
+                if record["name"] == name:
+                    absent = run_process(
+                        [
+                            *docker_base(self.docker), "inspect", "--format",
+                            "{{.Id}}", name,
+                        ],
+                        check=False,
+                        announce=False,
+                        echo_output=False,
+                        timeout=30,
+                    )
+                    if absent.returncode == 0:
+                        record["status"] = "removal-verification-failed"
+                        errors.append(
+                            f"owned container {name} still exists after removal"
+                        )
+                    else:
+                        record["status"] = "removed"
+                        record["removal_verified_absent"] = True
+                        record["removed_id"] = record["id"]
+        filters: list[str] = []
+        for key, value in sorted(self.labels.items()):
+            filters.extend(["--filter", f"label={key}={value}"])
+        remaining = run_process(
+            [
+                *docker_base(self.docker), "ps", "--all", *filters,
+                "--format", "{{.ID}}",
+            ],
+            check=False,
+            announce=False,
+            echo_output=False,
+            timeout=30,
+        )
+        remaining_ids = (
+            [line.strip() for line in remaining.stdout.splitlines() if line.strip()]
+            if remaining.returncode == 0 else []
+        )
+        if remaining.returncode != 0:
+            errors.append("could not query remaining containers for the owned run labels")
+        elif remaining_ids:
+            errors.append(
+                "owned run still has labeled containers: " + ", ".join(remaining_ids)
+            )
+        self.cleanup_evidence = {
+            "status": "pass" if not errors else "failed",
+            "policy": "remove",
+            "expected_container_count": len(self.records),
+            "verified_removed_count": sum(
+                record.get("removal_verified_absent") is True
+                for record in self.records
+            ),
+            "remaining_labeled_container_ids": remaining_ids,
+            "zero_owned_containers_remaining": (
+                remaining.returncode == 0 and not remaining_ids
+            ),
+        }
+        return errors
+
+
+def linux_amd64_probe(
+    docker: str, image: str, labels: Mapping[str, str]
+) -> dict[str, str]:
+    argv = [
+        *docker_base(docker),
+        "run",
+        "--rm",
+        "--platform",
+        CONTAINER_PLATFORM,
+    ]
+    for key, value in sorted(labels.items()):
+        argv.extend(["--label", f"{key}={value}"])
+    argv.extend(
+        [
+            image,
+            "sh",
+            "-ec",
+            '. /etc/os-release; printf "%s|%s\\n" "$(uname -m)" "$VERSION_ID"',
+        ]
+    )
+    result = run_process(argv, timeout=300)
+    observed = result.stdout.strip().splitlines()[-1]
+    if observed != f"x86_64|{FEDORA_VERSION}":
+        raise SmokeError(
+            "linux/amd64 Fedora 42 capability probe failed: "
+            f"expected x86_64|{FEDORA_VERSION}, observed {observed!r}"
+        )
+    return {"architecture": "x86_64", "fedora_version": FEDORA_VERSION}
+
+
+def wait_for_systemd(containers: OwnedContainers, name: str) -> None:
+    deadline = time.monotonic() + 150
+    last = ""
+    while time.monotonic() < deadline:
+        result = containers.exec(
+            name,
+            ["systemctl", "is-system-running"],
+            check=False,
+            capture=True,
+            announce=False,
+            echo_output=False,
+            timeout=10,
+        )
+        state = result.stdout.strip()
+        if state in {"running", "degraded"}:
+            return
+        last = result.stderr.strip() or state
+        time.sleep(1)
+    raise SmokeError(f"systemd in {name} did not become ready: {last}")
+
+
+def assert_container_fedora42_amd64(
+    containers: OwnedContainers, name: str
+) -> dict[str, str]:
+    result = containers.exec(
+        name,
+        [
+            "sh",
+            "-ec",
+            '. /etc/os-release; printf "%s|%s|%s\\n" "$ID" "$VERSION_ID" "$(uname -m)"',
+        ],
+        timeout=30,
+    )
+    observed = result.stdout.strip().splitlines()[-1]
+    if observed != f"fedora|{FEDORA_VERSION}|x86_64":
+        raise SmokeError(
+            f"container {name} must be Fedora 42 linux/amd64; observed {observed!r}"
+        )
+    return {"distribution": "fedora", "version": FEDORA_VERSION, "architecture": "x86_64"}
+
+
+def prepare_389_container(
+    containers: OwnedContainers,
+    name: str,
+    rpm_metadata: Mapping[str, Any],
+    expected_sha: str,
+) -> dict[str, Any]:
+    wait_for_systemd(containers, name)
+    environment = assert_container_fedora42_amd64(containers, name)
+    containers.exec(
+        name,
+        [
+            "sh",
+            "-ec",
+            "installed=$(rpm -qa --qf '%{NAME}\\n' | "
+            "grep -E '^(389-ds-base($|-)|python3-lib389($|-)|cockpit-389-ds$)' || true); "
+            "if [ -n \"$installed\" ]; then "
+            "dnf remove -y --no-autoremove $installed; fi",
+        ],
+        capture=False,
+        timeout=1800,
+    )
+    local_rpms = [f"/rpms/{name}" for name in rpm_metadata["install_filenames"]]
+    containers.exec(
+        name,
+        [
+            "dnf", "install", "-y",
+            "--setopt=install_weak_deps=False", "--allowerasing", *local_rpms,
+        ],
+        capture=False,
+        timeout=1800,
+    )
+    containers.exec(
+        name,
+        [
+            "sh",
+            "-ec",
+            "mkdir -p /etc/systemd/system/dirsrv@.service.d; "
+            "printf '%s\\n' '[Service]' 'MemoryDenyWriteExecute=no' "
+            "'KillSignal=SIGKILL' "
+            "> /etc/systemd/system/dirsrv@.service.d/orbstack-rosetta.conf; "
+            "systemctl daemon-reload",
+        ],
+        capture=False,
+        timeout=60,
+    )
+    identity = containers.exec(
+        name,
+        [
+            "rpm",
+            "-q",
+            "--qf",
+            "%{NEVRA}\\n",
+            "389-ds-base",
+            "389-ds-base-libs",
+            "python3-lib389",
+        ],
+        timeout=30,
+    ).stdout.strip()
+    tokens = sorted(set(token.lower() for token in RPM_GIT_RE.findall(identity)))
+    if not tokens or any(not expected_sha.startswith(token) for token in tokens):
+        raise SmokeError(
+            f"installed 389 DS RPM identity does not match {expected_sha}: {identity}"
+        )
+    return {
+        **environment,
+        "installed_nevras": identity.splitlines(),
+        "orbstack_dirsrv_service_overrides": ORBSTACK_DIRSRV_SERVICE_OVERRIDES,
+    }
+
+
+def prepare_openldap_container(
+    containers: OwnedContainers, name: str
+) -> dict[str, Any]:
+    environment = assert_container_fedora42_amd64(containers, name)
+    containers.exec(
+        name,
+        [
+            "dnf",
+            "install",
+            "-y",
+            "--setopt=install_weak_deps=False",
+            "python3",
+            "openldap-servers",
+            "openldap-clients",
+            "binutils",
+            "procps-ng",
+            "util-linux",
+        ],
+        capture=False,
+        timeout=1800,
+    )
+    identity = containers.exec(
+        name,
+        ["rpm", "-q", "--qf", "%{NEVRA}\\n", "openldap-servers", "openldap-clients"],
+        timeout=30,
+    ).stdout.strip()
+    return {**environment, "installed_nevras": identity.splitlines()}
+
+
+def runner_command(
+    spec: RunSpec,
+    *,
+    expected_sha: str,
+    retain: bool,
+) -> list[str]:
+    expected = expected_sha if spec.server == "389ds" else "fedora-package"
+    if spec.server == "389ds":
+        build_label = f"final-{expected_sha[:10]}-{spec.lookup}-{spec.index_config}-orbstack-smoke"
+    else:
+        build_label = "openldap-fedora42-orbstack-smoke"
+    argv = [
+        "python3",
+        "/study/bin/run-study",
+        "--mode",
+        "correctness-only",
+        "--server",
+        spec.server,
+        "--build-label",
+        build_label,
+        "--expected-source-sha",
+        expected,
+        "--operator-assertion",
+        "OrbStack smoke package identity supplied locally; correctness-only",
+        "--lookup",
+        spec.lookup,
+        "--workload",
+        "/workload",
+        "--output",
+        f"/results/runs/{spec.name}",
+        "--index-config",
+        spec.index_config,
+        "--backend",
+        "mdb",
+        "--repeat",
+        "1",
+        "--warmups",
+        "0",
+        "--cache-policy",
+        "warm",
+        "--host-class",
+        HOST_CLASS,
+        "--perf",
+        "off",
+        "--profile",
+        "off",
+        "--scenario-order",
+        "manifest",
+        "--schedule-position",
+        "correctness-only-not-timed",
+        "--retain" if retain else "--cleanup",
+    ]
+    for scenario in spec.scenarios:
+        argv.extend(["--scenario", scenario])
+    return argv
+
+
+def _verify_exact_evidence(
+        evidence: Any, scenario: Mapping[str, Any], label: str,
+        problems: list[str]) -> None:
+    if not isinstance(evidence, Mapping):
+        problems.append(f"{label} exact-result evidence is missing")
+        return
+    expected_count = scenario.get("expected_count")
+    expected_sha = scenario.get("expected_sha256")
+    expected_result_code = scenario.get("expected_result_code")
+    if expected_result_code != "LDAP_SUCCESS":
+        problems.append(f"{label} has an unsupported smoke LDAP result oracle")
+    if evidence.get("evidence_status") != "observed":
+        problems.append(f"{label} exact-result evidence was not observed")
+    if evidence.get("expected_count") != expected_count:
+        problems.append(f"{label} expected count differs from workload oracle")
+    if evidence.get("returned_count") != expected_count:
+        problems.append(f"{label} returned count differs from workload oracle")
+    if evidence.get("expected_sha256") != expected_sha:
+        problems.append(f"{label} expected hash differs from workload oracle")
+    if evidence.get("returned_sha256") != expected_sha:
+        problems.append(f"{label} returned hash differs from workload oracle")
+    if evidence.get("expected_result_code") != expected_result_code:
+        problems.append(f"{label} expected LDAP result differs from workload oracle")
+    if evidence.get("expected_ldap_result_code") != LDAP_SUCCESS:
+        problems.append(f"{label} numeric expected LDAP result is not success")
+    if evidence.get("ldap_result_code") != LDAP_SUCCESS:
+        problems.append(f"{label} client LDAP result is not success")
+    if evidence.get("actual_client_result_code") != LDAP_SUCCESS:
+        problems.append(f"{label} actual client LDAP result is not success")
+    for key in (
+            "exact_count_match", "exact_sha256_match", "exact_dns_match",
+            "client_result_code_match", "passed"):
+        if evidence.get(key) is not True:
+            problems.append(f"{label} {key} is not true")
+
+
+def _verify_server_result(
+        evidence: Any, label: str, problems: list[str]) -> None:
+    if not isinstance(evidence, Mapping):
+        problems.append(f"{label} server-result evidence is missing")
+        return
+    if evidence.get("evidence_status") != "observed":
+        problems.append(f"{label} server-result evidence was not observed")
+    if evidence.get("expected_result_code") != "LDAP_SUCCESS":
+        problems.append(f"{label} server expected LDAP result is not success")
+    if evidence.get("expected_ldap_result_code") != LDAP_SUCCESS:
+        problems.append(f"{label} server numeric expected LDAP result is not success")
+    if evidence.get("actual_server_result_code") != LDAP_SUCCESS:
+        problems.append(f"{label} actual server LDAP result is not success")
+    if evidence.get("server_result_code_match") is not True:
+        problems.append(f"{label} server LDAP result code does not match")
+    if evidence.get("passed") is not True:
+        problems.append(f"{label} server-result evidence did not pass")
+
+
+def _verify_background_quiet_guard(
+        evidence: Any, label: str, problems: list[str], *,
+        required: bool) -> None:
+    if not isinstance(evidence, Mapping):
+        problems.append(f"{label} background-quiet guard is missing")
+        return
+    if not required:
+        if evidence.get("status") != "not-applicable":
+            problems.append(f"{label} background-quiet guard is not N/A")
+        if evidence.get("passed") is not True:
+            problems.append(f"{label} N/A background-quiet guard did not pass")
+        return
+    if evidence.get("status") != "passed" or evidence.get("passed") is not True:
+        problems.append(f"{label} background-quiet guard did not pass")
+    if evidence.get("clock") != "CLOCK_MONOTONIC":
+        problems.append(f"{label} background-quiet guard uses the wrong clock")
+    if not isinstance(evidence.get("context"), str) or not evidence.get("context"):
+        problems.append(f"{label} background-quiet guard context is missing")
+    bucket = evidence.get("bucket")
+    start = evidence.get("start_monotonic_seconds")
+    end = evidence.get("end_monotonic_seconds")
+    boundary = evidence.get("next_boundary_monotonic_seconds")
+    deadline = evidence.get("deadline_monotonic_seconds")
+    margin = evidence.get("safety_margin_seconds")
+    if not isinstance(bucket, int) or isinstance(bucket, bool):
+        problems.append(f"{label} background-quiet bucket is invalid")
+    numeric = (start, end, boundary, deadline, margin)
+    if any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in numeric):
+        problems.append(f"{label} background-quiet timing values are invalid")
+        return
+    if not (start <= end < deadline < boundary):
+        problems.append(f"{label} background-quiet timing order is invalid")
+    if abs((boundary - deadline) - 5.0) > 1e-9 or margin != 5.0:
+        problems.append(f"{label} background-quiet safety margin is invalid")
+    if bucket != int(start // 3600) or bucket != int(end // 3600):
+        problems.append(f"{label} background-quiet bucket arithmetic is invalid")
+
+
+def _operation_background_guard(operation: Any) -> Any:
+    if not isinstance(operation, Mapping):
+        return None
+    isolation = operation.get("isolation")
+    if not isinstance(isolation, Mapping):
+        return None
+    return isolation.get("background_quiet_window")
+
+
+def _verify_dynamic_internal_scope(
+        operation: Any, label: str, problems: list[str], *,
+        allow_nested: bool) -> None:
+    isolation = (
+        operation.get("isolation") if isinstance(operation, Mapping) else None
+    )
+    internal = (
+        isolation.get("internal_server_operations")
+        if isinstance(isolation, Mapping) else None
+    )
+    if not isinstance(internal, Mapping):
+        problems.append(f"{label} internal-operation evidence is missing")
+        return
+    if internal.get("referral_monitor_line_count") != 0:
+        problems.append(f"{label} contains referral-monitor operations")
+    status = internal.get("status")
+    line_count = internal.get("line_count")
+    nested_line_count = internal.get("nested_line_count")
+    valid_counts = (
+        isinstance(line_count, int)
+        and not isinstance(line_count, bool)
+        and isinstance(nested_line_count, int)
+        and not isinstance(nested_line_count, bool)
+    )
+    if allow_nested:
+        if (
+                internal.get("allowed") is not True
+                or internal.get("required") is not False):
+            problems.append(
+                f"{label} optional nested internal-work policy is invalid"
+            )
+        if status == "not-observed":
+            if not valid_counts or line_count != 0 or nested_line_count != 0:
+                problems.append(
+                    f"{label} has inconsistent not-observed internal counts"
+                )
+        elif status == "observed-planned":
+            if (
+                    not valid_counts
+                    or nested_line_count < 1
+                    or line_count != nested_line_count):
+                problems.append(
+                    f"{label} has inconsistent observed-planned internal counts"
+                )
+        else:
+            problems.append(f"{label} has an invalid internal-work status")
+    elif (
+            status != "not-observed"
+            or internal.get("allowed") is not False
+            or internal.get("required") is not False
+            or not valid_counts
+            or line_count != 0
+            or nested_line_count != 0):
+        problems.append(f"{label} unexpectedly allowed internal work")
+
+
+def _verify_dynamic_candidate_observation(
+        operation: Any, label: str, root: Path, problems: list[str]) -> None:
+    diagnostics = (
+        operation.get("diagnostics")
+        if isinstance(operation, Mapping) else None
+    )
+    if not isinstance(diagnostics, Mapping):
+        problems.append(f"{label} candidate diagnostics are missing")
+        return
+    values = diagnostics.get("candidate_list_values")
+    if (
+            not isinstance(values, list)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                   for value in values)):
+        problems.append(f"{label} raw candidate-list traces are invalid")
+        return
+    status = diagnostics.get("candidate_list_status")
+    observed = diagnostics.get("observed_final_candidate_count")
+    observation = diagnostics.get("candidate_list_observation")
+    if values:
+        if (
+                status != "not-directly-observable-unattributed-traces"
+                or observed is not None):
+            problems.append(
+                f"{label} unattributed candidate-list evidence is inconsistent"
+            )
+        expected_parser_status = (
+            "observed" if len(values) == 1 else "ambiguous-multiple-traces"
+        )
+        if (
+                not isinstance(observation, Mapping)
+                or observation.get("status") != "not-directly-observable"
+                or observation.get("raw_trace_count") != len(values)
+                or observation.get("parser_status") != expected_parser_status
+                or not isinstance(observation.get("reason"), str)
+                or not observation.get("reason")):
+            problems.append(
+                f"{label} candidate-list unobservability is not documented"
+            )
+    elif status == "not-observed":
+        if observed is not None or observation is not None:
+            problems.append(
+                f"{label} absent candidate-list evidence is inconsistent"
+            )
+    else:
+        problems.append(f"{label} candidate-list status is invalid")
+    artifacts = operation.get("diagnostic_artifacts")
+    if not isinstance(artifacts, Mapping):
+        problems.append(f"{label} diagnostic artifact references are missing")
+        return
+    relative = artifacts.get("error_log")
+    expected_sha = artifacts.get("error_log_sha256")
+    expected_size = artifacts.get("error_log_size_bytes")
+    if (
+            not isinstance(relative, str)
+            or not isinstance(expected_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0):
+        problems.append(f"{label} error-log artifact identity is invalid")
+        return
+    unresolved = root / relative
+    resolved = unresolved.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        problems.append(f"{label} error-log artifact escapes the bundle")
+        return
+    current = unresolved
+    while current != root:
+        if current.is_symlink():
+            problems.append(f"{label} error-log artifact uses a symlink")
+            return
+        current = current.parent
+    if not resolved.is_file():
+        problems.append(f"{label} error-log artifact is missing")
+        return
+    if resolved.stat().st_size != expected_size or sha256_file(resolved) != expected_sha:
+        problems.append(f"{label} error-log artifact identity differs")
+        return
+    parsed_values = [
+        int(value) for value in CANDIDATE_TRACE_RE.findall(
+            resolved.read_text(encoding="utf-8", errors="replace")
+        )
+    ]
+    if parsed_values != values:
+        problems.append(f"{label} candidate-list traces differ from the error log")
+
+
+def _verify_background_control(
+        run_manifest: Mapping[str, Any], artifact_manifest: Mapping[str, Any],
+        *, required: bool, problems: list[str]) -> None:
+    setup = run_manifest.get("server_setup")
+    run_control = (
+        setup.get("background_referral_check_control")
+        if isinstance(setup, Mapping) else None
+    )
+    artifact_control = artifact_manifest.get(
+        "background_referral_check_control"
+    )
+    if not required:
+        if run_control is not None or artifact_control is not None:
+            problems.append("OpenLDAP unexpectedly carries a 389 DS referral control")
+        return
+    if not isinstance(run_control, Mapping):
+        problems.append("run referral-monitor control is missing")
+        return
+    if artifact_control != run_control:
+        problems.append("artifact/run referral-monitor controls differ")
+    expected = {
+        "attribute": "nsslapd-referral-check-period",
+        "requested_seconds": 3600,
+        "pre_restart_readback": "3600",
+        "post_restart_readback": "3600",
+        "final_restart_applied": True,
+        "clock": "CLOCK_MONOTONIC",
+        "interval_anchor": "kernel-monotonic-epoch",
+        "safety_margin_seconds": 5.0,
+        "evidence_status": "observed",
+        "passed": True,
+    }
+    for key, value in expected.items():
+        if run_control.get(key) != value:
+            problems.append(f"referral-monitor control {key} is invalid")
+    vattr_barrier = run_control.get("post_restart_vattr_check_barrier")
+    if not isinstance(vattr_barrier, Mapping):
+        problems.append("post-restart vattr-check barrier is missing")
+    else:
+        if (
+                vattr_barrier.get("status") != "observed-complete"
+                or vattr_barrier.get("passed") is not True):
+            problems.append("post-restart vattr-check barrier did not pass")
+        if (
+                vattr_barrier.get("source_function")
+                != VATTR_CHECK_SOURCE_FUNCTION):
+            problems.append("post-restart vattr-check source_function is invalid")
+        delay_seconds = vattr_barrier.get("delay_seconds")
+        if (
+                not isinstance(delay_seconds, int)
+                or isinstance(delay_seconds, bool)
+                or delay_seconds != VATTR_CHECK_DELAY_SECONDS):
+            problems.append("post-restart vattr-check delay_seconds is invalid")
+        if vattr_barrier.get("exact_filter") != VATTR_CHECK_FILTER:
+            problems.append("post-restart vattr-check exact_filter is invalid")
+        paired_operations = vattr_barrier.get("paired_operation_count")
+        start_lines = vattr_barrier.get("start_line_count")
+        completion_lines = vattr_barrier.get("completion_line_count")
+        unmatched_starts = vattr_barrier.get("unmatched_start_count")
+        if (
+                any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in (
+                        paired_operations, start_lines, completion_lines,
+                        unmatched_starts,
+                    )
+                )
+                or paired_operations < 1
+                or start_lines < paired_operations
+                or completion_lines < paired_operations
+                or unmatched_starts != 0):
+            problems.append(
+                "post-restart vattr-check paired-operation evidence is invalid"
+            )
+        stability_seconds = vattr_barrier.get("stability_seconds")
+        if (
+                not isinstance(stability_seconds, (int, float))
+                or isinstance(stability_seconds, bool)
+                or not math.isfinite(float(stability_seconds))
+                or float(stability_seconds)
+                < VATTR_CHECK_MINIMUM_STABILITY_SECONDS):
+            problems.append(
+                "post-restart vattr-check stability interval is invalid"
+            )
+    barrier = run_control.get("barrier")
+    if not isinstance(barrier, Mapping):
+        problems.append("referral-monitor completion barrier is missing")
+    elif (
+            barrier.get("status") != "observed-complete"
+            or not isinstance(barrier.get("paired_operation_count"), int)
+            or barrier.get("paired_operation_count", 0) < 1
+            or barrier.get("unmatched_referral_start_count") != 0):
+        problems.append("referral-monitor completion barrier is invalid")
+    access = run_control.get("access_log_internal_operation_control")
+    if not isinstance(access, Mapping) or (
+            access.get("requested") != 260
+            or access.get("post_restart_readback") != "260"
+            or access.get("internal_operation_bit_enabled") is not True
+            or access.get("passed") is not True):
+        problems.append("internal-operation access-log control is invalid")
+    quiet = run_control.get("quiet_window")
+    if not isinstance(quiet, Mapping):
+        problems.append("referral-monitor quiet-window evidence is missing")
+    else:
+        established = quiet.get("established_monotonic_seconds")
+        deadline = quiet.get("deadline_monotonic_seconds")
+        boundary = quiet.get("next_boundary_monotonic_seconds")
+        bucket = quiet.get("bucket")
+        if not all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (established, deadline, boundary)):
+            problems.append("referral-monitor quiet-window values are invalid")
+        elif not (
+                isinstance(bucket, int) and not isinstance(bucket, bool)
+                and bucket == int(established // 3600)
+                and established < deadline < boundary
+                and abs((boundary - deadline) - 5.0) <= 1e-9
+                and quiet.get("policy")
+                == "fail-collection-before-or-at-deadline"):
+            problems.append("referral-monitor quiet-window arithmetic is invalid")
+
+
+def verified_installed_artifact_identity(
+        run_manifest: Mapping[str, Any],
+        artifact_manifest: Mapping[str, Any],
+        spec: RunSpec) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a strict installed-server identity for cross-container checks."""
+    executable = artifact_manifest.get("server_executable")
+    if not isinstance(executable, Mapping):
+        raise SmokeError(f"{spec.name} server executable identity is missing")
+    expected_name = "ns-slapd" if spec.server == "389ds" else "slapd"
+    executable_path = executable.get("executable_path")
+    executable_sha = executable.get("executable_sha256")
+    build_id = executable.get("elf_build_id")
+    if (
+            executable.get("executable_name") != expected_name
+            or not isinstance(executable_path, str)
+            or not Path(executable_path).is_absolute()
+            or Path(executable_path).name != expected_name
+            or not isinstance(executable_sha, str)
+            or not SHA256_RE.fullmatch(executable_sha)
+            or not isinstance(build_id, Mapping)
+            or build_id.get("status") != "observed"
+            or not isinstance(build_id.get("value"), str)
+            or not re.fullmatch(r"[0-9a-f]+", build_id["value"])):
+        raise SmokeError(f"{spec.name} server executable identity is invalid")
+    owner = executable.get("owning_package")
+    nevra = executable.get("package_nevra")
+    if (
+            not isinstance(owner, str) or not owner.strip()
+            or not isinstance(nevra, str) or not nevra.strip()):
+        raise SmokeError(f"{spec.name} installed RPM owner/NEVRA is invalid")
+    verify = executable.get("rpm_verify")
+    if (
+            not isinstance(verify, Mapping)
+            or verify.get("accepted") is not True
+            or not isinstance(verify.get("returncode"), int)
+            or isinstance(verify.get("returncode"), bool)
+            or verify.get("returncode") != 0
+            or verify.get("stdout") != ""
+            or verify.get("stderr") != ""):
+        raise SmokeError(f"{spec.name} strict rpm -V evidence is not clean")
+    identity_hashes: dict[str, str] = {}
+    for field in (
+            "runtime_closure_sha256",
+            "backend_runtime_closure_sha256",
+            "behavioral_runtime_identity_sha256"):
+        artifact_value = artifact_manifest.get(field)
+        run_value = run_manifest.get(field)
+        if (
+                not isinstance(artifact_value, str)
+                or not SHA256_RE.fullmatch(artifact_value)
+                or run_value != artifact_value):
+            raise SmokeError(
+                f"{spec.name} artifact/run {field} identity differs"
+            )
+        identity_hashes[field] = artifact_value
+    if executable.get("runtime_closure_sha256") != identity_hashes[
+            "runtime_closure_sha256"]:
+        raise SmokeError(
+            f"{spec.name} executable runtime closure identity differs"
+        )
+    harness = artifact_manifest.get("harness_identity")
+    run_harness = run_manifest.get("harness_identity")
+    if (
+            not isinstance(harness, Mapping)
+            or not isinstance(run_harness, Mapping)
+            or harness != run_harness
+            or not isinstance(harness.get("content_sha256"), str)
+            or not SHA256_RE.fullmatch(harness["content_sha256"])):
+        raise SmokeError(f"{spec.name} harness identity is invalid or differs")
+    identity = {
+        "server": spec.server,
+        "executable_name": expected_name,
+        "executable_path": executable_path,
+        "executable_sha256": executable_sha,
+        "elf_build_id": build_id["value"],
+        "owning_package": owner,
+        "package_nevra": nevra,
+        "harness_content_sha256": harness["content_sha256"],
+        **identity_hashes,
+    }
+    return identity, {
+        "accepted": True,
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+    }
+
+
+def verify_389ds_cross_container_identity(
+        run_records: Sequence[Mapping[str, Any]],
+        container_records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    expected_bundles = {
+        spec.name for spec in RUN_SPECS if spec.server == "389ds"
+    }
+    ds_runs = {
+        str(record.get("name")): record
+        for record in run_records if record.get("server") == "389ds"
+    }
+    ds_containers = {
+        str(record.get("bundle")): record
+        for record in container_records if record.get("bundle") is not None
+    }
+    if set(ds_runs) != expected_bundles or set(ds_containers) != expected_bundles:
+        raise SmokeError("389 DS cross-container identity lacks the exact three bundles")
+    container_ids = [
+        ds_containers[name].get("id") for name in sorted(expected_bundles)
+    ]
+    container_names = [
+        ds_containers[name].get("name") for name in sorted(expected_bundles)
+    ]
+    if (
+            any(
+                not isinstance(value, str) or not value
+                for value in container_ids + container_names
+            )
+            or len(set(container_ids)) != len(expected_bundles)
+            or len(set(container_names)) != len(expected_bundles)
+            ):
+        raise SmokeError("389 DS bundles did not use three distinct containers")
+
+    runtime_identities = [
+        ds_runs[name].get("installed_artifact_identity")
+        for name in sorted(expected_bundles)
+    ]
+    rpm_verifications = [
+        ds_runs[name].get("rpm_verify") for name in sorted(expected_bundles)
+    ]
+    image_identities = [
+        ds_containers[name].get("image_identity")
+        for name in sorted(expected_bundles)
+    ]
+    nevra_sets = [
+        ds_containers[name].get("environment", {}).get("installed_nevras")
+        if isinstance(ds_containers[name].get("environment"), Mapping)
+        else None
+        for name in sorted(expected_bundles)
+    ]
+    for label, values in (
+            ("installed artifact", runtime_identities),
+            ("strict rpm -V", rpm_verifications),
+            ("container image", image_identities)):
+        if (
+                any(not isinstance(value, Mapping) for value in values)
+                or len({canonical_json_sha256(value) for value in values}) != 1):
+            raise SmokeError(f"389 DS {label} identity differs across containers")
+    if (
+            any(not isinstance(value, list) or not value for value in nevra_sets)
+            or len({canonical_json_sha256(value) for value in nevra_sets}) != 1):
+        raise SmokeError("389 DS installed NEVRA identity differs across containers")
+    clean_verify = {
+        "accepted": True, "returncode": 0, "stdout": "", "stderr": "",
+    }
+    if any(dict(value) != clean_verify for value in rpm_verifications):
+        raise SmokeError("389 DS strict rpm -V evidence is not uniformly clean")
+    image_identity = dict(image_identities[0])
+    if (
+            not isinstance(image_identity.get("container_image_id"), str)
+            or not image_identity["container_image_id"].startswith("sha256:")
+            or not isinstance(image_identity.get("configured_image"), str)
+            or not image_identity["configured_image"]):
+        raise SmokeError("389 DS container image identity is incomplete")
+    return {
+        "status": "pass",
+        "bundle_count": len(expected_bundles),
+        "bundle_names": sorted(expected_bundles),
+        "distinct_container_count": len(set(container_ids)),
+        "container_ids": container_ids,
+        "container_names": container_names,
+        "image_identity": image_identity,
+        "installed_nevras": list(nevra_sets[0]),
+        "installed_artifact_identity": dict(runtime_identities[0]),
+        "strict_rpm_verify_all_clean": True,
+    }
+
+
+def verify_result_bundle(output: Path, spec: RunSpec) -> dict[str, Any]:
+    run_manifest = load_json(output / "run-manifest.json")
+    workload_manifest = load_json(output / "workload-manifest.json")
+    copied_workload_manifest = load_json(output / "workload" / "workload-manifest.json")
+    artifact_manifest = load_json(output / "artifact-manifest.json")
+    correctness_manifest = load_json(output / "correctness.json")
+    raw_results = load_json(output / "raw-results.json")
+    problems: list[str] = []
+    if not (output / "COMPLETE").is_file() or (output / "COMPLETE").is_symlink():
+        problems.append("required COMPLETE marker is absent or invalid")
+    for marker in ("INCOMPLETE", "CLEANUP-FAILED"):
+        if (output / marker).exists() or (output / marker).is_symlink():
+            problems.append(f"result bundle retains {marker}")
+
+    for label, record in (
+        ("run-manifest", run_manifest),
+        ("workload-manifest", workload_manifest),
+        ("copied workload-manifest", copied_workload_manifest),
+        ("artifact-manifest", artifact_manifest),
+        ("correctness", correctness_manifest),
+        ("raw-results", raw_results),
+    ):
+        if record.get("correctness_only") is not True:
+            problems.append(f"{label} correctness_only is not true")
+        if record.get("release_timing_evidence") is not False:
+            problems.append(f"{label} release_timing_evidence is not false")
+        if label not in {"workload-manifest", "copied workload-manifest"} and (
+                record.get("host_class") != HOST_CLASS):
+            problems.append(f"{label} host_class is not {HOST_CLASS}")
+    workload_root = output / "workload"
+    if workload_root.is_symlink():
+        problems.append("copied workload root is a symlink")
+    try:
+        workload_root.resolve().relative_to(output.resolve())
+    except ValueError:
+        problems.append("copied workload root escapes the result bundle")
+    root_manifest_bytes = (output / "workload-manifest.json").read_bytes()
+    if (output / "workload" / "workload-manifest.json").read_bytes() != root_manifest_bytes:
+        problems.append("copied workload manifest is not byte-identical to the root copy")
+    if copied_workload_manifest != workload_manifest:
+        problems.append("copied workload manifest differs structurally from the root copy")
+    files = workload_manifest.get("files")
+    if not isinstance(files, Mapping) or not files:
+        problems.append("workload payload hash mapping is missing")
+    else:
+        for relative, expected_sha in files.items():
+            unresolved_payload = workload_root / str(relative)
+            payload = unresolved_payload.resolve()
+            try:
+                payload.relative_to(workload_root.resolve())
+            except ValueError:
+                problems.append(f"workload payload escapes the bundle: {relative}")
+                continue
+            current = unresolved_payload
+            while current != workload_root:
+                if current.is_symlink():
+                    problems.append(f"workload payload uses a symlink: {relative}")
+                    break
+                current = current.parent
+            if not payload.is_file():
+                problems.append(f"workload payload is missing: {relative}")
+            elif sha256_file(payload) != expected_sha:
+                problems.append(f"workload payload hash differs: {relative}")
+    if run_manifest.get("mode") != "correctness-only":
+        problems.append("run mode is not correctness-only")
+    if run_manifest.get("status") != "complete":
+        problems.append("run status is not complete")
+    run_id = run_manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        problems.append("run_id is missing")
+    if run_manifest.get("host_class") != HOST_CLASS:
+        problems.append(f"host_class is not {HOST_CLASS}")
+    if run_manifest.get("repeat_count") != 1 or run_manifest.get("warmup_count") != 0:
+        problems.append("runner did not preserve repeat=1/warmups=0")
+    if run_manifest.get("index_config") != spec.index_config:
+        problems.append("runner index configuration differs from its invocation")
+    if run_manifest.get("server") != spec.server:
+        problems.append("runner server differs from its invocation")
+    if run_manifest.get("lookup_mode_requested") != spec.lookup:
+        problems.append("runner requested lookup mode differs from its invocation")
+    if run_manifest.get("lookup_mode_actual") != spec.lookup:
+        problems.append("runner actual lookup mode differs from its invocation")
+    if run_manifest.get("backend_requested") != "mdb":
+        problems.append("runner requested backend is not mdb")
+    if run_manifest.get("backend_actual") != "mdb":
+        problems.append("runner actual backend is not mdb")
+    if run_manifest.get("selected_scenarios") != list(spec.scenarios):
+        problems.append("runner selected scenarios differ from the declared smoke matrix")
+    if run_manifest.get("correctness_status") != "pass":
+        problems.append("run correctness_status is not pass")
+    if artifact_manifest.get("server") != spec.server:
+        problems.append("artifact server differs from the declared smoke matrix")
+    installed_artifact_identity, rpm_verify = verified_installed_artifact_identity(
+        run_manifest, artifact_manifest, spec,
+    )
+    background_guard_required = spec.server == "389ds"
+    _verify_background_control(
+        run_manifest,
+        artifact_manifest,
+        required=background_guard_required,
+        problems=problems,
+    )
+    scenarios = workload_manifest.get("scenarios")
+    if not isinstance(scenarios, Mapping):
+        problems.append("workload scenario mapping is missing")
+        scenarios = {}
+    correctness_records = correctness_manifest.get("scenarios")
+    if not isinstance(correctness_records, list):
+        problems.append("correctness scenario records are missing")
+        correctness_records = []
+    records_by_scenario: dict[str, list[Mapping[str, Any]]] = {}
+    for index, record in enumerate(correctness_records):
+        if not isinstance(record, Mapping):
+            problems.append(f"correctness record {index} is not an object")
+            continue
+        records_by_scenario.setdefault(str(record.get("scenario")), []).append(record)
+    unexpected_correctness = sorted(
+        set(records_by_scenario).difference(spec.scenarios)
+    )
+    if unexpected_correctness:
+        problems.append(
+            "correctness records contain unselected scenarios: "
+            + ", ".join(unexpected_correctness)
+        )
+    for scenario_id in spec.scenarios:
+        declared = scenarios.get(scenario_id)
+        if not isinstance(declared, Mapping):
+            problems.append(f"workload scenario is missing: {scenario_id}")
+            continue
+        records = records_by_scenario.get(scenario_id, [])
+        if len(records) != 1:
+            problems.append(
+                f"{scenario_id} has {len(records)} correctness records; exactly one is required"
+            )
+            continue
+        record = records[0]
+        if record.get("correctness") != "pass":
+            problems.append(f"{scenario_id} correctness is not pass")
+        groups = set(declared.get("groups", []))
+        if "dynamic-list-correctness" in groups:
+            if record.get("historical_expected_failure") is not False:
+                problems.append(f"{scenario_id} unexpectedly uses a historical failure")
+            final_search = record.get("final_search")
+            if not isinstance(final_search, Mapping) or (
+                    final_search.get("operation_isolated") is not True):
+                problems.append(f"{scenario_id} final-search was not isolated")
+            _verify_exact_evidence(
+                final_search, declared, f"{scenario_id} final-search", problems
+            )
+            if isinstance(final_search, Mapping):
+                _verify_server_result(
+                    final_search.get("server_result_evidence"),
+                    f"{scenario_id} final-search", problems,
+                )
+                _verify_background_quiet_guard(
+                    _operation_background_guard(final_search),
+                    f"{scenario_id} final-search",
+                    problems,
+                    required=background_guard_required,
+                )
+                _verify_dynamic_internal_scope(
+                    final_search,
+                    f"{scenario_id} final-search",
+                    problems,
+                    allow_nested=True,
+                )
+                _verify_dynamic_candidate_observation(
+                    final_search,
+                    f"{scenario_id} final-search",
+                    output,
+                    problems,
+                )
+            dynamic = workload_manifest.get("dynamic_list")
+            if not isinstance(dynamic, Mapping):
+                problems.append(f"{scenario_id} dynamic workload metadata is missing")
+                dynamic = {}
+            stored_dns = sorted(str(dn).casefold() for dn in dynamic.get("stored_dns", []))
+            augmented_dns = sorted(
+                stored_dns + [
+                    str(dn).casefold()
+                    for dn in dynamic.get("dynamic_url_dns", [])
+                ]
+            )
+            operation_contracts = {
+                "ordinary_candidates": {
+                    "expected_count": len(stored_dns),
+                    "expected_sha256": dns_digest(stored_dns),
+                    "expected_result_code": "LDAP_SUCCESS",
+                },
+                "augmented_candidates": {
+                    "expected_count": len(augmented_dns),
+                    "expected_sha256": dns_digest(augmented_dns),
+                    "expected_result_code": "LDAP_SUCCESS",
+                },
+                "post_control_health": {
+                    "expected_count": 1,
+                    "expected_sha256": dns_digest(["dc=example,dc=com"]),
+                    "expected_result_code": "LDAP_SUCCESS",
+                },
+            }
+            for operation, operation_contract in operation_contracts.items():
+                value = record.get(operation)
+                if not isinstance(value, Mapping) or value.get("passed") is not True:
+                    problems.append(f"{scenario_id} {operation} did not pass")
+                elif value.get("operation_isolated") is not True:
+                    problems.append(f"{scenario_id} {operation} was not isolated")
+                else:
+                    _verify_exact_evidence(
+                        value, operation_contract,
+                        f"{scenario_id} {operation}", problems,
+                    )
+                    _verify_server_result(
+                        value.get("server_result_evidence"),
+                        f"{scenario_id} {operation}", problems,
+                    )
+                    _verify_background_quiet_guard(
+                        _operation_background_guard(value),
+                        f"{scenario_id} {operation}",
+                        problems,
+                        required=background_guard_required,
+                    )
+                    _verify_dynamic_internal_scope(
+                        value,
+                        f"{scenario_id} {operation}",
+                        problems,
+                        allow_nested=(operation in {
+                            "augmented_candidates", "post_control_health",
+                        }),
+                    )
+            if record.get("ldap_adminlimit_exceeded") is not False:
+                problems.append(f"{scenario_id} observed LDAP_ADMINLIMIT_EXCEEDED")
+            if record.get("mechanism_gate", {}).get("status") != "pass":
+                problems.append(f"{scenario_id} dynamic mechanism gate did not pass")
+        else:
+            flights = record.get("diagnostic_flights")
+            if not isinstance(flights, Mapping):
+                problems.append(f"{scenario_id} diagnostic flights are missing")
+                continue
+            if set(flights) != {"preflight", "postflight"}:
+                problems.append(
+                    f"{scenario_id} requires exactly preflight and postflight diagnostics"
+                )
+            for phase in ("preflight", "postflight"):
+                flight = flights.get(phase)
+                if not isinstance(flight, Mapping):
+                    problems.append(f"{scenario_id} {phase} diagnostic is missing")
+                    continue
+                if flight.get("operation_isolated") is not True:
+                    problems.append(f"{scenario_id} {phase} was not isolated")
+                _verify_exact_evidence(
+                    flight.get("exact_result"), declared,
+                    f"{scenario_id} {phase}", problems,
+                )
+                _verify_server_result(
+                    flight.get("server_result_evidence"),
+                    f"{scenario_id} {phase}", problems,
+                )
+                _verify_background_quiet_guard(
+                    _operation_background_guard(flight),
+                    f"{scenario_id} {phase}",
+                    problems,
+                    required=background_guard_required,
+                )
+                selection_probe = flight.get("selection_probe")
+                if (
+                        isinstance(selection_probe, Mapping)
+                        and selection_probe.get("evidence_status")
+                        == "observed"):
+                    _verify_background_quiet_guard(
+                        _operation_background_guard(selection_probe),
+                        f"{scenario_id} {phase} selection probe",
+                        problems,
+                        required=background_guard_required,
+                    )
+            if record.get("postflight_verified") is not True:
+                problems.append(f"{scenario_id} postflight was not verified")
+            if record.get("pre_post_mechanism_match") is not True:
+                problems.append(f"{scenario_id} pre/post mechanism evidence differs")
+
+        comparison = declared.get("cross_server_comparison")
+        approximate_required = (
+            "combined-approximate" in groups
+            or scenario_id.startswith("combined-approximate")
+        )
+        if approximate_required and not isinstance(comparison, Mapping):
+            problems.append(
+                f"{scenario_id} lacks its required approximate semantic contract"
+            )
+        if isinstance(comparison, Mapping):
+            if comparison.get("policy") != "requires-native-equivalence-preflight":
+                problems.append(f"{scenario_id} has an invalid approximate policy")
+            semantic_contract = comparison.get("semantic_contract")
+            calculated_contract_sha = (
+                hashlib.sha256(json.dumps(
+                    semantic_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")).hexdigest()
+                if isinstance(semantic_contract, Mapping) else None
+            )
+            if calculated_contract_sha != comparison.get("contract_sha256"):
+                problems.append(f"{scenario_id} approximate contract hash is invalid")
+            approximate = artifact_manifest.get("approximate_semantics_evidence")
+            if not isinstance(approximate, Mapping):
+                problems.append(f"{scenario_id} approximate semantics evidence is missing")
+            else:
+                if approximate.get("status") != "comparable":
+                    problems.append(f"{scenario_id} approximate semantics are not comparable")
+                if approximate.get("evidence_status") != "observed":
+                    problems.append(f"{scenario_id} approximate evidence was not observed")
+                if approximate.get("contract_sha256") != comparison.get("contract_sha256"):
+                    problems.append(f"{scenario_id} approximate contract hash differs")
+                required_probe_ids = comparison.get("required_probe_ids")
+                declared_probes = comparison.get("probes")
+                if not isinstance(required_probe_ids, list) or not isinstance(
+                        declared_probes, Mapping):
+                    problems.append(
+                        f"{scenario_id} approximate probe contract is incomplete"
+                    )
+                    required_probe_ids = []
+                    declared_probes = {}
+                if approximate.get("required_probe_ids") != required_probe_ids:
+                    problems.append(
+                        f"{scenario_id} observed approximate probe list differs"
+                    )
+                probe_records = approximate.get("probes")
+                records_by_probe: dict[str, list[Mapping[str, Any]]] = {}
+                if isinstance(probe_records, list):
+                    for value in probe_records:
+                        if isinstance(value, Mapping):
+                            records_by_probe.setdefault(
+                                str(value.get("probe_id")), []
+                            ).append(value)
+                else:
+                    problems.append(f"{scenario_id} approximate probe records are missing")
+                if set(records_by_probe) != set(required_probe_ids):
+                    problems.append(
+                        f"{scenario_id} approximate probe IDs differ from the contract"
+                    )
+                for probe_id in required_probe_ids:
+                    probe_contract = declared_probes.get(probe_id)
+                    records = records_by_probe.get(probe_id, [])
+                    if not isinstance(probe_contract, Mapping) or len(records) != 1:
+                        problems.append(
+                            f"{scenario_id} approximate probe {probe_id} is ambiguous"
+                        )
+                        continue
+                    probe_record = records[0]
+                    if probe_record.get("declared_probe") != dict(probe_contract):
+                        problems.append(
+                            f"{scenario_id} approximate probe {probe_id} contract differs"
+                        )
+                    if probe_record.get("operation_isolated") is not True:
+                        problems.append(
+                            f"{scenario_id} approximate probe {probe_id} was not isolated"
+                        )
+                    if probe_record.get("result_line_isolated") is not True:
+                        problems.append(
+                            f"{scenario_id} approximate probe {probe_id} "
+                            "result line is not isolated"
+                        )
+                    if probe_record.get("passed") is not True:
+                        problems.append(
+                            f"{scenario_id} approximate probe {probe_id} did not pass"
+                        )
+                    _verify_exact_evidence(
+                        probe_record.get("exact_result"), probe_contract,
+                        f"{scenario_id} approximate probe {probe_id}", problems,
+                    )
+                    _verify_server_result(
+                        probe_record.get("server_result_evidence"),
+                        f"{scenario_id} approximate probe {probe_id}", problems,
+                    )
+                    _verify_background_quiet_guard(
+                        _operation_background_guard(probe_record),
+                        f"{scenario_id} approximate probe {probe_id}",
+                        problems,
+                        required=background_guard_required,
+                    )
+    rows = raw_results.get("rows")
+    if not isinstance(rows, list):
+        problems.append("raw-results rows are missing")
+        rows = []
+    measured_by_scenario: dict[str, list[Mapping[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            problems.append(f"raw row {index} is not an object")
+            continue
+        if row.get("correctness_only") is not True:
+            problems.append(f"raw row {index} correctness_only is not true")
+        if row.get("release_timing_evidence") is not False:
+            problems.append(f"raw row {index} release_timing_evidence is not false")
+        if row.get("host_class") != HOST_CLASS:
+            problems.append(f"raw row {index} host_class is not {HOST_CLASS}")
+        if row.get("server") != spec.server:
+            problems.append(f"raw row {index} server differs from its invocation")
+        if row.get("backend") != "mdb":
+            problems.append(f"raw row {index} backend is not mdb")
+        if row.get("lookup_mode") != spec.lookup:
+            problems.append(f"raw row {index} lookup mode differs from its invocation")
+        if row.get("index_config") != spec.index_config:
+            problems.append(f"raw row {index} index configuration differs")
+        _verify_background_quiet_guard(
+            row.get("background_quiet_window"),
+            f"raw row {index}",
+            problems,
+            required=background_guard_required,
+        )
+        scenario_id = row.get("scenario")
+        if scenario_id not in spec.scenarios:
+            problems.append(f"raw row {index} names an unselected scenario")
+            continue
+        if row.get("phase") != "measured":
+            problems.append(f"raw row {index} is not a measured row")
+        declared = scenarios.get(scenario_id)
+        if isinstance(declared, Mapping):
+            variant = row.get("attribute_variant")
+            expected_attributes = (
+                NORMAL_PRIMARY_ATTRIBUTES
+                if variant == "normal-attributes"
+                else list(declared.get("requested_attributes", ["1.1"]))
+            )
+            if row.get("requested_attributes") != expected_attributes:
+                problems.append(
+                    f"raw row {index} ({scenario_id}) requested attributes differ"
+                )
+            _verify_exact_evidence(
+                row.get("exact_result"), declared,
+                f"raw row {index} ({scenario_id})", problems,
+            )
+            _verify_server_result(
+                row.get("server_result_evidence"),
+                f"raw row {index} ({scenario_id})", problems,
+            )
+        measured_by_scenario.setdefault(str(scenario_id), []).append(row)
+    for scenario_id in spec.scenarios:
+        declared = scenarios.get(scenario_id)
+        if not isinstance(declared, Mapping):
+            continue
+        groups = set(declared.get("groups", []))
+        expected_rows = (
+            0 if "dynamic-list-correctness" in groups
+            else 2 if scenario_id in {
+                "principal-with-sdn2-equality",
+                "principal-without-sdn2-equality",
+            }
+            else 1
+        )
+        observed_rows = measured_by_scenario.get(scenario_id, [])
+        if len(observed_rows) != expected_rows:
+            problems.append(
+                f"{scenario_id} has {len(observed_rows)} measured rows, "
+                f"expected {expected_rows}"
+            )
+        expected_variants = (
+            {"attrs-1.1", "normal-attributes"} if expected_rows == 2
+            else {"attrs-1.1"} if expected_rows == 1 else set()
+        )
+        actual_variants = {
+            str(row.get("attribute_variant")) for row in observed_rows
+        }
+        if actual_variants != expected_variants:
+            problems.append(
+                f"{scenario_id} measured attribute variants differ: "
+                f"{sorted(actual_variants)}"
+            )
+    if problems:
+        raise SmokeError(f"invalid correctness-only result {output}: " + "; ".join(problems))
+    return {
+        "name": spec.name,
+        "server": spec.server,
+        "lookup": spec.lookup,
+        "index_config": spec.index_config,
+        "output": str(output.resolve()),
+        "status": "pass",
+        "run_id": run_id,
+        "correctness_only": True,
+        "release_timing_evidence": False,
+        "scenario_count": len(spec.scenarios),
+        "scenarios": list(spec.scenarios),
+        "raw_rows": len(rows),
+        "installed_artifact_identity": installed_artifact_identity,
+        "rpm_verify": rpm_verify,
+    }
+
+
+def verify_merged_result_bundle(
+        output: Path, source_outputs: Sequence[Path]) -> dict[str, Any]:
+    """Prove the default merge retained only correctness-only evidence."""
+    required = (
+        output / "merged-raw-results.json",
+        output / "artifact-manifest.json",
+        output / "RESULTS.md",
+    )
+    for path in required:
+        if not path.is_file() or path.is_symlink():
+            raise SmokeError(f"merged result is missing a regular {path.name}")
+    merged = load_json(required[0])
+    artifact = load_json(required[1])
+    report = required[2].read_text(encoding="utf-8")
+    problems: list[str] = []
+    if len(source_outputs) != len(RUN_SPECS):
+        problems.append(
+            f"merged smoke has {len(source_outputs)} sources; "
+            f"expected {len(RUN_SPECS)}"
+        )
+
+    expected_sources: dict[str, dict[str, Any]] = {}
+    expected_rows = 0
+    expected_perf_batches = 0
+    expected_workload_sha: str | None = None
+    expected_manifest_sha: str | None = None
+    for source in source_outputs:
+        run_manifest = load_json(source / "run-manifest.json")
+        source_artifact = load_json(source / "artifact-manifest.json")
+        correctness = load_json(source / "correctness.json")
+        raw = load_json(source / "raw-results.json")
+        workload = load_json(source / "workload-manifest.json")
+        run_id = run_manifest.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            problems.append(f"source bundle {source} has no run_id")
+            continue
+        if run_id in expected_sources:
+            problems.append(f"source bundles reuse run_id {run_id}")
+            continue
+        rows = raw.get("rows")
+        batches = raw.get("perf_batches", [])
+        if not isinstance(rows, list) or not isinstance(batches, list):
+            problems.append(f"source bundle {run_id} has malformed raw arrays")
+            continue
+        raw_path = source / "raw-results.json"
+        expected_sources[run_id] = {
+            "artifact_manifest_sha256": canonical_json_sha256(source_artifact),
+            "run_manifest_sha256": canonical_json_sha256(run_manifest),
+            "correctness_manifest_sha256": canonical_json_sha256(correctness),
+            "raw_results_sha256": sha256_file(raw_path),
+        }
+        expected_rows += len(rows)
+        expected_perf_batches += len(batches)
+        workload_sha = workload.get("workload_sha256")
+        manifest_sha = sha256_file(source / "workload-manifest.json")
+        if expected_workload_sha is None:
+            expected_workload_sha = workload_sha
+            expected_manifest_sha = manifest_sha
+        elif (
+                workload_sha != expected_workload_sha
+                or manifest_sha != expected_manifest_sha):
+            problems.append(f"source workload identity differs for {run_id}")
+
+    expected_run_ids = list(expected_sources)
+    for label, record in (("merged raw", merged), ("merged artifact", artifact)):
+        if record.get("status") != "native-results-pending":
+            problems.append(f"{label} status is not native-results-pending")
+        if record.get("correctness_status") != "pass":
+            problems.append(f"{label} correctness_status is not pass")
+        if record.get("correctness_only") is not True:
+            problems.append(f"{label} correctness_only is not true")
+        if record.get("release_timing_evidence") is not False:
+            problems.append(f"{label} release_timing_evidence is not false")
+        if record.get("timing_claims_allowed") is not False:
+            problems.append(f"{label} timing_claims_allowed is not false")
+        if record.get("host_class") != HOST_CLASS:
+            problems.append(f"{label} host_class is not {HOST_CLASS}")
+        if record.get("source_host_classes") != [HOST_CLASS]:
+            problems.append(f"{label} source_host_classes differ")
+        if record.get("source_run_ids") != expected_run_ids:
+            problems.append(f"{label} source_run_ids differ from executed bundles")
+        if record.get("source_run_count") != len(expected_run_ids):
+            problems.append(f"{label} source_run_count differs")
+        if record.get("duplicate_bundle_count") != 0:
+            problems.append(f"{label} reports duplicate input bundles")
+        if record.get("correctness_only_evidence_present") is not True:
+            problems.append(f"{label} omits correctness-only evidence marker")
+        if record.get("validation_only_evidence_present") is not True:
+            problems.append(f"{label} omits validation-only evidence marker")
+        if record.get("nonrelease_evidence_can_satisfy_performance_gates") is not False:
+            problems.append(f"{label} permits nonrelease performance gates")
+        if record.get("matrix_completion_status") != "not-established-by-merger":
+            problems.append(f"{label} overstates matrix completion")
+
+    if merged.get("unsafe_include_nonrelease") is not False:
+        problems.append("default merge unexpectedly enabled unsafe nonrelease summaries")
+    for key in (
+            "release_summaries", "release_comparisons",
+            "openldap_contextual_comparisons", "release_scaling_tables",
+            "unsafe_nonrelease_summaries"):
+        if merged.get(key) != []:
+            problems.append(f"merged raw {key} is not empty")
+    release_array_counts = {
+        key: len(merged.get(key, []))
+        for key in (
+            "release_summaries", "release_comparisons",
+            "openldap_contextual_comparisons", "release_scaling_tables",
+            "unsafe_nonrelease_summaries",
+        )
+    }
+    rows = merged.get("rows")
+    if not isinstance(rows, list) or len(rows) != expected_rows:
+        problems.append(
+            f"merged raw row count differs: expected {expected_rows}, "
+            f"observed {len(rows) if isinstance(rows, list) else 'invalid'}"
+        )
+        rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            problems.append(f"merged row {index} is not an object")
+            continue
+        if row.get("release_eligible") is not False:
+            problems.append(f"merged row {index} became release eligible")
+        source_row = row.get("raw")
+        if not isinstance(source_row, Mapping):
+            problems.append(f"merged row {index} omits its retained raw row")
+            continue
+        if source_row.get("correctness_only") is not True:
+            problems.append(f"merged row {index} lost correctness_only=true")
+        if source_row.get("release_timing_evidence") is not False:
+            problems.append(f"merged row {index} gained release timing evidence")
+        if source_row.get("host_class") != HOST_CLASS:
+            problems.append(f"merged row {index} host class differs")
+    batches = merged.get("perf_batches")
+    if not isinstance(batches, list) or len(batches) != expected_perf_batches:
+        problems.append("merged perf-batch count differs from source bundles")
+    if expected_perf_batches != 0:
+        problems.append("OrbStack smoke unexpectedly produced perf batches")
+
+    gates = merged.get("acceptance_gate_results")
+    if not isinstance(gates, list):
+        problems.append("merged acceptance-gate results are missing")
+        gates = []
+    gate_ids = {
+        gate.get("gate_id") for gate in gates if isinstance(gate, Mapping)
+    }
+    if gate_ids != EXPECTED_ACCEPTANCE_GATES:
+        problems.append("merged acceptance-gate IDs differ from the frozen ten")
+    if merged.get("acceptance_gate_overall_status") != "pending":
+        problems.append("merged acceptance gates are not pending native evidence")
+    if any(
+            isinstance(gate, Mapping) and gate.get("status") == "fail"
+            for gate in gates):
+        problems.append("correctness smoke produced a failed acceptance gate")
+
+    if artifact.get("workload_sha256") != expected_workload_sha:
+        problems.append("merged artifact workload SHA differs")
+    if artifact.get("workload_manifest_sha256") != expected_manifest_sha:
+        problems.append("merged artifact workload-manifest SHA differs")
+    source_bundles = artifact.get("source_bundles")
+    by_run: dict[str, list[Mapping[str, Any]]] = {}
+    if isinstance(source_bundles, list):
+        for source in source_bundles:
+            if isinstance(source, Mapping):
+                by_run.setdefault(str(source.get("run_id")), []).append(source)
+    else:
+        problems.append("merged artifact source_bundles are missing")
+    if set(by_run) != set(expected_sources):
+        problems.append("merged artifact source bundle IDs differ")
+    for run_id, expected in expected_sources.items():
+        records = by_run.get(run_id, [])
+        if len(records) != 1:
+            problems.append(f"merged artifact has {len(records)} records for {run_id}")
+            continue
+        record = records[0]
+        for key, value in expected.items():
+            if record.get(key) != value:
+                problems.append(f"merged source {run_id} {key} differs")
+        if record.get("release_candidate") is not False:
+            problems.append(f"merged source {run_id} became a release candidate")
+        reasons = record.get("disposition_reasons")
+        if not isinstance(reasons, list) or not reasons:
+            problems.append(f"merged source {run_id} lacks exclusion reasons")
+
+    if "Status: **native-results-pending**" not in report:
+        problems.append("merged Markdown omits native-results-pending status")
+    if "native installed-RPM timing evidence only" not in report:
+        problems.append("merged Markdown omits native-only release authority")
+    if "NON-RELEASE / UNSAFE descriptive appendix" in report:
+        problems.append("default merged Markdown contains the unsafe appendix")
+    if problems:
+        raise SmokeError(
+            f"invalid merged correctness-only result {output}: "
+            + "; ".join(problems)
+        )
+    return {
+        "status": "pass",
+        "native_status": "native-results-pending",
+        "correctness_only": True,
+        "release_timing_evidence": False,
+        "source_run_ids": expected_run_ids,
+        "source_run_count": len(expected_run_ids),
+        "raw_rows": len(rows),
+        "acceptance_gate_overall_status": "pending",
+        "unsafe_include_nonrelease": False,
+        "release_array_counts": release_array_counts,
+        "release_eligible_row_count": sum(
+            isinstance(row, Mapping) and row.get("release_eligible") is True
+            for row in rows
+        ),
+    }
+
+
+def dry_run_plan(
+    *,
+    args: argparse.Namespace,
+    expected_sha: str,
+    host: Mapping[str, Any],
+    rpm_metadata: Mapping[str, Any],
+    output: Path,
+    workload: Path,
+) -> dict[str, Any]:
+    commands = []
+    for spec in RUN_SPECS:
+        container = (
+            f"CONTAINER_{spec.name.upper().replace('-', '_')}"
+            if spec.server == "389ds" else "CONTAINER_OPENLDAP"
+        )
+        commands.append(
+            {
+                "run": spec.name,
+                "container": container,
+                "argv": [
+                    *docker_base(host["docker"]),
+                    "exec",
+                    "--env",
+                    "LFSTUDY_EMULATED=1",
+                    container,
+                    *runner_command(spec, expected_sha=expected_sha, retain=args.retain),
+                ],
+            }
+        )
+    return {
+        "format_version": 1,
+        "kind": "large-filter-orbstack-smoke-dry-run",
+        "dry_run": True,
+        "status": "planned",
+        "mode": "correctness-only",
+        "host_class": HOST_CLASS,
+        "correctness_only": True,
+        "release_timing_evidence": False,
+        "timing_claims_allowed": False,
+        "docker_context": DOCKER_CONTEXT,
+        "container_platform": CONTAINER_PLATFORM,
+        "linux_amd64_probe": "planned; no container is created in --dry-run",
+        "expected_source_sha": expected_sha,
+        "rpm": rpm_metadata,
+        "workload": str(workload),
+        "workload_action": "use supplied workload" if args.workload else "generate smoke profile",
+        "output": str(output),
+        "retain": args.retain,
+        "container_isolation": "fresh-container-per-389ds-bundle",
+        "commands": commands,
+        "merge": {
+            "tool": "/study/bin/merge-results",
+            "inputs": [f"/results/runs/{spec.name}" for spec in RUN_SPECS],
+            "output": "/results/merged",
+            "unsafe_include_nonrelease": False,
+        },
+    }
+
+
+def default_output() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return STUDY_ROOT / "results" / f"orbstack-smoke-{stamp}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--rpm-dir",
+        type=Path,
+        default=REPOSITORY_ROOT / "dist" / "rpms",
+        help="directory containing externally built Fedora 42 389 DS RPMs",
+    )
+    parser.add_argument(
+        "--expected-source-sha",
+        help=f"40-hex RPM source revision (default: current HEAD; expected study tip {FINAL_STUDY_SHA})",
+    )
+    parser.add_argument(
+        "--workload",
+        type=Path,
+        help="existing correctness-only workload (otherwise generate --profile smoke)",
+    )
+    parser.add_argument("--output", type=Path, default=default_output())
+    parser.add_argument("--ds-image", default="quay.io/389ds/ci-images:test")
+    parser.add_argument("--openldap-image", default="fedora:42")
+    parser.add_argument(
+        "--retain",
+        action="store_true",
+        help="retain owned containers and server instances for inspection",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate host/context/RPM filenames and print the plan without mutations",
+    )
+    return parser
+
+
+def execute(args: argparse.Namespace) -> dict[str, Any]:
+    expected_sha = normalize_expected_sha(args.expected_source_sha)
+    rpm_metadata = validate_rpms(args.rpm_dir, expected_sha)
+    rpm_input_identity_sha256 = canonical_json_sha256(rpm_metadata)
+    host = host_preflight()
+    for required in (GENERATOR, RUN_STUDY, MERGE_RESULTS):
+        if not required.is_file():
+            raise SmokeError(f"required study entry point is missing: {required}")
+
+    output = args.output.resolve()
+    if output.exists():
+        raise SmokeError(f"output path already exists: {output}")
+    workload = args.workload.resolve() if args.workload else output / "workload"
+    if args.workload:
+        validate_workload(workload)
+    if args.dry_run:
+        plan = dry_run_plan(
+            args=args,
+            expected_sha=expected_sha,
+            host=host,
+            rpm_metadata=rpm_metadata,
+            output=output,
+            workload=workload,
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return plan
+
+    output.mkdir(parents=True)
+    started = utc_now()
+    run_id = f"lfsmoke-{os.getpid()}-{uuid.uuid4().hex[:10]}"
+    labels = ownership_labels(run_id)
+    containers = OwnedContainers(host["docker"], run_id, args.retain)
+    summary: dict[str, Any] = {
+        "format_version": 1,
+        "kind": "large-filter-orbstack-smoke-summary",
+        "created_at": started,
+        "status": "running",
+        "mode": "correctness-only",
+        "host_class": HOST_CLASS,
+        "correctness_only": True,
+        "release_timing_evidence": False,
+        "timing_claims_allowed": False,
+        "timing_statement": (
+            "OrbStack/Rosetta results validate correctness and artifact flow only; "
+            "they are not release timing evidence."
+        ),
+        "run_id": run_id,
+        "host": host,
+        "docker_context": DOCKER_CONTEXT,
+        "container_platform": CONTAINER_PLATFORM,
+        "ownership_labels": labels,
+        "expected_source_sha": expected_sha,
+        "rpm": rpm_metadata,
+        "rpm_input_identity_sha256": rpm_input_identity_sha256,
+        "rpm_input_revalidation": {"status": "pending", "check_count": 0},
+        "retain": args.retain,
+        "container_isolation": "fresh-container-per-389ds-bundle",
+        "runs": [],
+        "merge": {"status": "pending"},
+    }
+    failure: str | None = None
+    cleanup_errors: list[str] = []
+    try:
+        if not args.workload:
+            run_process(
+                [str(GENERATOR), "--profile", "smoke", "--output", str(workload)],
+                capture=False,
+                timeout=1800,
+            )
+        manifest = validate_workload(workload)
+        summary["workload"] = {
+            "path": str(workload),
+            "profile": manifest.get("profile"),
+            "workload_id": manifest.get("workload_id"),
+            "workload_sha256": manifest.get("workload_sha256"),
+            "generated_by_launcher": not bool(args.workload),
+            "scenario_count": len(manifest["scenarios"]),
+        }
+
+        summary["linux_amd64_probe"] = linux_amd64_probe(
+            host["docker"], args.openldap_image, labels
+        )
+        mounts = (
+            (STUDY_ROOT, "/study", True),
+            (args.rpm_dir.resolve(), "/rpms", True),
+            (workload, "/workload", True),
+            (output, "/results", False),
+        )
+        openldap_name = f"{run_id}-openldap"
+        openldap_record = containers.start(
+            name=openldap_name,
+            image=args.openldap_image,
+            mounts=mounts,
+            systemd=False,
+        )
+        openldap_record["image_identity"] = containers.inspect_image(openldap_name)
+        openldap_record["environment"] = prepare_openldap_container(
+            containers, openldap_name
+        )
+
+        completed_outputs: list[Path] = []
+        rpm_revalidation_count = 0
+        for spec in RUN_SPECS:
+            if spec.server == "389ds":
+                verified_rpm_identity = verify_rpm_inputs_unchanged(
+                    rpm_metadata, args.rpm_dir, expected_sha,
+                )
+                rpm_revalidation_count += 1
+                if verified_rpm_identity != rpm_input_identity_sha256:
+                    raise SmokeError("RPM input identity revalidation disagrees")
+                container_name = f"{run_id}-{spec.name}"
+                ds_record = containers.start(
+                    name=container_name,
+                    image=args.ds_image,
+                    mounts=mounts,
+                    systemd=True,
+                )
+                ds_record["bundle"] = spec.name
+                ds_record["image_identity"] = containers.inspect_image(
+                    container_name
+                )
+                ds_record["environment"] = prepare_389_container(
+                    containers, container_name, rpm_metadata, expected_sha
+                )
+            else:
+                container_name = openldap_name
+            containers.exec(
+                container_name,
+                runner_command(spec, expected_sha=expected_sha, retain=args.retain),
+                capture=True,
+                timeout=14400,
+                env={"LFSTUDY_EMULATED": "1"},
+            )
+            run_output = output / "runs" / spec.name
+            record = verify_result_bundle(run_output, spec)
+            summary["runs"].append(record)
+            completed_outputs.append(run_output)
+
+        verified_rpm_identity = verify_rpm_inputs_unchanged(
+            rpm_metadata, args.rpm_dir, expected_sha,
+        )
+        rpm_revalidation_count += 1
+        if verified_rpm_identity != rpm_input_identity_sha256:
+            raise SmokeError("final RPM input identity revalidation disagrees")
+        summary["rpm_input_revalidation"] = {
+            "status": "pass",
+            "check_count": rpm_revalidation_count,
+            "identity_sha256": verified_rpm_identity,
+            "checkpoints": "before-each-389ds-container-and-after-all-runs",
+        }
+        summary["ds389_cross_container_identity"] = (
+            verify_389ds_cross_container_identity(
+                summary["runs"], containers.records,
+            )
+        )
+
+        if len(completed_outputs) < 2:
+            raise SmokeError("fewer than two smoke outputs are available for merge-results")
+        merge_argv = ["python3", "/study/bin/merge-results"]
+        merge_argv.extend(f"/results/runs/{path.name}" for path in completed_outputs)
+        merge_argv.extend(["--output", "/results/merged"])
+        containers.exec(
+            openldap_name,
+            merge_argv,
+            capture=True,
+            timeout=1800,
+            env={"LFSTUDY_EMULATED": "1"},
+        )
+        merged = output / "merged"
+        merged_verification = verify_merged_result_bundle(
+            merged, completed_outputs,
+        )
+        summary["merge"] = {
+            "status": "pass",
+            "tool": "bin/merge-results",
+            "input_count": len(completed_outputs),
+            "inputs": [str(path) for path in completed_outputs],
+            "output": str(merged),
+            "unsafe_include_nonrelease": False,
+            "verification": merged_verification,
+        }
+        summary["status"] = "pass"
+    except KeyboardInterrupt:
+        failure = "interrupted"
+        summary["status"] = "failed"
+        summary["error"] = failure
+    except Exception as error:  # preserve a useful summary before returning failure
+        failure = str(error)
+        summary["status"] = "failed"
+        summary["error"] = failure
+    finally:
+        cleanup_errors = containers.cleanup()
+        summary["containers"] = containers.records
+        summary["cleanup"] = containers.cleanup_evidence
+        if cleanup_errors:
+            summary["cleanup_errors"] = cleanup_errors
+            summary["status"] = "failed"
+            failure = failure or "; ".join(cleanup_errors)
+        summary["completed_at"] = utc_now()
+        write_json(output / "smoke-summary.json", summary)
+
+    if failure:
+        raise SmokeError(
+            f"OrbStack correctness smoke failed: {failure}; summary: "
+            f"{output / 'smoke-summary.json'}"
+        )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return summary
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        execute(args)
+    except SmokeError as error:
+        parser.exit(2, f"error: {error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
