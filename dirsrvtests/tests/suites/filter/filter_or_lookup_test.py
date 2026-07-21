@@ -896,6 +896,37 @@ def test_or_acl_mixed_allowed_denied(topo, create_data):
         suffix.remove('aci', deny)
 
 
+def test_or_acl_all_denied_all_miss(topo, create_data):
+    """Verify an all-miss OR over an unindexed attribute denied to the
+    bound user returns nothing: the classic walk scores every component
+    undefined (no access), the lookup path decides non-match, and both
+    are the same empty result at the protocol boundary.
+
+    :id: 16e18b56-ab5c-437e-8673-34750cdc39a0
+    :setup: Standalone instance with 400 users, groups, and a subentry
+    :steps:
+        1. Add an aci denying l read/search to one user and bind as it
+        2. Search a 16-branch all-miss l OR
+        3. Assert parity with optional lookup disabled when available
+    :expectedresults:
+        1. Bind succeeds
+        2. No entries are returned
+        3. Optional lookup-disabled evaluation returns the same empty set
+    """
+    suffix = Domain(topo.standalone, DEFAULT_SUFFIX)
+    deny = ('(targetattr="l")(version 3.0; acl "ol deny l"; '
+            'deny (read, search, compare)'
+            f'(userdn="ldap:///{user_dn(4)}");)')
+    suffix.add('aci', deny)
+    conn = UserAccount(topo.standalone, user_dn(4)).bind(PW)
+    try:
+        filt = or_of('l', [f'ol-absent-loc-{i:02d}' for i in range(16)])
+        assert assert_parity(topo, conn, filt) == []
+    finally:
+        conn.unbind_s()
+        suffix.remove('aci', deny)
+
+
 def test_not_of_or_complement(topo, create_data):
     """Verify NOT of a large OR returns the exact complement: an absent
     assertion is defined-false so the NOT can negate it, never undefined.

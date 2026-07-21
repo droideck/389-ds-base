@@ -545,13 +545,17 @@ struct slapi_filter_or_lookup
 {
     char *ol_type;                       /* owned; the shared base attribute type T */
     int32_t ol_type_is_dn;               /* T is DN-syntax: m-guard + key validation apply */
+    int32_t ol_boolean_ctx;              /* no NOT ancestor and non-VLV operation: every
+                                          * consumer reduces this node's result to
+                                          * match/non-match, so -1 vs undefined (>0) is
+                                          * unobservable and a no-winner pass may decide */
     struct slapi_filter_or_key *ol_tab;  /* owned array, sorted by (ok_len, memcmp) */
     size_t ol_tab_len;
     struct slapi_filter **ol_rest;       /* owned array of borrowed non-hashable children */
     size_t ol_rest_len;
 };
 
-int32_t filter_or_lookup_build(struct slapi_filter *f, int32_t *largest);
+int32_t filter_or_lookup_build(struct slapi_filter *f, int32_t *largest, int32_t boolean_ctx);
 void filter_or_lookup_free(struct slapi_filter_or_lookup **ol);
 struct slapi_filter *filter_or_lookup_probe(const struct slapi_filter_or_lookup *ol,
                                             const struct berval *key);

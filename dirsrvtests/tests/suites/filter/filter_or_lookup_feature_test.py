@@ -453,7 +453,15 @@ def test_or_lookup_third_family_after_distractors(topo,
 
 
 def test_or_lookup_true_root_all_miss(topo, lookup_feature_data):
-    """Require lookup engagement for an unproxied root all-miss search.
+    """Require the all-miss fast decision for an unproxied root search.
+
+    The family attribute is unindexed, so candidate generation returns the
+    container's entries and every one reaches the per-entry filter test.
+    With the table engaged, a no-winner probe pass over a boolean-context
+    node must decide without the classic component walk: the walk emits one
+    ``test_ava_filter`` AVA line per component per entry, so an engaged
+    search with zero family AVA lines is only satisfiable by the fast
+    decision.
 
     :id: 3fd00a80-65fd-4945-b5f9-dc146ac1b3ec
     :setup: Standalone instance and an independent Directory Manager bind
@@ -462,8 +470,10 @@ def test_or_lookup_true_root_all_miss(topo, lookup_feature_data):
         2. Repeat with lookup disabled
         3. Run a base-object health search on the same connection
     :expectedresults:
-        1. LDAP success, an exact empty result, and a largest-16 summary
-        2. LDAP success, the same empty result, and no new summary
+        1. LDAP success, an exact empty result, a largest-16 summary, and no
+           family AVA evaluations in the operation window
+        2. LDAP success, the same empty result, no new summary, and the
+           classic walk's family AVA evaluations reappear
         3. The suffix entry returns exactly
     """
     inst = topo.standalone
@@ -473,25 +483,115 @@ def test_or_lookup_true_root_all_miss(topo, lookup_feature_data):
     try:
         with backend_debug_log(inst):
             before = len(eng_summaries(inst))
-            assert search_dns_result(
-                conn, filterstr, base=lookup_feature_data['base'],
-                scope=ldap.SCOPE_ONELEVEL) == []
-            summaries = eng_summaries(inst)[before:]
-            assert summaries and all(largest == 16
-                                     for _, largest in summaries)
-
-            with lookup_disabled(inst):
-                before = len(eng_summaries(inst))
+            with error_log_window(inst) as window:
                 assert search_dns_result(
                     conn, filterstr, base=lookup_feature_data['base'],
                     scope=ldap.SCOPE_ONELEVEL) == []
+            summaries = eng_summaries(inst)[before:]
+            assert summaries and all(largest == 16
+                                     for _, largest in summaries)
+            assert not [attr for attr, _ in window_avas(window['text'])
+                        if attr == 'olfeaturelookupa']
+
+            with lookup_disabled(inst):
+                before = len(eng_summaries(inst))
+                with error_log_window(inst) as window:
+                    assert search_dns_result(
+                        conn, filterstr, base=lookup_feature_data['base'],
+                        scope=ldap.SCOPE_ONELEVEL) == []
                 assert len(eng_summaries(inst)) == before
+                assert [attr for attr, _ in window_avas(window['text'])
+                        if attr == 'olfeaturelookupa']
 
         assert search_dns_result(
             conn, '(objectClass=*)', base=DEFAULT_SUFFIX,
             scope=ldap.SCOPE_BASE) == [DEFAULT_SUFFIX.lower()]
     finally:
         conn.unbind_s()
+
+
+def test_or_lookup_all_miss_under_not_falls_back(topo, lookup_feature_data):
+    """Require the classic walk for an all-miss family under NOT.
+
+    NOT keeps undefined results undefined while negating false to true, so
+    below it the -1/undefined placement is observable again and a no-winner
+    pass may not decide; the node is built without boolean context and the
+    linear walk must run.
+
+    :id: b991ad4b-13f2-4886-9204-f8e22a7e94ce
+    :setup: Standalone instance with synthetic case-ignore attributes
+    :steps:
+        1. Search the negation of a 16-branch all-miss family
+        2. Inspect the operation's engagement summary and AVA evaluations
+    :expectedresults:
+        1. Exactly the container's entries return (the complement)
+        2. The table is built, and the classic walk's family AVA
+           evaluations are present
+    """
+    inst = topo.standalone
+    base = lookup_feature_data['base']
+    dns = lookup_feature_data['dns']
+    filterstr = '(!{})'.format(escaped_or_of(
+        'olFeatureLookupA', [f'ol-not-miss-{i:02d}' for i in range(16)]))
+    expected = sorted(dns.values())
+
+    with backend_debug_log(inst):
+        before = len(eng_summaries(inst))
+        with error_log_window(inst) as window:
+            assert search_dns_result(
+                inst, filterstr, base=base,
+                scope=ldap.SCOPE_ONELEVEL) == expected
+        summaries = eng_summaries(inst)[before:]
+        assert summaries and all(largest == 16 for _, largest in summaries)
+        assert [attr for attr, _ in window_avas(window['text'])
+                if attr == 'olfeaturelookupa']
+
+
+def test_or_lookup_all_miss_rest_component_matches(topo, lookup_feature_data):
+    """Require the rest walk to decide matches after a no-winner pass.
+
+    A no-winner probe pass must still evaluate the non-family components
+    with the same access-then-match sequence as table hits, and an entry
+    matching one of them is returned without walking the family branches.
+
+    :id: 4d7fb9c3-ddce-40e3-9b81-beed18f2cd6f
+    :setup: Standalone instance with synthetic case-ignore attributes
+    :steps:
+        1. Search a 16-branch all-miss family OR one live non-family
+           equality
+        2. Inspect the operation's AVA evaluations
+        3. Repeat with lookup disabled
+    :expectedresults:
+        1. Exactly the non-family matches return
+        2. The rest component was evaluated per entry while the family
+           branches were not
+        3. The same exact result returns
+    """
+    inst = topo.standalone
+    base = lookup_feature_data['base']
+    dns = lookup_feature_data['dns']
+    filterstr = '(|{}{})'.format(
+        escaped_equalities(
+            'olFeatureLookupA', [f'ol-rest-miss-{i:02d}' for i in range(16)]),
+        '(olFeatureLookupB=b-hit)')
+    expected = sorted([dns['family-b'], dns['family-both']])
+
+    with backend_debug_log(inst):
+        before = len(eng_summaries(inst))
+        with error_log_window(inst) as window:
+            assert search_dns_result(
+                inst, filterstr, base=base,
+                scope=ldap.SCOPE_ONELEVEL) == expected
+        summaries = eng_summaries(inst)[before:]
+        assert summaries and all(largest == 16 for _, largest in summaries)
+        avas = window_avas(window['text'])
+        assert [attr for attr, _ in avas if attr == 'olfeaturelookupb']
+        assert not [attr for attr, _ in avas if attr == 'olfeaturelookupa']
+
+    with lookup_disabled(inst):
+        assert search_dns_result(
+            inst, filterstr, base=base,
+            scope=ldap.SCOPE_ONELEVEL) == expected
 
 
 if __name__ == '__main__':

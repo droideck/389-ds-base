@@ -1150,10 +1150,19 @@ vattr_test_filter_list_or(
  * test: every returned 0 has been re-verified through the same
  * per-component access-check and match calls the linear walk makes, and
  * every situation the table cannot decide exactly leaves *decided at 0
- * so the caller runs the untouched linear walk.  In particular, under
- * verify_access a no-winner outcome always falls back: unvisited
- * components carry their own access outcomes, which legitimately decide
- * -1 vs undefined (ticket 48275 semantics).
+ * so the caller runs the untouched linear walk.
+ *
+ * A no-winner pass cannot always place the result exactly within the
+ * non-match class: unvisited components carry access outcomes that
+ * legitimately decide -1 vs undefined (ticket 48275 semantics), and
+ * all-hits-undefined leaves no defined-false in hand.  When the node was
+ * built in boolean context (ol_boolean_ctx: no NOT ancestor, non-VLV
+ * operation) that placement is unobservable - every consumer reduces the
+ * result to match/non-match - so the pass decides: rest components are
+ * tested with the same access-then-match sequence as table hits, and
+ * with no winner among them the entry is a non-match (-1).  Outside
+ * boolean context the no-winner pass falls back to the linear walk
+ * exactly as before.
  */
 static int
 vattr_test_filter_or_lookup(
@@ -1287,22 +1296,36 @@ vattr_test_filter_or_lookup(
     }
 
     /* No winning component. */
-    if (verify_access) {
+    if (verify_access && !ol->ol_boolean_ctx) {
         return 0;
     }
-    if (probe_hits >= ol->ol_tab_len && !nomatch_seen) {
+    if (!ol->ol_boolean_ctx && probe_hits >= ol->ol_tab_len && !nomatch_seen) {
         /* Cannot prove an unvisited table component exists, and no
          * defined-false in hand: the -1/undefined class is unknown. */
         return 0;
     }
-    /* At least one table component is defined-false for this entry:
-     * either a confirmed non-match above, or a component whose assertion
-     * value the entry does not have (probe_hits < table size), which
-     * test_ava_filter scores -1 today.  A defined-false forces -1 unless
-     * some non-table component matches. */
+    /* Without boolean context: at least one table component is
+     * defined-false for this entry - either a confirmed non-match above,
+     * or a component whose assertion value the entry does not have
+     * (probe_hits < table size), which test_ava_filter scores -1 today -
+     * and a defined-false forces -1 unless some non-table component
+     * matches.  With boolean context the same walk decides even when the
+     * exact -1/undefined placement is unknown: no consumer can tell the
+     * two apart. */
     {
         size_t i;
         for (i = 0; i < ol->ol_rest_len; i++) {
+            if (verify_access) {
+                /* Access first, as the winner path above and the linear
+                 * walk both do: a matching component the binder cannot
+                 * read must not count as a match. */
+                rc = slapi_vattr_filter_test_ext_internal(pb, e, ol->ol_rest[i],
+                                                          verify_access, -1,
+                                                          access_check_done);
+                if (rc != 0) {
+                    continue;
+                }
+            }
             rc = slapi_vattr_filter_test_ext_internal(pb, e, ol->ol_rest[i], 0, 0,
                                                       access_check_done);
             if (rc == 0) {

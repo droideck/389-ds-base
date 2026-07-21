@@ -333,7 +333,8 @@ filter_or_lookup_free(struct slapi_filter_or_lookup **ol)
  * have paid) on success, 0 if the node does not qualify for this type.
  */
 static int32_t
-or_lookup_annotate_type(struct slapi_filter *f, const char *type, int32_t is_dn)
+or_lookup_annotate_type(struct slapi_filter *f, const char *type, int32_t is_dn,
+                        int32_t boolean_ctx)
 {
     struct slapi_filter *fc;
     struct slapi_filter_or_key *tab = NULL;
@@ -396,6 +397,7 @@ or_lookup_annotate_type(struct slapi_filter *f, const char *type, int32_t is_dn)
     ol = (struct slapi_filter_or_lookup *)slapi_ch_calloc(1, sizeof(*ol));
     ol->ol_type = slapi_ch_strdup(type);
     ol->ol_type_is_dn = is_dn;
+    ol->ol_boolean_ctx = boolean_ctx;
     ol->ol_tab = tab;
     ol->ol_tab_len = uniq + 1;
     ol->ol_rest = rest;
@@ -406,7 +408,7 @@ or_lookup_annotate_type(struct slapi_filter *f, const char *type, int32_t is_dn)
 }
 
 static int32_t
-or_lookup_annotate(struct slapi_filter *f)
+or_lookup_annotate(struct slapi_filter *f, int32_t boolean_ctx)
 {
     struct slapi_filter *fc;
     struct or_lookup_family *families = NULL;
@@ -494,7 +496,8 @@ or_lookup_annotate(struct slapi_filter *f)
     for (i = 0;
          i < n_families && families[i].usable >= FILTER_OR_LOOKUP_THRESHOLD;
          i++) {
-        k = or_lookup_annotate_type(f, families[i].type, families[i].is_dn);
+        k = or_lookup_annotate_type(f, families[i].type, families[i].is_dn,
+                                    boolean_ctx);
         if (k > 0) {
             break;
         }
@@ -509,7 +512,8 @@ done:
 }
 
 static int32_t
-or_lookup_build_recurse(struct slapi_filter *f, int32_t depth, int32_t *largest)
+or_lookup_build_recurse(struct slapi_filter *f, int32_t depth, int32_t *largest,
+                        int32_t boolean_ctx)
 {
     struct slapi_filter *fc;
     int32_t count = 0;
@@ -521,7 +525,7 @@ or_lookup_build_recurse(struct slapi_filter *f, int32_t depth, int32_t *largest)
 
     switch (f->f_choice) {
     case LDAP_FILTER_OR:
-        k = or_lookup_annotate(f);
+        k = or_lookup_annotate(f, boolean_ctx);
         if (k > 0) {
             count++;
             if (k > *largest) {
@@ -530,9 +534,15 @@ or_lookup_build_recurse(struct slapi_filter *f, int32_t depth, int32_t *largest)
         }
     /* FALLTHROUGH */
     case LDAP_FILTER_AND:
-    case LDAP_FILTER_NOT:
         for (fc = f->f_list; fc != NULL; fc = fc->f_next) {
-            count += or_lookup_build_recurse(fc, depth + 1, largest);
+            count += or_lookup_build_recurse(fc, depth + 1, largest, boolean_ctx);
+        }
+        break;
+    case LDAP_FILTER_NOT:
+        /* NOT maps -1 to 0 but keeps >0 undefined (vattr NOT handling), so
+         * below it the -1/undefined distinction is observable again. */
+        for (fc = f->f_list; fc != NULL; fc = fc->f_next) {
+            count += or_lookup_build_recurse(fc, depth + 1, largest, 0);
         }
         break;
     default:
@@ -544,13 +554,16 @@ or_lookup_build_recurse(struct slapi_filter *f, int32_t depth, int32_t *largest)
 /*
  * Annotate every qualifying OR node under f.  Returns the number of
  * annotated nodes; *largest is updated with the biggest component count
- * seen.  Caller must own f exclusively (per-operation dup).
+ * seen.  Caller must own f exclusively (per-operation dup).  boolean_ctx
+ * declares that the operation consumes the filter test as a plain
+ * match/non-match (not VLV, whose inclusion test distinguishes undefined
+ * from false); it is cleared while descending through NOT.
  */
 int32_t
-filter_or_lookup_build(struct slapi_filter *f, int32_t *largest)
+filter_or_lookup_build(struct slapi_filter *f, int32_t *largest, int32_t boolean_ctx)
 {
     if (!config_get_enable_or_filter_lookup()) {
         return 0;
     }
-    return or_lookup_build_recurse(f, 0, largest);
+    return or_lookup_build_recurse(f, 0, largest, boolean_ctx);
 }
