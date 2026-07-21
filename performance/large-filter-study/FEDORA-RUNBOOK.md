@@ -383,9 +383,21 @@ invalid off/on states. That layout writes 20 raw bundles.
 
 The defaults are 15 measured searches, two warm-ups, CPU 2, and perf/profile
 collection off, so this works on the PMU-limited Fedora VM used for the minimal
-screen. Optional overrides are `LF_REPEAT`, `LF_WARMUPS`, `LF_CPU`, `LF_PERF`,
-`LF_PROFILE`, and `LF_WORKLOAD`. For example, a host with usable counters can
-request `LF_PERF=auto LF_PROFILE=auto bin/run-full-fedora-screen`.
+screen. Optional overrides are `LF_REPEAT`, `LF_WARMUPS`, `LF_PREWARM_PASSES`,
+`LF_CPU`, `LF_PERF`, `LF_PROFILE`, and `LF_WORKLOAD`. For example, a host with
+usable counters can request `LF_PERF=auto LF_PROFILE=auto
+bin/run-full-fedora-screen`.
+
+Every warm-cache native invocation begins with a state pre-warm: after server
+setup and before any diagnostic or timed search, the runner executes
+`LF_PREWARM_PASSES` (default 3) full-database `(objectClass=*)` scans with
+`1.1` attributes. Screen states run as separate sequential invocations, so
+without the pre-warm the later states always start on a warmer host and
+same-binary comparisons inherit an order bias. The passes are recorded as
+`state_prewarm` evidence in each run manifest, never as result rows, and the
+pre-warm policy is part of the timing-environment signature, so rows produced
+under the old protocol cannot silently pool with pre-warmed rows. The cold
+cache policy is unaffected (`--prewarm` resolves to not-applicable there).
 
 Like the minimal command, this is a directional screen. Its stable-to-custom
 comparisons contain every intervening package change, and its fixed execution

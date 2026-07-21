@@ -53,9 +53,11 @@ from study.run_study import (  # noqa: E402
     perf_iteration_batches,
     profile_lookup_symbol_evidence,
     resolve_revision,
+    resolve_state_prewarm,
     run_approximate_semantics_preflight,
     run_dynamic_control,
     run_profile,
+    run_state_prewarm,
     verify_workload,
 )
 from study.revisions import (  # noqa: E402
@@ -154,6 +156,102 @@ class WorkloadBoundaryTests(unittest.TestCase):
                     encoding="utf-8"
                 ),
                 "(uid=case)\n",
+            )
+
+
+class StatePrewarmTests(unittest.TestCase):
+    class _Runtime:
+        def __init__(self, results: list[SearchResult]) -> None:
+            self.results = results
+            self.calls: list[dict[str, object]] = []
+
+        def search(self, **request: object) -> SearchResult:
+            self.calls.append(request)
+            return self.results.pop(0)
+
+    @staticmethod
+    def _result(count: int, returncode: int = 0) -> SearchResult:
+        dns = [f"uid=e{index},dc=example,dc=com" for index in range(count)]
+        return SearchResult(returncode, "", "search failed", dns)
+
+    @staticmethod
+    def _args(**overrides: object) -> SimpleNamespace:
+        values = {"prewarm": "auto", "prewarm_passes": 3, "cache_policy": "warm"}
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_executes_requested_passes_and_records_evidence(self) -> None:
+        runtime = self._Runtime(
+            [self._result(5), self._result(5), self._result(5)]
+        )
+        evidence = run_state_prewarm(
+            runtime=runtime, manifest={"entries": 5}, passes=3
+        )
+        self.assertEqual(evidence["status"], "completed")
+        self.assertEqual(evidence["policy"], "full-database-scan")
+        self.assertEqual(evidence["executed_passes"], 3)
+        self.assertEqual(
+            [record["iteration"] for record in evidence["passes"]], [1, 2, 3]
+        )
+        self.assertEqual(
+            [record["returned_count"] for record in evidence["passes"]],
+            [5, 5, 5],
+        )
+        self.assertEqual(len(runtime.calls), 3)
+        self.assertEqual(runtime.calls[0]["filter_text"], "(objectClass=*)")
+        self.assertEqual(runtime.calls[0]["scope"], "sub")
+        self.assertEqual(runtime.calls[0]["attributes"], ["1.1"])
+
+    def test_nonzero_result_code_raises(self) -> None:
+        runtime = self._Runtime([self._result(5, returncode=32)])
+        with self.assertRaisesRegex(StudyError, "LDAP result 32"):
+            run_state_prewarm(
+                runtime=runtime, manifest={"entries": 5}, passes=2
+            )
+
+    def test_short_count_raises(self) -> None:
+        runtime = self._Runtime([self._result(4)])
+        with self.assertRaisesRegex(StudyError, "below the workload minimum"):
+            run_state_prewarm(
+                runtime=runtime, manifest={"entries": 5}, passes=1
+            )
+
+    def test_missing_manifest_entry_count_raises(self) -> None:
+        runtime = self._Runtime([])
+        with self.assertRaisesRegex(StudyError, "entry count"):
+            run_state_prewarm(runtime=runtime, manifest={}, passes=1)
+
+    def test_auto_enables_only_for_warm_native_timing(self) -> None:
+        decision = resolve_state_prewarm(self._args(), mode="native-timing")
+        self.assertTrue(decision["enabled"])
+        self.assertEqual(decision["passes"], 3)
+        decision = resolve_state_prewarm(self._args(), mode="correctness-only")
+        self.assertFalse(decision["enabled"])
+        self.assertEqual(decision["status"], "not-applicable-correctness-only")
+        decision = resolve_state_prewarm(
+            self._args(cache_policy="cold"), mode="native-timing"
+        )
+        self.assertFalse(decision["enabled"])
+        self.assertEqual(decision["status"], "not-applicable-cold-cache")
+
+    def test_explicit_off_stays_disabled_for_native_timing(self) -> None:
+        decision = resolve_state_prewarm(
+            self._args(prewarm="off"), mode="native-timing"
+        )
+        self.assertFalse(decision["enabled"])
+        self.assertEqual(decision["status"], "disabled")
+
+    def test_on_with_cold_cache_is_rejected(self) -> None:
+        with self.assertRaisesRegex(StudyError, "cold"):
+            resolve_state_prewarm(
+                self._args(prewarm="on", cache_policy="cold"),
+                mode="native-timing",
+            )
+
+    def test_invalid_pass_count_is_rejected(self) -> None:
+        with self.assertRaisesRegex(StudyError, "at least 1"):
+            resolve_state_prewarm(
+                self._args(prewarm_passes=0), mode="correctness-only"
             )
 
 

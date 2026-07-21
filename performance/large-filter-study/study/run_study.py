@@ -58,6 +58,7 @@ from .revisions import (
 )
 from .server_runtime import (
     DS389Runtime,
+    SUFFIX,
     ServerRuntime,
     create_runtime,
     internal_access_lines,
@@ -66,6 +67,7 @@ from .server_runtime import (
 
 FORMAT_VERSION = 1
 NATIVE_EVIDENCE_CONTRACT_VERSION = 2
+ALLOWED_NATIVE_PREWARM_PASSES = frozenset({2, 3})
 STUDY_ROOT = Path(__file__).resolve().parents[1]
 LOOKUP_PATTERN = re.compile(
     r"OR filter equality lookup engaged: (\d+) node\(s\), largest (\d+) branches"
@@ -945,6 +947,100 @@ def mechanism_signature_material(
         "selected_family": dict(selected_family),
         "server_notes": access_result["server_notes"],
         "server_result_code": access_result["server_result_code"],
+    }
+
+
+def resolve_state_prewarm(args: argparse.Namespace, *, mode: str) -> dict[str, Any]:
+    if args.prewarm_passes < 1:
+        raise StudyError("--prewarm-passes must be at least 1")
+    if args.prewarm == "on" and args.cache_policy == "cold":
+        raise StudyError(
+            "--prewarm on contradicts --cache-policy cold: the cold policy "
+            "drops caches before every measured search"
+        )
+    enabled = args.prewarm == "on" or (
+        args.prewarm == "auto"
+        and mode == "native-timing"
+        and args.cache_policy == "warm"
+    )
+    if enabled:
+        return {"enabled": True, "status": "pending", "passes": args.prewarm_passes}
+    if args.cache_policy == "cold":
+        status = "not-applicable-cold-cache"
+    elif mode != "native-timing":
+        status = "not-applicable-correctness-only"
+    else:
+        status = "disabled"
+    return {"enabled": False, "status": status, "passes": 0}
+
+
+def run_state_prewarm(
+    *,
+    runtime: ServerRuntime,
+    manifest: Mapping[str, Any],
+    passes: int,
+) -> dict[str, Any]:
+    """Prime server and host caches with full-database scans.
+
+    Screen states run as separate sequential runner invocations, so without
+    this the later states always start on a warmer host. The scans are
+    deterministic and bundle-independent: every entry passes through the
+    entry cache, the backend's page cache, and the host file-system cache
+    before any diagnostic or timed search runs. The evidence goes to the run
+    manifest only - pre-warm passes are never result rows.
+    """
+    minimum = manifest.get("entries")
+    if not isinstance(minimum, int) or minimum < 1:
+        raise StudyError(
+            "workload manifest lacks a positive entry count for the state pre-warm"
+        )
+    records: list[dict[str, Any]] = []
+    for iteration in range(1, passes + 1):
+        started = time.monotonic_ns()
+        result = runtime.search(
+            base=SUFFIX,
+            scope="sub",
+            filter_text="(objectClass=*)",
+            attributes=["1.1"],
+        )
+        elapsed = time.monotonic_ns() - started
+        if result.returncode != 0:
+            raise StudyError(
+                f"state pre-warm pass {iteration} failed with LDAP result "
+                f"{result.returncode}: {result.stderr.strip()}"
+            )
+        if len(result.dns) < minimum:
+            raise StudyError(
+                f"state pre-warm pass {iteration} returned {len(result.dns)} "
+                f"entries, below the workload minimum {minimum}"
+            )
+        records.append({
+            "iteration": iteration,
+            "client_elapsed_ns": elapsed,
+            "returned_count": len(result.dns),
+        })
+    return {
+        "format_version": 1,
+        "status": "completed",
+        "policy": "full-database-scan",
+        "base_dn": SUFFIX,
+        "scope": "sub",
+        "filter": "(objectClass=*)",
+        "requested_attributes": ["1.1"],
+        "requested_passes": passes,
+        "executed_passes": len(records),
+        "passes": records,
+    }
+
+
+def disabled_state_prewarm(status: str) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "status": status,
+        "policy": "full-database-scan",
+        "requested_passes": 0,
+        "executed_passes": 0,
+        "passes": [],
     }
 
 
@@ -2358,6 +2454,7 @@ def declared_schedule(args: argparse.Namespace) -> dict[str, Any]:
 def run(args: argparse.Namespace, *, forced_mode: str | None = None) -> int:
     mode = forced_mode or args.mode
     correctness_only = mode == "correctness-only"
+    prewarm_decision = resolve_state_prewarm(args, mode=mode)
     if mode == "native-timing":
         enforce_native_fedora()
         host_class = "fedora_native"
@@ -2365,6 +2462,14 @@ def run(args: argparse.Namespace, *, forced_mode: str | None = None) -> int:
             raise StudyError("native timing requires at least 15 measured repeats")
         if args.warmups not in {2, 3}:
             raise StudyError("native timing requires 2 or 3 warm-ups")
+        if args.cache_policy == "warm":
+            if not prewarm_decision["enabled"]:
+                raise StudyError(
+                    "native timing with the warm cache policy requires the "
+                    "state pre-warm"
+                )
+            if prewarm_decision["passes"] not in ALLOWED_NATIVE_PREWARM_PASSES:
+                raise StudyError("native timing requires 2 or 3 pre-warm passes")
     else:
         if not args.host_class:
             raise StudyError("correctness-only mode requires --host-class")
@@ -2634,6 +2739,15 @@ def run(args: argparse.Namespace, *, forced_mode: str | None = None) -> int:
             runtime.setup_metadata.get("background_referral_check_control")
         )
         startup_memory = process_metrics(runtime.pid)
+        if prewarm_decision["enabled"]:
+            state_prewarm = run_state_prewarm(
+                runtime=runtime,
+                manifest=manifest,
+                passes=prewarm_decision["passes"],
+            )
+        else:
+            state_prewarm = disabled_state_prewarm(prewarm_decision["status"])
+        artifact["state_prewarm"] = state_prewarm
         approximate_semantics_evidence = (
             run_approximate_semantics_preflight(
                 runtime=runtime,
@@ -2717,6 +2831,11 @@ def run(args: argparse.Namespace, *, forced_mode: str | None = None) -> int:
         timing_environment_material = {
             **host_environment_material,
             "cache_policy": args.cache_policy,
+            "state_prewarm": {
+                "policy": ("full-database-scan" if prewarm_decision["enabled"]
+                           else "disabled"),
+                "passes": prewarm_decision["passes"],
+            },
             "backend": runtime.actual_backend,
             "perf_collection": args.perf,
             "profile_collection": args.profile,
@@ -3273,6 +3392,8 @@ def run(args: argparse.Namespace, *, forced_mode: str | None = None) -> int:
             "selected_scenarios": selected,
             "repeat_count": args.repeat,
             "warmup_count": args.warmups,
+            "prewarm_passes": prewarm_decision["passes"],
+            "state_prewarm": state_prewarm,
             "cache_policy": args.cache_policy,
             "connection_policy": "new-connection-per-search",
             "bind_class": "administrative",
@@ -3400,6 +3521,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=("mdb", "bdb"), default="mdb")
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument("--prewarm", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--prewarm-passes", type=int, default=3)
     parser.add_argument("--cache-policy", choices=("warm", "cold"), default="warm")
     parser.add_argument("--host-class")
     parser.add_argument("--cpu", type=int)

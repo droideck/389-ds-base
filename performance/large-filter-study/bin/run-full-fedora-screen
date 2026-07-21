@@ -51,6 +51,7 @@ runner_logs="$output/logs"
 cpu=${LF_CPU:-2}
 repeat=${LF_REPEAT:-15}
 warmups=${LF_WARMUPS:-2}
+prewarm_passes=${LF_PREWARM_PASSES:-3}
 perf=${LF_PERF:-off}
 profile=${LF_PROFILE:-off}
 
@@ -64,6 +65,10 @@ if [[ ! $repeat =~ ^[0-9]+$ ]] || (( repeat < 15 )); then
 fi
 if [[ $warmups != 2 && $warmups != 3 ]]; then
     echo "LF_WARMUPS must be 2 or 3" >&2
+    exit 2
+fi
+if [[ $prewarm_passes != 2 && $prewarm_passes != 3 ]]; then
+    echo "LF_PREWARM_PASSES must be 2 or 3" >&2
     exit 2
 fi
 if [[ $perf != auto && $perf != on && $perf != off ]]; then
@@ -232,6 +237,7 @@ run_bundle() {
                 --backend mdb \
                 --repeat "$repeat" \
                 --warmups "$warmups" \
+                --prewarm-passes "$prewarm_passes" \
                 --cache-policy warm \
                 --cpu "$cpu" \
                 --perf "$perf" \
