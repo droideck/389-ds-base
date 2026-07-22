@@ -37,6 +37,22 @@
 # expect_cap is true/false, one extra search runs with backend debug logging
 # enabled (outside the timed window) and the cap diagnostic must / must not
 # appear. Without it an S6 row would silently measure baseline-vs-baseline.
+#
+# Single-binary read-cap A/B (REPRO_CAP_ARM=on|off, requires
+# REPRO_CAP_BUILD=1): an explicit per-index nsIndexIDListScanLimit rule
+# overrides the cap, so one installed build can measure both arms.
+#   off - apply "limit=1000000 type=sub flags=AND" to every sub-indexed
+#         reproducer attribute: substring reads complete in full, i.e.
+#         exactly uncapped candidate generation. Shapes that normally
+#         engage must then show ZERO capped-read diagnostics - except the
+#         s9-not-* rungs, whose lines come from NOT components that are
+#         classified costly but never read an index; no read means nothing
+#         for the rule to override, and RESULTS.md documents that wording
+#         ("returned", not "degraded").
+#   on  - remove the rule (and verify none is present): the cap's default
+#         behavior, engagement expectations exactly as the manifest states.
+# Run the arms back to back (off, then on, or order-crossed) and compare
+# rows in results/matrix.csv by the cap_arm column.
 
 set -euo pipefail
 
@@ -53,6 +69,20 @@ die() { echo "error: $*" >&2; exit 1; }
 source "$SCRIPT_DIR/repro-common.sh"
 
 (( RUNS >= 2 )) || die "RUNS must be >= 2 (run 1 is discarded from all stats)"
+
+CAP_ARM="${REPRO_CAP_ARM:-}"
+case "$CAP_ARM" in
+    ""|on|off) ;;
+    *) die "REPRO_CAP_ARM must be unset, on, or off" ;;
+esac
+if [[ -n "$CAP_ARM" && "${REPRO_CAP_BUILD:-0}" != 1 ]]; then
+    die "REPRO_CAP_ARM A/Bs the read cap on one binary and requires REPRO_CAP_BUILD=1 (a cap-capable installed build)"
+fi
+# The override defeats capped READS; every sub-indexed attribute the shapes
+# touch carries it (cn is sub-indexed by default and s1/s3/s6/s7 use cn
+# substrings).
+CAP_ARM_RULE="limit=1000000 type=sub flags=AND"
+CAP_ARM_ATTRS="reproTitle reproDept cn"
 
 SHAPES=()
 while [[ $# -gt 0 ]]; do
@@ -150,12 +180,56 @@ EOS
     echo ">> cap engagement check ($1): expected=$3 loglines=$count OK"
 }
 
+apply_cap_arm() {  # $1 on|off: remove/apply the per-index override rule
+    docker exec -i \
+        -e PASSWORD="$PASSWORD" -e ARM="$1" -e RULE="$CAP_ARM_RULE" \
+        -e ATTRS="$CAP_ARM_ATTRS" \
+        "$NAME_389DS" bash -s <<'EOS'
+set -euo pipefail
+sea() { ldapsearch -x -H ldap://localhost:389 -D "cn=Directory Manager" -w "$PASSWORD" "$@"; }
+mod() { ldapmodify -x -H ldap://localhost:389 -D "cn=Directory Manager" -w "$PASSWORD" >/dev/null "$@"; }
+for attr in $ATTRS; do
+    dn="cn=$attr,cn=index,cn=userRoot,cn=ldbm database,cn=plugins,cn=config"
+    if [ "$ARM" = off ]; then
+        mod <<EOF
+dn: $dn
+changetype: modify
+replace: nsIndexIDListScanLimit
+nsIndexIDListScanLimit: $RULE
+EOF
+        got=$(sea -b "$dn" -s base -o ldif-wrap=no nsIndexIDListScanLimit \
+              | awk 'tolower($1)=="nsindexidlistscanlimit:" {sub(/^[^:]*: /, ""); print}')
+        if [ "$got" != "$RULE" ]; then
+            echo "cap arm off: $attr rule read-back '$got' != '$RULE'" >&2
+            exit 1
+        fi
+    else
+        mod 2>/dev/null <<EOF || true
+dn: $dn
+changetype: modify
+delete: nsIndexIDListScanLimit
+EOF
+        if sea -b "$dn" -s base -o ldif-wrap=no nsIndexIDListScanLimit \
+                | grep -qi '^nsIndexIDListScanLimit:'; then
+            echo "cap arm on: $attr still carries a scan-limit rule" >&2
+            exit 1
+        fi
+    fi
+done
+EOS
+    echo ">> cap arm $1: per-index override rule $([ "$1" = off ] && echo applied || echo absent) on: $CAP_ARM_ATTRS"
+}
+
 log_lines() {  # $1 container, $2 log path -> current line count
     docker exec "$1" bash -c "wc -l < '$2' 2>/dev/null || echo 0"
 }
 
 LOG_389=/var/log/dirsrv/slapd-repro/access
 LOG_OL=/var/log/slapd-repro.log
+
+if [[ -n "$CAP_ARM" ]]; then
+    apply_cap_arm "$CAP_ARM"
+fi
 
 for shape in "${SHAPES[@]}"; do
     ff="filter-$shape.txt"
@@ -185,12 +259,18 @@ import json
 v = json.load(open('$SCRIPT_DIR/shapes-manifest.json'))['shapes']['$shape']['expect_cap']
 print({True: 'true', False: 'false', None: 'skip'}[v])")
         if [[ "$expect" != skip ]]; then
+            if [[ "$CAP_ARM" == off && "$expect" == true && "$shape" != s9-not-* ]]; then
+                # The override rule lets every capped read complete, so the
+                # capped-read diagnostic must vanish; s9's lines come from
+                # no-read NOT classification and persist by design.
+                expect=false
+            fi
             check_cap_engagement "$shape" "$ff" "$expect"
         fi
     fi
 
     echo ">> computing stats + appending measurements.md..."
-    python3 - "$SCRIPT_DIR" "$RUNS" "$shape" <<'EOPY'
+    python3 - "$SCRIPT_DIR" "$RUNS" "$shape" "${CAP_ARM:-default}" <<'EOPY'
 import hashlib
 import json
 import re
@@ -203,6 +283,7 @@ from pathlib import Path
 repro = Path(sys.argv[1])
 runs = int(sys.argv[2])
 shape = sys.argv[3]
+cap_arm = sys.argv[4]
 results = repro / "results"
 meas = repro / "measurements.md"
 
@@ -367,6 +448,11 @@ lines = [
     f"- expectation: PASS - every run on both servers returned exactly the "
     f"{exp_count}-entry independently computed set (sorted-DN md5 {exp_md5})",
     f"- runs per cell: {runs} (run 1 discarded)",
+] + ([
+    f"- cap arm: {cap_arm} (single-binary A/B via per-index "
+    "nsIndexIDListScanLimit override; 'off' means capped reads were "
+    "defeated and candidate generation ran uncapped)",
+] if cap_arm != "default" else []) + [
     "",
     "| server | variant | client median (ms) | client min (ms) | "
     "client max (ms) | server etime median (s) | notes |",
@@ -382,7 +468,8 @@ for srv, label in (("389ds", "389-ds"), ("openldap", "OpenLDAP")):
                      f"| {smed_s} | {notes} |")
         matrix_rows.append(f"{stamp},{shape},{srv},{var.replace(' ', '')},"
                            f"{med:.1f},{smed_s},{exp_count},"
-                           f"\"{ver389 if srv == '389ds' else verol}\"")
+                           f"\"{ver389 if srv == '389ds' else verol}\","
+                           f"{cap_arm}")
 
 extras = []
 for srv, label in (("389ds", "389-ds"), ("openldap", "OpenLDAP")):
@@ -411,9 +498,21 @@ with open(meas, "a") as f:
     f.write("\n".join(lines) + "\n")
 
 matrix = results / "matrix.csv"
+matrix_header = ("stamp,shape,server,variant,client_median_ms,"
+                 "server_etime_median_s,nentries,version,cap_arm\n")
+if matrix.exists():
+    with open(matrix) as f:
+        existing_header = f.readline()
+    if existing_header != matrix_header:
+        legacy = results / "matrix-legacy.csv"
+        counter = 1
+        while legacy.exists():
+            counter += 1
+            legacy = results / f"matrix-legacy-{counter}.csv"
+        matrix.rename(legacy)
+        print(f"matrix.csv used the previous column set; moved to {legacy.name}")
 if not matrix.exists():
-    matrix.write_text("stamp,shape,server,variant,client_median_ms,"
-                      "server_etime_median_s,nentries,version\n")
+    matrix.write_text(matrix_header)
 with open(matrix, "a") as f:
     f.write("\n".join(matrix_rows) + "\n")
 
@@ -427,7 +526,8 @@ etol = srv_summary("openldap", 0)[0]
 et389_s = f"{et389:.3f}s" if et389 is not None else "n/a"
 etol_s = f"{etol:.3f}s" if etol is not None else "n/a"
 ratio_s = (f"{et389 / etol:.1f}x" if et389 is not None and etol else "n/a")
-print(f"iteration {iteration} [{shape}]: nentries={exp_count}  "
+arm_tag = "" if cap_arm == "default" else f" cap-arm={cap_arm}"
+print(f"iteration {iteration} [{shape}]{arm_tag}: nentries={exp_count}  "
       f"server etime {et389_s} vs {etol_s} (ratio {ratio_s}); "
       f"client median {med389:.1f} vs {medol:.1f} ms [attrs=1.1]")
 print(f"appended to {meas}")

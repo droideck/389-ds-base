@@ -57,6 +57,40 @@ where it must (s1, s3, s6) and does NOT appear where it must not (s2-*,
 s3b, s4-*, s5). An s6 row is only recorded if the cap provably engaged,
 so it cannot silently measure baseline-vs-baseline.
 
+The matrix above is a two-build A/B (pre-cap parent vs series build).
+The harness now also supports a single-binary A/B on one cap-capable
+build (`REPRO_CAP_ARM=on|off`): the off arm defeats the cap through an
+explicit per-index `nsIndexIDListScanLimit` override - the supported
+mechanism the cap itself honors - with flipped engagement checks proving
+each arm ran what it claims. Rows carry a `cap_arm` column.
+
+### Single-binary read-cap A/B (measured)
+
+One installed build (`3.3.0.202607212241git6aab8cbfd`, which also carries
+the OR equality-lookup fast path in both arms), same emulated host class
+as the matrix above, RUNS=6 per cell, every expectation and engagement
+gate green in both arms. Server etime medians, attrs=1.1:
+
+| Shape | off (uncapped) | on (capped) | cap effect | OpenLDAP |
+|---|---:|---:|---|---:|
+| s7-and-1 | 0.005 | 0.007 | ms-floor noise | 0.000 |
+| s7-and-4 | 0.006 | 0.005 | ms-floor noise | 0.000 |
+| s7-and-16 | 0.016 | 0.005 | 3.2x win | 0.001 |
+| s7-and-64 | 0.055 | 0.008 | 6.9x win | 0.002 |
+| s1 | 0.602 | 0.094 | 6.4x win; beats OpenLDAP | 0.132 |
+| s3 | 0.008 | 0.004 | win (near ms floor) | 0.001 |
+| s6 | 0.014 | 0.026 | honest loss, 1.9x | 0.003 |
+| s3b | 0.007 | 0.008 | parity (ms floor) | 0.001 |
+| s8-orsub-16 | 0.176 | 0.170 | parity, never engages | 0.027 |
+| s9-not-8 | 0.007 | 0.004 | parity (ms floor) | 0.000 |
+
+The uncapped arm reproduces the pre-cap baseline (s1 0.602 vs the
+committed 0.658; s7 linear growth) on one binary, eliminating the
+cross-build confound. s6's loss ratio is smaller than the two-build
+matrix's (1.9x vs 2.8x) because both arms now carry the OR lookup,
+which independently recovers part of s6. Shapes at or under ~8 ms sit
+on the etime quantization floor; their ratios are not signal.
+
 ## The union-rewrite gate: superlinear ladder, refuted attribution
 
 The planned `idl_set_union` flatten (issue #6275's suspected fix) was

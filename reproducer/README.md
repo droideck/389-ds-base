@@ -45,7 +45,7 @@ checkout's `dist/rpms` to install a baseline build through this harness.
 | `repro-common.sh` | Shared container naming + ownership-label helpers |
 | `setup-389ds.sh` | Privileged systemd container from `quay.io/389ds/ci-images:test` + local RPMs (`../dist/rpms`, or `REPRO_RPMS_DIR`); dscreate, schema, indexes, online import, reindex, index + substring preflights |
 | `setup-openldap.sh` | Container from `fedora:42`; slapd file config (mdb), schema, indexes, `slapadd -q`, slapd with stats logging, same preflights |
-| `run-benchmark.sh` | Per shape: 10 timed runs per server per variant, fatal independent-expectation gate, appends `measurements.md` + `results/matrix.csv`; `REPRO_CAP_BUILD=1` also verifies read-cap engagement per shape |
+| `run-benchmark.sh` | Per shape: 10 timed runs per server per variant, fatal independent-expectation gate, appends `measurements.md` + `results/matrix.csv`; `REPRO_CAP_BUILD=1` also verifies read-cap engagement per shape; `REPRO_CAP_ARM=on\|off` runs a single-binary read-cap A/B (see below) |
 | `RESULTS.md` | Curated, committed measurement matrix (hand-assembled from `results/matrix.csv`) |
 | `measurements.md` | Generated raw results + iteration log (do not hand-edit) |
 | `investigation-prompt.md` | Hand-off prompt for the follow-up investigation + fix work |
@@ -118,6 +118,36 @@ Each shape is emitted as its own `filter-<shape>.txt` with an independently
 computed `expected-dns-<shape>.txt`. `expect_cap` is the read-cap engagement
 expectation on a cap-capable 389-ds build (checked by `run-benchmark.sh`
 when `REPRO_CAP_BUILD=1`).
+
+### Single-binary read-cap A/B (`REPRO_CAP_ARM`)
+
+An explicit per-index `nsIndexIDListScanLimit` rule overrides the AND read
+cap, so one installed cap-capable build measures both arms - no baseline
+build needed:
+
+```bash
+REPRO_CAP_BUILD=1 REPRO_CAP_ARM=off ./run-benchmark.sh --all-shapes  # uncapped
+REPRO_CAP_BUILD=1 REPRO_CAP_ARM=on  ./run-benchmark.sh --all-shapes  # capped
+```
+
+The `off` arm applies `limit=1000000 type=sub flags=AND` to every
+sub-indexed attribute the shapes touch (`reproTitle`, `reproDept`, and the
+default-indexed `cn`) with a read-back check,
+letting every substring read complete in full - exactly uncapped candidate
+generation; the `on` arm removes the rule and verifies none is present.
+Engagement checks flip accordingly in the `off` arm: normally-capped shapes
+must log ZERO capped-read diagnostics, except `s9-not-*`, whose lines come
+from NOT components that are classified costly but never read an index, so
+there is no read for the rule to override. Every `measurements.md`
+iteration and `results/matrix.csv` row carries a `cap_arm` column
+(`default` when the variable is unset); compare arms by that column. Read
+the cap's benefit from `s7-and-*` (isolation ladder) and `s1`, and its
+honest loss from `s6`.
+
+The rule persists in the instance until the `on` arm removes it, so finish
+an A/B with the `on` arm before any unarmored run. A stale rule cannot
+poison `REPRO_CAP_BUILD=1` runs silently - the engagement gate dies when a
+normally-capped shape shows no diagnostic - but plain runs do not check.
 
 | Shape | Filter | Purpose | expect_cap |
 |---|---|---|---|
