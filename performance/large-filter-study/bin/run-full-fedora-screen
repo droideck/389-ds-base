@@ -739,6 +739,10 @@ def percent(value):
     return "n/a" if value is None else f"{value:.1f}%"
 
 
+def times(value):
+    return "n/a" if value is None else f"{value:.2f}x"
+
+
 def markdown(value):
     return str(value).replace("|", "\\|").replace("\n", " ")
 
@@ -779,14 +783,30 @@ with report_path.open("w") as stream:
             f"- {state}: `{next(iter(binary_hashes[state]))}` "
             f"({len(build_labels[state])} bundle labels)\n"
         )
+    if openldap_included:
+        stream.write(
+            "- OpenLDAP columns are contextual (packaged server, unavoidable "
+            "implementation differences, never release evidence): x-ratios "
+            "divide the 389 DS state's elapsed median by OpenLDAP's; above "
+            "1.00x means 389 DS was slower\n"
+        )
     stream.write("\n## Per-filter results\n\n")
     if custom_lookup_layout == "toggle":
-        stream.write(
-            "| Index | Scenario | Attributes | Short filter structure | "
-            "stable elapsed/CPU | custom-off elapsed/CPU | custom-on elapsed/CPU | "
-            "stable -> off benefit | off -> on benefit |\n"
+        header = "| Index | Scenario | Attributes | Short filter structure | "
+        rule = "|---|---|---|---|"
+        if openldap_included:
+            header += "openldap elapsed/CPU | "
+            rule += "---:|"
+        header += (
+            "stable elapsed/CPU | custom-off elapsed/CPU | "
+            "custom-on elapsed/CPU | stable -> off benefit | "
+            "off -> on benefit |"
         )
-        stream.write("|---|---|---|---|---:|---:|---:|---:|---:|\n")
+        rule += "---:|---:|---:|---:|---:|"
+        if openldap_included:
+            header += " off/OL | on/OL |"
+            rule += "---:|---:|"
+        stream.write(header + "\n" + rule + "\n")
         for index, scenario, attrs in strata:
             stable = metrics["stable", index, scenario, attrs]
             off = metrics["custom-off", index, scenario, attrs]
@@ -799,20 +819,39 @@ with report_path.open("w") as stream:
                 f"{percent(benefit(off['elapsed'], on['elapsed']))} / "
                 f"{percent(benefit(off['cpu'], on['cpu']))}"
             )
-            stream.write(
+            row = (
                 f"| {markdown(index)} | {markdown(scenario)} | {markdown(attrs)} | "
                 f"{markdown(descriptions[scenario])} | "
+            )
+            if openldap_included:
+                ol = metrics["openldap", index, scenario, attrs]
+                row += f"{number(ol['elapsed'])} / {number(ol['cpu'])} | "
+            row += (
                 f"{number(stable['elapsed'])} / {number(stable['cpu'])} | "
                 f"{number(off['elapsed'])} / {number(off['cpu'])} | "
                 f"{number(on['elapsed'])} / {number(on['cpu'])} | "
-                f"{stable_off} | {off_on} |\n"
+                f"{stable_off} | {off_on} |"
             )
+            if openldap_included:
+                row += (
+                    f" {times(ratio(off['elapsed'], ol['elapsed']))} |"
+                    f" {times(ratio(on['elapsed'], ol['elapsed']))} |"
+                )
+            stream.write(row + "\n")
     else:
-        stream.write(
+        header = (
             "| Index | Scenario | Attributes | Short filter structure | "
-            "stable elapsed/CPU | custom elapsed/CPU | benefit |\n"
         )
-        stream.write("|---|---|---|---|---:|---:|---:|\n")
+        rule = "|---|---|---|---|"
+        if openldap_included:
+            header += "openldap elapsed/CPU | "
+            rule += "---:|"
+        header += "stable elapsed/CPU | custom elapsed/CPU | benefit |"
+        rule += "---:|---:|---:|"
+        if openldap_included:
+            header += " custom/OL |"
+            rule += "---:|"
+        stream.write(header + "\n" + rule + "\n")
         for index, scenario, attrs in strata:
             stable = metrics["stable", index, scenario, attrs]
             custom = metrics["custom-unsupported", index, scenario, attrs]
@@ -820,43 +859,89 @@ with report_path.open("w") as stream:
                 f"{percent(benefit(stable['elapsed'], custom['elapsed']))} / "
                 f"{percent(benefit(stable['cpu'], custom['cpu']))}"
             )
-            stream.write(
+            row = (
                 f"| {markdown(index)} | {markdown(scenario)} | {markdown(attrs)} | "
                 f"{markdown(descriptions[scenario])} | "
+            )
+            if openldap_included:
+                ol = metrics["openldap", index, scenario, attrs]
+                row += f"{number(ol['elapsed'])} / {number(ol['cpu'])} | "
+            row += (
                 f"{number(stable['elapsed'])} / {number(stable['cpu'])} | "
                 f"{number(custom['elapsed'])} / {number(custom['cpu'])} | "
-                f"{change} |\n"
+                f"{change} |"
             )
+            if openldap_included:
+                row += f" {times(ratio(custom['elapsed'], ol['elapsed']))} |"
+            stream.write(row + "\n")
     stream.write(
         "\nEach elapsed/CPU cell is the median in seconds. Nearest-rank p95, "
-        "server etime, RSS, and high-water values are retained in `summary.csv`.\n"
+        "server etime, RSS, and high-water values are retained in `summary.csv`."
     )
     if openldap_included:
-        stream.write("\n## OpenLDAP context (not release evidence)\n\n")
         stream.write(
-            "Packaged OpenLDAP over the same generated data and index intent. "
-            "Cross-server differences are unavoidable implementation "
-            "differences, so this section reports medians and ratios, never "
-            f"benefit percentages. Ratios divide {custom_reference_state} by "
-            "openldap: values above 1.0 mean 389 DS used more time/CPU.\n\n"
+            " Per-scenario OpenLDAP CPU ratios are retained in "
+            "`openldap-context.csv`."
         )
-        stream.write(
-            "| Index | Scenario | Attributes | openldap elapsed/CPU | "
-            f"{custom_reference_state} elapsed/CPU | elapsed ratio | "
-            "CPU ratio |\n"
-        )
-        stream.write("|---|---|---|---:|---:|---:|---:|\n")
-        for index, scenario, attrs in strata:
-            ol = metrics["openldap", index, scenario, attrs]
-            ref = metrics[custom_reference_state, index, scenario, attrs]
-            stream.write(
-                f"| {markdown(index)} | {markdown(scenario)} | "
-                f"{markdown(attrs)} | "
-                f"{number(ol['elapsed'])} / {number(ol['cpu'])} | "
-                f"{number(ref['elapsed'])} / {number(ref['cpu'])} | "
-                f"{number(ratio(ref['elapsed'], ol['elapsed']), 3)} | "
-                f"{number(ratio(ref['cpu'], ol['cpu']), 3)} |\n"
+    stream.write("\n\n## Scenario reference\n\n")
+    stream.write(
+        "All states share one generated dataset: 100,000 person entries under "
+        "a single suffix plus small structural containers. Each scenario "
+        "selects a disjoint entry cohort whose attribute values make exactly "
+        "the intended filter branches live. Attribute roles and baseline "
+        "index intent: `sString1/2/3` select the outer cohort by equality "
+        "(eq); `sString4` guards the complex fallback (eq); `sDN1` carries "
+        "the large DN-syntax OR family and `sDN2` the simple DN fallback "
+        "(both eq; presence added only in the `presence-*` index variants, "
+        "equality removed in the `without-*-equality` variants); `sSub` is "
+        "the substring component (eq,sub); `sApprox` the approximate "
+        "component (eq,approx). The primary shape is\n"
+        "`(&(three outer equalities)(|(N x (sDN1=DN))(sDN2=DN)"
+        "(&(sString4=guard)(!(sDN1=*))(!(sDN2=*)))))`\n"
+        "- about 42 KB at N=355; the other scenarios permute, decompose, or "
+        "rescale this shape (each row's structure column above says how). "
+        "The assertion columns below count the DN-family branches: total, "
+        "live (a matching entry exists), absent (no match in the data), "
+        "duplicates; `+I` marks invalid DN assertions kept in the classic "
+        "evaluator remainder. Outer cohort is the entry count selected by "
+        "the outer equalities (the candidate load the filter test must "
+        "process); values/entry is how many relevant attribute values each "
+        "cohort entry carries.\n\n"
+    )
+    stream.write(
+        "| Scenario | Groups | Filter bytes | Nodes/leaves | "
+        "sDN1 assertions | DN mode | Outer cohort | Values/entry | "
+        "sDN2 branch | Expected |\n"
+    )
+    stream.write("|---|---|---:|---|---|---|---:|---:|---|---:|\n")
+    for scenario in sorted({name for _, name, _ in strata}):
+        value = manifest["scenarios"][scenario]
+        counts = value.get("assertion_counts") or {}
+        assertions = "-"
+        if counts.get("total"):
+            assertions = (
+                f"{counts['total']} (L{counts.get('live', 0)}/"
+                f"A{counts.get('absent', 0)}/D{counts.get('duplicates', 0)}"
             )
+            assertions += (
+                f"/I{counts['invalid']})" if counts.get("invalid") else ")"
+            )
+        dn_mode = value.get("dn_mode") or "-"
+        if dn_mode == "not-applicable":
+            dn_mode = "-"
+        cohort = value.get("logical_outer_cohort_count")
+        per_entry = value.get("relevant_values_per_entry") or 0
+        stream.write(
+            f"| {markdown(scenario)} | "
+            f"{markdown(', '.join(value.get('groups', [])))} | "
+            f"{value.get('rendered_bytes', 0)} | "
+            f"{value['node_count']}/{value['branch_count']} | "
+            f"{assertions} | {markdown(dn_mode)} | "
+            f"{cohort if cohort is not None else '-'} | "
+            f"{per_entry if per_entry else '-'} | "
+            f"{'yes' if value.get('simple_sdn2_branch') else '-'} | "
+            f"{value['expected_count']} |\n"
+        )
 
 screen_summary = {
     "format_version": 1,
