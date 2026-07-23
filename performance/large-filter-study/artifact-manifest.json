@@ -1,0 +1,188 @@
+{
+  "binary_deduplication": {
+    "expected_equivalences": [
+      {
+        "basis": "The production and legacy reproducer trees are identical at these two commits; the installed executable SHA-256 must still confirm the equivalence.",
+        "labels": [
+          "initial-or-lookup",
+          "historical-tests"
+        ]
+      },
+      {
+        "basis": "The two lifecycle-test commits do not change the server production tree from dominant-family-ranking; the installed executable SHA-256 must still confirm the equivalence.",
+        "labels": [
+          "dominant-family-ranking",
+          "lifecycle-leak-tests",
+          "asan-inline-reporting"
+        ]
+      }
+    ],
+    "identity_field": "installed server executable SHA-256 for aliases; behavioral runtime identity SHA-256 for performance pooling",
+    "policy": "An identical installed server executable SHA-256 makes commit/build labels executable aliases, so aliases are never presented as independent binaries. Performance rows may be pooled only when the content-derived direct-linked runtime closure and live backend-module closure also produce the same behavioral runtime identity SHA-256; that identity hashes runtime_closure_sha256 plus backend_runtime_closure_sha256. Preserve RPM ownership, NEVRA, build ID, and every commit/build label as provenance. Only an exact 40-hex package source token independently proves the asserted revision; a short git prefix is corroboration plus an operator assertion, and a source-tree expectation is not a measured identity.",
+    "recorded_executable_hashes": []
+  },
+  "format_version": 1,
+  "production_equivalent_revisions": {
+    "fa3987d01209bc60f599dda70ad4e5734ebc78c2": "e0161d0e61d0cdef22175418f0d4a1e126216a86"
+  },
+  "history": {
+    "active_series": {
+      "ancestry": [
+        "6e1e933745313622593d943e983ff710de8db732",
+        "72f489233e90688a18c11a3c71d42cc812e13fe9",
+        "fde13723bfa682526bb472baa91ff0d5f1b4af47",
+        "7c0b4f65637627be53ecc0b4d52bc9f8ec6f3bf6",
+        "038b8f58a305c1650ab0523a9d2658aabbc9848b",
+        "09f92bfbe67f8769277e4e4ae5fef5cf069d71f4",
+        "9c23a6e424ae4917a2fbf9e5815a9c517b6cf36a",
+        "014fe6a3793898b508a6d6de9893937a7e1aa49d",
+        "f29a3c6806c81d1cc0e5b77520b3b8d4b3d5d873",
+        "e0161d0e61d0cdef22175418f0d4a1e126216a86"
+      ],
+      "base": "6e1e933745313622593d943e983ff710de8db732",
+      "head": "e0161d0e61d0cdef22175418f0d4a1e126216a86"
+    },
+    "historical_fork": {
+      "ancestry": [
+        "6e1e933745313622593d943e983ff710de8db732",
+        "b7dd8311aa5b47bd40b88fe92af4f4e8562ede7c",
+        "91ce4718458b6c18708345729c41f230eafddd8a",
+        "117c5dcdbb08247a62268ebe863230aac365eab2",
+        "2d4904eebfbafb2037e1810cbc5ef094551aa26d",
+        "c73f4ea55a7c5dece94598f3e8265c13301e09f4",
+        "f20f918281e08bcbfb5e8c3c5bed6722767167fd",
+        "dd7d0db1a45a417f9c1546002758c25ca6e120d6"
+      ],
+      "fork_point": "6e1e933745313622593d943e983ff710de8db732",
+      "head": "dd7d0db1a45a417f9c1546002758c25ca6e120d6",
+      "relationship": "sibling history; dd7d0db1 is not an ancestor of the active series"
+    }
+  },
+  "manifest_kind": "large-filter-study-revision-plan",
+  "revision_roles": {
+    "all-family-fix": "09f92bfbe67f8769277e4e4ae5fef5cf069d71f4",
+    "asan-harness": "f29a3c6806c81d1cc0e5b77520b3b8d4b3d5d873",
+    "bounded-feature": "fde13723bfa682526bb472baa91ff0d5f1b4af47",
+    "combined-diagnostic": "7c0b4f65637627be53ecc0b4d52bc9f8ec6f3bf6",
+    "dynamic-list-fix": "038b8f58a305c1650ab0523a9d2658aabbc9848b",
+    "final": "e0161d0e61d0cdef22175418f0d4a1e126216a86",
+    "final-study-tip": "fa3987d01209bc60f599dda70ad4e5734ebc78c2",
+    "historical": "dd7d0db1a45a417f9c1546002758c25ca6e120d6",
+    "largest-family-fix": "9c23a6e424ae4917a2fbf9e5815a9c517b6cf36a",
+    "lifecycle-tests": "014fe6a3793898b508a6d6de9893937a7e1aa49d",
+    "modern-harness": "72f489233e90688a18c11a3c71d42cc812e13fe9",
+    "pre-series": "6e1e933745313622593d943e983ff710de8db732"
+  },
+  "revisions": [
+    {
+      "commit": "6e1e933745313622593d943e983ff710de8db732",
+      "label": "pre-series",
+      "purpose": "Unmodified reference immediately before either large-filter series branch.",
+      "role": "reference"
+    },
+    {
+      "commit": "72f489233e90688a18c11a3c71d42cc812e13fe9",
+      "label": "study-harness",
+      "purpose": "Adds the original reproducer and benchmark harness without a server optimization.",
+      "role": "reference"
+    },
+    {
+      "commit": "fde13723bfa682526bb472baa91ff0d5f1b4af47",
+      "label": "bounded-and-read",
+      "purpose": "Caps costly substring and approximate index reads after an AND has a small bound; also contains the NOT-first ownership correction.",
+      "role": "fix"
+    },
+    {
+      "commit": "7c0b4f65637627be53ecc0b4d52bc9f8ec6f3bf6",
+      "label": "initial-or-lookup",
+      "purpose": "Adds the per-operation lookup for eligible large same-attribute equality OR filters.",
+      "role": "fix"
+    },
+    {
+      "commit": "038b8f58a305c1650ab0523a9d2658aabbc9848b",
+      "label": "dynamic-candidate-safety",
+      "purpose": "Declines the bounded-read heuristic when dynamic-list candidate augmentation would invalidate its lookthrough assumption.",
+      "role": "fix"
+    },
+    {
+      "commit": "09f92bfbe67f8769277e4e4ae5fef5cf069d71f4",
+      "label": "all-family-discovery",
+      "purpose": "Discovers every plausible equality family instead of considering only the first two.",
+      "role": "fix"
+    },
+    {
+      "commit": "9c23a6e424ae4917a2fbf9e5815a9c517b6cf36a",
+      "label": "dominant-family-ranking",
+      "purpose": "Ranks eligible equality families and selects the largest buildable family with deterministic tie-breaking.",
+      "role": "fix"
+    },
+    {
+      "commit": "014fe6a3793898b508a6d6de9893937a7e1aa49d",
+      "label": "lifecycle-leak-tests",
+      "purpose": "Adds full-lifecycle sanitizer coverage; no server production change relative to dominant-family-ranking.",
+      "role": "validation"
+    },
+    {
+      "commit": "f29a3c6806c81d1cc0e5b77520b3b8d4b3d5d873",
+      "label": "asan-inline-reporting",
+      "purpose": "Hardens optimized/inlined ASan report classification; no server production change relative to dominant-family-ranking.",
+      "role": "validation"
+    },
+    {
+      "commit": "e0161d0e61d0cdef22175418f0d4a1e126216a86",
+      "label": "candidate-abort-ownership",
+      "purpose": "Frees unconsumed ordinary and complement ID lists on candidate-generation abort paths.",
+      "role": "fix"
+    },
+    {
+      "analysis_role": "final",
+      "commit": "fa3987d01209bc60f599dda70ad4e5734ebc78c2",
+      "label": "final-study-tip",
+      "production_equivalent_revision": "e0161d0e61d0cdef22175418f0d4a1e126216a86",
+      "purpose": "Adds only performance/large-filter-study on top of the final production revision. Preserve fa3987d0 as RPM source provenance while applying the e0161d0e final mechanism contracts.",
+      "role": "study"
+    },
+    {
+      "commit": "b7dd8311aa5b47bd40b88fe92af4f4e8562ede7c",
+      "label": "historical-harness",
+      "purpose": "Historical sibling's original reproducer and benchmark harness.",
+      "role": "historical-reference"
+    },
+    {
+      "commit": "91ce4718458b6c18708345729c41f230eafddd8a",
+      "label": "historical-not-first-ownership",
+      "purpose": "Historical sibling's latent NOT-first double-free correction.",
+      "role": "historical-fix"
+    },
+    {
+      "commit": "117c5dcdbb08247a62268ebe863230aac365eab2",
+      "label": "historical-bounded-and-read",
+      "purpose": "Historical sibling's bounded substring/approximate read change.",
+      "role": "historical-fix"
+    },
+    {
+      "commit": "2d4904eebfbafb2037e1810cbc5ef094551aa26d",
+      "label": "historical-or-union-tests",
+      "purpose": "Adds OR-union result-correctness coverage without the equality-OR lookup optimization.",
+      "role": "historical-validation"
+    },
+    {
+      "commit": "c73f4ea55a7c5dece94598f3e8265c13301e09f4",
+      "label": "historical-initial-or-lookup",
+      "purpose": "Historical sibling's initial equality-OR lookup implementation.",
+      "role": "historical-fix"
+    },
+    {
+      "commit": "f20f918281e08bcbfb5e8c3c5bed6722767167fd",
+      "label": "historical-docs",
+      "purpose": "Documentation-only historical commit.",
+      "role": "historical-validation"
+    },
+    {
+      "commit": "dd7d0db1a45a417f9c1546002758c25ca6e120d6",
+      "label": "historical-tests",
+      "purpose": "Adds functional and ownership tests on the historical sibling; production and reproducer trees match initial-or-lookup.",
+      "role": "historical-validation"
+    }
+  ]
+}

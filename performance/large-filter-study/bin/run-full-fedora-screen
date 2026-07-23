@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# Run every timed scenario against packaged OpenLDAP on the same generated
+# data, then the already installed custom 389 DS git RPM, then Fedora stable
+# after one dnf downgrade.  Custom builds containing the OR lookup switch are
+# measured off/on; builds without it are measured once as unsupported.
+# This script never builds or stages an RPM.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: run-full-fedora-screen [OUTPUT_DIRECTORY]
+
+Runs the full 116-scenario timed matrix back to back for: packaged OpenLDAP
+over the same generated data (contextual comparison, skippable), the installed
+custom 389 DS git RPM, and Fedora stable after one dnf downgrade. If the
+custom source contains the OR lookup switch, it runs the identical custom
+binary with lookup off and on. If the switch was reverted, it runs that custom
+binary once as unsupported.
+
+Rerunning with the same output directory skips matching complete bundles.
+Incomplete bundles are archived, and referral-boundary failures are retried once.
+
+The two dynamic-list scenarios are correctness-only and are not part of the
+timed comparison matrix.
+
+Optional environment variables:
+  LF_EXPECTED_SOURCE expected custom source commit; when set, the installed
+                     RPM's embedded git hash must match or the run aborts
+                     before any state (unset: recorded with a warning only)
+  LF_WORKLOAD        generated full workload directory
+  LF_CPU             pinned CPU (default: 2)
+  LF_REPEAT          measured searches per stratum (default: 15; minimum: 15)
+  LF_WARMUPS         warm-ups per stratum (default: 2; allowed: 2 or 3)
+  LF_PREWARM_PASSES  state pre-warm scans per invocation (default: 3; 2 or 3)
+  LF_OPENLDAP        on or off: packaged-OpenLDAP context state (default: on)
+  LF_PERF            auto, on, or off (default: off)
+  LF_PROFILE         auto, on, or off (default: off)
+EOF
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    usage
+    exit 0
+fi
+if (( $# > 1 )); then
+    usage >&2
+    exit 2
+fi
+
+study_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(git -C "$study_root" rev-parse --show-toplevel)
+workload=${LF_WORKLOAD:-/mnt/tests/large-filter-workload-full}
+output=${1:-/mnt/tests/large-filter-full-screen-$(date -u +%Y%m%dT%H%M%SZ)}
+results="$output/results"
+incomplete="$output/incomplete"
+runner_logs="$output/logs"
+
+cpu=${LF_CPU:-2}
+repeat=${LF_REPEAT:-15}
+warmups=${LF_WARMUPS:-2}
+prewarm_passes=${LF_PREWARM_PASSES:-3}
+lf_openldap=${LF_OPENLDAP:-on}
+perf=${LF_PERF:-off}
+profile=${LF_PROFILE:-off}
+
+if [[ ! $cpu =~ ^[0-9]+$ ]]; then
+    echo "LF_CPU must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! $repeat =~ ^[0-9]+$ ]] || (( repeat < 15 )); then
+    echo "LF_REPEAT must be an integer of at least 15" >&2
+    exit 2
+fi
+if [[ $warmups != 2 && $warmups != 3 ]]; then
+    echo "LF_WARMUPS must be 2 or 3" >&2
+    exit 2
+fi
+if [[ $prewarm_passes != 2 && $prewarm_passes != 3 ]]; then
+    echo "LF_PREWARM_PASSES must be 2 or 3" >&2
+    exit 2
+fi
+if [[ $lf_openldap != on && $lf_openldap != off ]]; then
+    echo "LF_OPENLDAP must be on or off" >&2
+    exit 2
+fi
+if [[ $perf != auto && $perf != on && $perf != off ]]; then
+    echo "LF_PERF must be auto, on, or off" >&2
+    exit 2
+fi
+if [[ $profile != auto && $profile != on && $profile != off ]]; then
+    echo "LF_PROFILE must be auto, on, or off" >&2
+    exit 2
+fi
+
+packages=(
+    389-ds-base
+    389-ds-base-libs
+    389-ds-base-robdb-libs
+    python3-lib389
+)
+
+custom_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $custom_vr =~ git([[:xdigit:]]{7,40}) ]]; then
+    custom_token=${BASH_REMATCH[1],,}
+else
+    echo "installed 389-ds-base has no git hash; custom build required" >&2
+    exit 1
+fi
+if ! custom_sha=$(git -C "$repo_root" rev-parse --verify "${custom_token}^{commit}"); then
+    echo "installed RPM git hash $custom_token is absent from this repository" >&2
+    exit 1
+fi
+if git -C "$repo_root" grep -q \
+        CONFIG_ENABLE_OR_FILTER_LOOKUP "$custom_sha" -- \
+        ldap/servers/slapd/libglobs.c; then
+    custom_lookup_layout=toggle
+else
+    custom_lookup_layout=unsupported
+fi
+
+assert_package_set() {
+    local expected=$1
+    local package actual
+
+    for package in "${packages[@]}"; do
+        actual=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package")
+        if [[ $actual != "$expected" ]]; then
+            echo "mixed packages: $package is $actual, expected $expected" >&2
+            exit 1
+        fi
+    done
+}
+
+assert_package_set "$custom_vr"
+
+openldap_vr=""
+if [[ $lf_openldap == on ]]; then
+    if ! openldap_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' openldap-servers); then
+        echo "LF_OPENLDAP=on requires the packaged openldap-servers RPM" >&2
+        exit 1
+    fi
+    if ! rpm -q openldap-clients >/dev/null; then
+        echo "LF_OPENLDAP=on requires the packaged openldap-clients RPM" >&2
+        exit 1
+    fi
+fi
+
+if [[ -e $output && ! -d $output ]]; then
+    echo "output exists and is not a directory: $output" >&2
+    exit 1
+fi
+mkdir -p "$results" "$incomplete" "$runner_logs"
+
+expected_source=${LF_EXPECTED_SOURCE:-}
+expected_sha=""
+if [[ -n $expected_source ]]; then
+    if ! expected_sha=$(git -C "$repo_root" rev-parse --verify \
+            "${expected_source}^{commit}"); then
+        echo "LF_EXPECTED_SOURCE does not resolve to a commit: $expected_source" >&2
+        exit 1
+    fi
+fi
+head_sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo "")
+repo_describe=$(git -C "$repo_root" describe --always --dirty 2>/dev/null || echo "")
+ancestor=unavailable
+if git -C "$repo_root" merge-base --is-ancestor "$custom_sha" HEAD 2>/dev/null; then
+    ancestor=yes
+else
+    ancestor_status=$?
+    if (( ancestor_status == 1 )); then
+        ancestor=no
+    fi
+fi
+provenance_args=(
+    --output "$output/provenance.json"
+    --observed-token "$custom_token"
+    --observed-sha "$custom_sha"
+    --rpm-vr "$custom_vr"
+    --ancestor "$ancestor"
+)
+if [[ -n $head_sha ]]; then
+    provenance_args+=(--head-sha "$head_sha")
+fi
+if [[ -n $repo_describe ]]; then
+    provenance_args+=(--describe "$repo_describe")
+fi
+if [[ -f $workload/workload-manifest.json ]]; then
+    provenance_args+=(--workload-manifest "$workload/workload-manifest.json")
+fi
+if [[ -n $expected_source ]]; then
+    provenance_args+=(
+        --expected-raw "$expected_source"
+        --expected-sha "$expected_sha"
+        --assert-match
+    )
+fi
+provenance_status=0
+python3 "$study_root/study/provenance.py" "${provenance_args[@]}" \
+    || provenance_status=$?
+if (( provenance_status == 3 )); then
+    {
+        echo "============================================================"
+        echo "PROVENANCE MISMATCH: aborting before any state runs"
+        echo "  LF_EXPECTED_SOURCE: $expected_source"
+        echo "  expected commit:    $expected_sha"
+        echo "  installed RPM:      $custom_vr (git $custom_sha)"
+        echo "Install the RPM built from the expected commit and rerun."
+        echo "============================================================"
+    } >&2
+    exit 1
+elif (( provenance_status != 0 )); then
+    echo "provenance preflight failed (exit $provenance_status)" >&2
+    exit 1
+fi
+if [[ -z $expected_source ]]; then
+    {
+        echo "WARNING: LF_EXPECTED_SOURCE is not set; the installed custom RPM"
+        echo "source (git $custom_sha) is recorded in provenance.json but is"
+        echo "not asserted against the commit under review."
+    } | tee "$runner_logs/provenance-preflight.log" >&2
+fi
+
+sudo rpm --restore "${packages[@]}"
+custom_binary=$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')
+
+if [[ ! -f $workload/workload-manifest.json ]]; then
+    if [[ -e $workload ]]; then
+        echo "incomplete workload directory exists: $workload" >&2
+        exit 1
+    fi
+    "$study_root/bin/generate-workload" --profile full --output "$workload"
+fi
+
+canary_prefix=drift-canary
+canary_enabled=0
+if python3 - "$workload/workload-manifest.json" "$canary_prefix" <<'PY'
+import json
+import sys
+
+manifest = json.loads(open(sys.argv[1]).read())
+raise SystemExit(
+    0 if manifest.get("scenario_groups", {}).get(sys.argv[2]) else 1
+)
+PY
+then
+    canary_enabled=1
+    echo "Drift canary enabled: one $canary_prefix scenario runs in every bundle"
+else
+    echo "WARNING: workload has no $canary_prefix scenarios; the per-bundle" \
+        "drift anchor is disabled (regenerate the workload to enable it)"
+fi
+
+completed_bundle_matches() {
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" \
+        "$repeat" "$warmups" "$cpu" "$perf" "$profile" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source, lookup, index, position, binary = sys.argv[2:7]
+repeat, warmups, cpu = map(int, sys.argv[7:10])
+perf, profile = sys.argv[10:12]
+run = json.loads((path / "run-manifest.json").read_text())
+artifact = json.loads((path / "artifact-manifest.json").read_text())
+expected = {
+    "status": "complete", "expected_source_sha": source,
+    "lookup_mode_requested": lookup, "lookup_mode_actual": lookup,
+    "index_config": index, "repeat_count": repeat, "warmup_count": warmups,
+    "cpu_affinity": cpu, "perf_mode": perf, "profile_mode": profile,
+    "backend_actual": "mdb", "cache_policy": "warm",
+    "schedule_design": "screen", "schedule_position": position,
+}
+wrong = [key for key, value in expected.items() if run.get(key) != value]
+observed_binary = artifact.get("server_executable", {}).get("executable_sha256")
+if wrong or observed_binary != binary:
+    detail = ", ".join(wrong) or "server binary"
+    raise SystemExit(f"{path}: completed bundle mismatch: {detail}")
+PY
+}
+
+archive_incomplete_bundle() {
+    local destination=$1
+    local state=$2
+    local bundle=$3
+    local reason=$4
+    local stamp archive
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archive="$incomplete/${state}-${bundle}-${reason}-${stamp}-$$-$RANDOM"
+    test ! -e "$archive"
+    sudo mv -- "$destination" "$archive"
+    echo "Archived incomplete bundle at: $archive"
+}
+
+retryable_referral_boundary() {
+    local log=$1
+    grep -Eq \
+        'log window is contaminated by the periodic referral monitor|controlled background-quiet window expired|collection crossed the controlled background-quiet deadline|final server start crossed a referral-monitor boundary|referral quiet-window setup crossed a monitor boundary' \
+        "$log"
+}
+
+run_bundle() {
+    local server=$1
+    local state=$2
+    local label=$3
+    local source=$4
+    local assertion=$5
+    local lookup=$6
+    local index_config=$7
+    local bundle=$8
+    shift 8
+
+    local destination="$results/$state/$bundle"
+    local schedule_position="$state-$bundle"
+    local server_binary=/usr/bin/ns-slapd
+    local binary_sha attempt attempt_log status tee_status
+    local -a statuses
+    local -a canary_args=()
+
+    if (( canary_enabled )); then
+        canary_args=(--scenario "${canary_prefix}-${index_config}")
+    fi
+
+    if [[ $server == openldap ]]; then
+        server_binary=/usr/sbin/slapd
+    fi
+    binary_sha=$(sha256sum "$server_binary" | awk '{print $1}')
+    if [[ -f $destination/COMPLETE ]]; then
+        if [[ -e $destination/INCOMPLETE ]]; then
+            echo "completed bundle also contains INCOMPLETE: $destination" >&2
+            exit 1
+        fi
+        if ! completed_bundle_matches \
+                "$destination" "$source" "$lookup" "$index_config" \
+                "$schedule_position" "$binary_sha"; then
+            echo "completed bundle does not match this run: $destination" >&2
+            exit 1
+        fi
+        echo "Skipping completed $state / $bundle"
+        return
+    fi
+    if [[ -e $destination ]]; then
+        archive_incomplete_bundle \
+            "$destination" "$state" "$bundle" preexisting
+    fi
+
+    for attempt in 1 2; do
+        attempt_log="$runner_logs/${state}-${bundle}-attempt${attempt}.log"
+        echo "Running $state / $bundle ($index_config), attempt $attempt/2"
+        if sudo "$study_root/bin/run-fedora-study" \
+                --server "$server" \
+                --build-label "$label-$bundle" \
+                --expected-source-sha "$source" \
+                --operator-assertion "$assertion" \
+                --lookup "$lookup" \
+                --workload "$workload" \
+                --output "$destination" \
+                --index-config "$index_config" \
+                --backend mdb \
+                --repeat "$repeat" \
+                --warmups "$warmups" \
+                --prewarm-passes "$prewarm_passes" \
+                --cache-policy warm \
+                --cpu "$cpu" \
+                --perf "$perf" \
+                --profile "$profile" \
+                --scenario-order randomized \
+                --order-seed 38920260720 \
+                --schedule-design screen \
+                --schedule-position "$schedule_position" \
+                --cleanup \
+                "$@" \
+                "${canary_args[@]}" 2>&1 | tee "$attempt_log"; then
+            status=0
+            tee_status=0
+        else
+            statuses=("${PIPESTATUS[@]}")
+            status=${statuses[0]}
+            tee_status=${statuses[1]}
+        fi
+
+        if (( status == 0 )) && [[ -f $destination/COMPLETE ]] \
+                && [[ ! -e $destination/INCOMPLETE ]]; then
+            if (( tee_status != 0 )); then
+                echo "warning: could not save runner log: $attempt_log" >&2
+            fi
+            return
+        fi
+        if (( status == 0 )); then
+            status=1
+        fi
+        if (( tee_status != 0 )); then
+            echo "could not save runner log: $attempt_log" >&2
+        fi
+        if [[ -e $destination ]]; then
+            archive_incomplete_bundle \
+                "$destination" "$state" "$bundle" "attempt${attempt}"
+        fi
+        if (( tee_status == 0 && attempt == 1 )) \
+                && retryable_referral_boundary "$attempt_log"; then
+            echo "Referral-monitor boundary reached; retrying the whole bundle"
+            continue
+        fi
+        echo "Bundle failed; runner log: $attempt_log" >&2
+        return "$status"
+    done
+}
+
+run_matrix() {
+    local server=$1
+    local state=$2
+    local label=$3
+    local source=$4
+    local assertion=$5
+    local lookup=$6
+
+    # Keep the 110 baseline-index scenarios in bounded batches so a full run
+    # does not approach the runner's one-hour background-operation boundary.
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-core \
+        --scenario-group acceptance \
+        --scenario-group candidate-scaling \
+        --scenario-group hit-position \
+        --scenario-group fallbacks \
+        --scenario-group multivalue-scaling
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-branch-scaling \
+        --scenario-group branch-scaling
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-dn-and-decomposition \
+        --scenario-group dn-normalization \
+        --scenario-group decomposition
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-combined-and-family \
+        --scenario-group combined-substring \
+        --scenario-group combined-approximate \
+        --scenario-group flat-family \
+        --scenario order-principal-assertions-reversed \
+        --scenario order-principal-or-dn-sdn2-fallback \
+        --scenario order-principal-or-fallback-sdn2-dn \
+        --scenario order-principal-or-sdn2-dn-fallback \
+        --scenario order-principal-outer-abc \
+        --scenario order-principal-outer-bca \
+        --scenario order-principal-outer-cba
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        baseline-no-presence baseline-index-controls \
+        --scenario presence-primary-none \
+        --scenario presence-no-sdn2-none \
+        --scenario candidate-index-all-equality
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-sdn1 presence-sdn1 \
+        --scenario presence-primary-sdn1
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-sdn2 presence-sdn2 \
+        --scenario presence-primary-sdn2
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        presence-both presence-both \
+        --scenario presence-primary-both \
+        --scenario presence-no-sdn2-both
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        without-sdn1-equality without-sdn1-equality \
+        --scenario candidate-index-without-sdn1
+
+    run_bundle \
+        "$server" "$state" "$label" "$source" "$assertion" "$lookup" \
+        without-sdn2-equality without-sdn2-equality \
+        --scenario candidate-index-without-sdn2
+}
+
+if [[ $lf_openldap == on ]]; then
+    # The OpenLDAP state touches no 389 DS package, so it runs first and the
+    # custom states still measure the untouched installed RPM afterwards.
+    run_matrix \
+        openldap \
+        openldap \
+        openldap-fedora \
+        fedora-package \
+        "Fedora openldap-servers package $openldap_vr" \
+        unsupported
+fi
+
+if [[ $custom_lookup_layout == toggle ]]; then
+    run_matrix \
+        389ds \
+        custom-off \
+        "custom-${custom_token}-off" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr" \
+        off
+
+    sudo rpm --restore "${packages[@]}"
+    assert_package_set "$custom_vr"
+    test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+    run_matrix \
+        389ds \
+        custom-on \
+        "custom-${custom_token}-on" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr" \
+        on
+else
+    echo "Custom source has no OR lookup switch; running lookup unsupported"
+    run_matrix \
+        389ds \
+        custom-unsupported \
+        "custom-${custom_token}-unsupported" \
+        "$custom_sha" \
+        "Installed custom Fedora RPM $custom_vr without OR lookup switch" \
+        unsupported
+fi
+
+assert_package_set "$custom_vr"
+test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+sudo dnf downgrade -y 389-ds-base
+
+stable_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $stable_vr =~ git[[:xdigit:]]{7,40} ]]; then
+    echo "dnf left a custom git build installed: $stable_vr" >&2
+    exit 1
+fi
+assert_package_set "$stable_vr"
+sudo rpm --restore "${packages[@]}"
+
+run_matrix \
+    389ds \
+    fedora-stable \
+    fedora-stable \
+    fedora-stable-package \
+    "Fedora stable packages installed by dnf downgrade 389-ds-base" \
+    unsupported
+
+python3 "$study_root/study/screen_report.py" \
+    "$results" "$repeat" "$custom_sha" "$custom_vr" "$stable_vr" \
+    "$custom_lookup_layout" "$lf_openldap" "$openldap_vr"

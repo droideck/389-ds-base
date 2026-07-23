@@ -1,0 +1,279 @@
+{
+  "classification": {
+    "allowed_result_classifications": [
+      "demonstrated improvement",
+      "no material change",
+      "regression",
+      "expected decline/fallback",
+      "unverified due to missing mechanism evidence",
+      "unavoidable implementation difference"
+    ],
+    "expected_improvement_groups": [
+      "primary",
+      "candidate-scaling",
+      "branch-scaling",
+      "family-discovery",
+      "family-ranking"
+    ],
+    "fallback_groups": [
+      "decline-paths",
+      "dynamic-list-correctness"
+    ],
+    "no_regression_groups": [
+      "presence-index",
+      "fallbacks",
+      "dn-normalization",
+      "candidate-index-controls",
+      "branch-order",
+      "flat-family"
+    ]
+  },
+  "correctness": {
+    "exact_dn_sha256_required": true,
+    "expected_ldap_result_required": true,
+    "failed_rows_are_timing_ineligible": true
+  },
+  "format_version": 1,
+  "gates": [
+    {
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "Every returned DN SHA-256, count, and LDAP result code equals the independently generated scenario oracle.",
+      "id": "exact-result-parity",
+      "numerical_floor": 0,
+      "required_operation_kinds": [
+        "mechanism-preflight",
+        "mechanism-postflight",
+        "warmup",
+        "measured",
+        "profiled-search",
+        "dynamic-list-control"
+      ],
+      "scope": "every row"
+    },
+    {
+      "classification_on_failure": "regression",
+      "formula": "The candidate introduces zero LDAP result-code changes and zero new LDAP_ADMINLIMIT_EXCEEDED outcomes relative to its paired reference.",
+      "id": "no-new-result-or-admin-limit",
+      "numerical_floor": 0,
+      "scope": "every paired correctness control"
+    },
+    {
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "For the 612-candidate by 355-DN-branch unproxied Directory Manager all-miss principal shape, both median process CPU and instructions/search fall by at least max(0.30, noise_fraction) when lookup consumption is independently supported.",
+      "id": "principal-consumed-lookup-cost",
+      "minimum_independent_cpu_samples": 15,
+      "minimum_independent_instruction_batches": 15,
+      "numerical_floor_fraction": 0.3,
+      "pair": {
+        "attribute_variant": "attrs-1.1",
+        "candidate_lookup_mode": "on",
+        "reference_lookup_mode": "off",
+        "revision_role": "final",
+        "scenario": "principal-with-sdn2-equality"
+      },
+      "required_mechanism_evidence": [
+        "lookup-off construction absent",
+        "lookup-on largest family 355",
+        "hashed profile samples lookup consumption"
+      ],
+      "scope": "principal lookup-off versus lookup-on"
+    },
+    {
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "The endpoint normalized branch-count slope (delta cost / delta branch) falls by at least max(0.20, noise_fraction) from reference to candidate, with all branch ladder points correct.",
+      "id": "branch-count-scaling",
+      "numerical_floor_fraction": 0.2,
+      "required_branch_counts": [16, 32, 64, 128, 355, 500, 1000],
+      "required_distributions": [
+        "all-absent",
+        "mostly-live",
+        "mixed",
+        "duplicates"
+      ],
+      "slope_endpoints": [16, 1000],
+      "excluded_from_slope": [
+        "branch count 15",
+        "zero-candidate distribution"
+      ],
+      "scope": "branch-scaling"
+    },
+    {
+      "classification_on_failure": "regression",
+      "formula": "Median regression stays below max(0.05, noise_fraction) and p95 regression stays below max(0.10, 1.5 * noise_fraction).",
+      "id": "adverse-and-small-shape-no-regression",
+      "median_numerical_floor_fraction": 0.05,
+      "p95_numerical_floor_fraction": 0.1,
+      "required_scenarios": [
+        "branch-count-15-all-absent",
+        "branch-count-15-mostly-live",
+        "branch-count-15-mixed",
+        "branch-count-15-duplicates",
+        "branch-count-15-zero-candidate",
+        "decomposition-b-one-absent-equality",
+        "candidate-count-0",
+        "branch-count-16-zero-candidate",
+        "branch-count-32-zero-candidate",
+        "branch-count-64-zero-candidate",
+        "branch-count-128-zero-candidate",
+        "branch-count-355-zero-candidate",
+        "branch-count-500-zero-candidate",
+        "branch-count-1000-zero-candidate",
+        "combined-substring-adverse"
+      ],
+      "scope": "15-branch, small equality OR, zero-candidate, selective substring, and explicit adverse substring controls"
+    },
+    {
+      "classification_on_failure": "regression",
+      "formula": "At the lookup threshold, table-build median CPU overhead stays below max(0.10, noise_fraction), and RSS growth must exceed both 0.15 and 64 MiB before failing.",
+      "id": "table-build-and-memory-overhead",
+      "median_cpu_numerical_floor_fraction": 0.1,
+      "minimum_independent_cpu_samples": 15,
+      "required_memory_scenarios": [
+        "multivalue-sdn1-1",
+        "multivalue-sdn1-4",
+        "multivalue-sdn1-16",
+        "multivalue-sdn1-64",
+        "principal-with-sdn2-equality"
+      ],
+      "required_threshold_scenarios": [
+        "branch-count-15-zero-candidate",
+        "branch-count-16-zero-candidate"
+      ],
+      "rss_absolute_floor_bytes": 67108864,
+      "rss_fractional_floor": 0.15,
+      "scope": "below-threshold/threshold controls and multi-valued scaling"
+    },
+    {
+      "classification_on_expected_behavior": "expected decline/fallback",
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "Unsupported and intentional decline paths retain exact results and do not regress against lookup-off by max(0.05, noise_fraction) unless profile/mechanism evidence attributes an unavoidable implementation difference.",
+      "id": "decline-path-parity",
+      "numerical_floor_fraction": 0.05,
+      "required_groups": [
+        "decline-paths",
+        "fallbacks",
+        "dynamic-list-correctness"
+      ],
+      "scope": "fallbacks, decline-paths, and dynamic-list correctness"
+    },
+    {
+      "classification_on_failure": "regression",
+      "formula": "Final e0161d0e median and p95 remain within the generic no-regression floors of 9c23a6e4 on representative successful equality-OR, bounded-substring, and combined shapes.",
+      "id": "final-success-path-no-regression",
+      "median_numerical_floor_fraction": 0.05,
+      "p95_numerical_floor_fraction": 0.1,
+      "required_scenarios": [
+        "hit-position-middle",
+        "combined-substring-gain",
+        "combined-approximate-gain",
+        "flat-family-ranking-a16-b64",
+        "flat-family-ranking-b64-a16"
+      ],
+      "revision_pair": ["largest-family-fix", "final"],
+      "scope": "9c23a6e4 versus e0161d0e"
+    },
+    {
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "The full and no-sDN2-equality principal variants have identical expected and returned DN hashes; candidate-list and runtime differences are reported separately and never presumed equivalent.",
+      "id": "sdn2-pair-attribution",
+      "numerical_floor": 0,
+      "required_pairs": {
+        "decomposition-full": [
+          "decomposition-e-full-primary",
+          "decomposition-f-full-no-sdn2"
+        ],
+        "presence-both": [
+          "presence-primary-both",
+          "presence-no-sdn2-both"
+        ],
+        "presence-none": [
+          "presence-primary-none",
+          "presence-no-sdn2-none"
+        ],
+        "principal": [
+          "principal-with-sdn2-equality",
+          "principal-without-sdn2-equality"
+        ]
+      },
+      "required_attribution_channels": [
+        "candidate-list",
+        "notes-U",
+        "STAT-index-reads",
+        "elapsed",
+        "CPU",
+        "instructions",
+        "hashed-profile"
+      ],
+      "scope": "sdn2-pair"
+    },
+    {
+      "classification_on_failure": "regression",
+      "classification_on_missing_evidence": "unverified due to missing mechanism evidence",
+      "formula": "The final build passes the third-family discovery and largest-family ranking diagnostics introduced by 09f92bfb and 9c23a6e4.",
+      "id": "selection-fix-retention",
+      "numerical_floor": 0,
+      "required_observations": [
+        {"largest_family": 64, "revision_role": "all-family-fix", "scenario": "flat-family-third-after-distractors", "selected_attribute": "sString3"},
+        {"largest_family": 64, "revision_role": "largest-family-fix", "scenario": "flat-family-third-after-distractors", "selected_attribute": "sString3"},
+        {"largest_family": 64, "revision_role": "largest-family-fix", "scenario": "flat-family-ranking-a16-b64", "selected_attribute": "sString2"},
+        {"largest_family": 64, "revision_role": "largest-family-fix", "scenario": "flat-family-ranking-b64-a16", "selected_attribute": "sString2"},
+        {"largest_family": 16, "revision_role": "largest-family-fix", "scenario": "flat-family-unsupported-fallback", "selected_attribute": "sString1"},
+        {"largest_family": 16, "revision_role": "largest-family-fix", "scenario": "flat-family-tie-a-first", "selected_attribute": "sString1"},
+        {"largest_family": 16, "revision_role": "largest-family-fix", "scenario": "flat-family-tie-b-first", "selected_attribute": "sString2"},
+        {"largest_family": 64, "revision_role": "final", "scenario": "flat-family-third-after-distractors", "selected_attribute": "sString3"},
+        {"largest_family": 64, "revision_role": "final", "scenario": "flat-family-ranking-a16-b64", "selected_attribute": "sString2"},
+        {"largest_family": 64, "revision_role": "final", "scenario": "flat-family-ranking-b64-a16", "selected_attribute": "sString2"},
+        {"largest_family": 16, "revision_role": "final", "scenario": "flat-family-unsupported-fallback", "selected_attribute": "sString1"},
+        {"largest_family": 16, "revision_role": "final", "scenario": "flat-family-tie-a-first", "selected_attribute": "sString1"},
+        {"largest_family": 16, "revision_role": "final", "scenario": "flat-family-tie-b-first", "selected_attribute": "sString2"}
+      ],
+      "scope": "family-discovery and family-ranking"
+    }
+  ],
+  "memory": {
+    "absolute_rss_increase_floor_bytes": 67108864,
+    "maximum_rss_increase_fraction": 0.15,
+    "rule": "Fail only when both the fractional and absolute RSS increases exceed their numerical floors."
+  },
+  "noise_model": {
+    "formula": "noise_fraction = max(0.03, 3 * max(MAD_baseline / median_baseline, MAD_candidate / median_candidate))",
+    "mad_multiplier": 3.0,
+    "numerical_floor_fraction": 0.03,
+    "statistic": "median absolute deviation divided by median, evaluated per timing stratum"
+  },
+  "performance": {
+    "expected_improvement_floor_fraction": 0.25,
+    "expected_improvement_rule": "Demonstrated only when the candidate median is lower by at least max(0.25, noise_fraction).",
+    "material_change_floor_fraction": 0.05,
+    "material_change_rule": "A median change is material only when abs(delta) >= max(0.05, noise_fraction).",
+    "maximum_median_regression_floor_fraction": 0.05,
+    "maximum_p95_regression_floor_fraction": 0.10,
+    "regression_rule": "A median regression fails at max(0.05, noise_fraction); a p95 regression fails at max(0.10, 1.5 * noise_fraction).",
+    "required_metrics": [
+      "elapsed"
+    ],
+    "supporting_metrics": [
+      "server_cpu",
+      "instructions"
+    ]
+  },
+  "reporting": {
+    "maximum_searches_per_perf_batch": 1,
+    "minimum_independent_instruction_batches": 15,
+    "minimum_native_measured_repeats": 15,
+    "p95_definition": "nearest-rank: sorted_values[ceil(0.95 * n) - 1]",
+    "release_rows_require_native_fedora": true,
+    "release_rows_require_rpm_artifact_identity": true,
+    "unsafe_nonrelease_rows_must_remain_separate": true
+  },
+  "scaling": {
+    "dimensions": [
+      "candidate_count",
+      "branch_count",
+      "values_per_entry",
+      "dn_mode"
+    ],
+    "minimum_distinct_points": 2,
+    "rule": "Emit a scaling table only when at least two distinct values exist for a dimension in one otherwise-identical native timing stratum."
+  }
+}

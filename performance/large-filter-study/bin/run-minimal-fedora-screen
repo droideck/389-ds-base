@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Run the smallest useful native Fedora screen against an already installed
+# custom git RPM.  This script never builds or stages an RPM.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: $0 [OUTPUT_DIRECTORY]"
+    echo "Runs custom/off, identical custom/on, then downgrades to pre-fix."
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    usage
+    exit 0
+fi
+if (( $# > 1 )); then
+    usage >&2
+    exit 2
+fi
+
+study_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(git -C "$study_root" rev-parse --show-toplevel)
+workload=${LF_WORKLOAD:-/mnt/tests/large-filter-workload-full}
+output=${1:-/mnt/tests/large-filter-screen-$(date -u +%Y%m%dT%H%M%SZ)}
+results="$output/results"
+
+cpu=${LF_CPU:-2}
+
+packages=(
+    389-ds-base
+    389-ds-base-libs
+    389-ds-base-robdb-libs
+    python3-lib389
+)
+
+custom_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $custom_vr =~ git([[:xdigit:]]{7,40}) ]]; then
+    custom_token=${BASH_REMATCH[1],,}
+else
+    echo "installed 389-ds-base has no git hash; custom build required" >&2
+    exit 1
+fi
+if ! custom_sha=$(git -C "$repo_root" rev-parse --verify "${custom_token}^{commit}"); then
+    echo "installed RPM git hash $custom_token is absent from this repository" >&2
+    exit 1
+fi
+
+for package in "${packages[@]}"; do
+    actual=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package")
+    if [[ $actual != "$custom_vr" ]]; then
+        echo "mixed custom packages: $package is $actual, base is $custom_vr" >&2
+        exit 1
+    fi
+done
+
+test ! -e "$output"
+mkdir -p "$results"
+
+sudo rpm --restore "${packages[@]}"
+custom_binary=$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')
+
+if [[ ! -f $workload/workload-manifest.json ]]; then
+    if [[ -e $workload ]]; then
+        echo "incomplete workload directory exists: $workload" >&2
+        exit 1
+    fi
+    "$study_root/bin/generate-workload" --profile full --output "$workload"
+fi
+
+run_state() {
+    local label=$1
+    local source=$2
+    local assertion=$3
+    local lookup=$4
+    local destination=$5
+
+    sudo "$study_root/bin/run-fedora-study" \
+        --server 389ds \
+        --build-label "$label" \
+        --expected-source-sha "$source" \
+        --operator-assertion "$assertion" \
+        --lookup "$lookup" \
+        --workload "$workload" \
+        --output "$destination" \
+        --scenario combined-substring-gain \
+        --scenario hit-position-late \
+        --index-config baseline-no-presence \
+        --backend mdb \
+        --repeat 15 \
+        --warmups 2 \
+        --prewarm-passes 2 \
+        --cache-policy warm \
+        --cpu "$cpu" \
+        --perf off \
+        --profile off \
+        --schedule-design screen \
+        --schedule-position "$label" \
+        --cleanup
+
+    test -f "$destination/COMPLETE"
+}
+
+run_state \
+    "custom-${custom_token}-off" \
+    "$custom_sha" \
+    "Installed custom Fedora RPM $custom_vr" \
+    off \
+    "$results/custom-off"
+
+sudo rpm --restore "${packages[@]}"
+test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+run_state \
+    "custom-${custom_token}-on" \
+    "$custom_sha" \
+    "Installed custom Fedora RPM $custom_vr" \
+    on \
+    "$results/custom-on"
+
+test "$(sha256sum /usr/bin/ns-slapd | awk '{print $1}')" = "$custom_binary"
+
+sudo dnf downgrade -y 389-ds-base
+
+stable_vr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' 389-ds-base)
+if [[ $stable_vr =~ git[[:xdigit:]]{7,40} ]]; then
+    echo "dnf left a custom git build installed: $stable_vr" >&2
+    exit 1
+fi
+for package in "${packages[@]}"; do
+    actual=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package")
+    if [[ $actual != "$stable_vr" ]]; then
+        echo "mixed stable package versions: $package is $actual" >&2
+        exit 1
+    fi
+done
+
+sudo rpm --restore "${packages[@]}"
+
+run_state \
+    fedora44-stable \
+    fedora-stable-package \
+    "Fedora stable packages installed by dnf downgrade 389-ds-base" \
+    unsupported \
+    "$results/fedora-stable"
+
+python3 - "$results" <<'PY'
+import json
+import math
+import statistics
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+states = {
+    "stable": root / "fedora-stable",
+    "custom-off": root / "custom-off",
+    "custom-on": root / "custom-on",
+}
+scenarios = ("combined-substring-gain", "hit-position-late")
+
+
+def metrics(path, scenario):
+    payload = json.loads((path / "raw-results.json").read_text())
+    rows = [
+        row for row in payload["rows"]
+        if row["phase"] == "measured" and row["scenario"] == scenario
+    ]
+    if len(rows) != 15:
+        raise RuntimeError(f"{path}/{scenario}: expected 15 rows, got {len(rows)}")
+    elapsed = sorted(row["client_elapsed_ns"] / 1_000_000_000 for row in rows)
+    cpu = sorted(row["server_cpu_seconds"] for row in rows)
+    return {
+        "elapsed": statistics.median(elapsed),
+        "p95": elapsed[math.ceil(0.95 * len(elapsed)) - 1],
+        "cpu": statistics.median(cpu),
+    }
+
+
+values = {
+    (state, scenario): metrics(path, scenario)
+    for state, path in states.items()
+    for scenario in scenarios
+}
+
+off_artifact = json.loads(
+    (states["custom-off"] / "artifact-manifest.json").read_text()
+)
+on_artifact = json.loads(
+    (states["custom-on"] / "artifact-manifest.json").read_text()
+)
+if (
+    off_artifact["server_executable"]["executable_sha256"]
+    != on_artifact["server_executable"]["executable_sha256"]
+):
+    raise RuntimeError("custom off/on executable hashes differ")
+
+
+def benefit(baseline, candidate):
+    return 100.0 * (baseline - candidate) / baseline
+
+
+print("\nMedian results from 15 measured searches")
+print("state       scenario                    elapsed(s)   p95(s)   CPU(s)")
+for state in states:
+    for scenario in scenarios:
+        value = values[state, scenario]
+        print(
+            f"{state:11} {scenario:27} "
+            f"{value['elapsed']:10.6f} {value['p95']:8.6f} "
+            f"{value['cpu']:8.6f}"
+        )
+
+stable = values["stable", "combined-substring-gain"]
+custom_off = values["custom-off", "combined-substring-gain"]
+or_off = values["custom-off", "hit-position-late"]
+or_on = values["custom-on", "hit-position-late"]
+
+print(
+    "\nAND/bounded whole-package benefit, pre-fix -> custom/off: "
+    f"elapsed {benefit(stable['elapsed'], custom_off['elapsed']):.1f}%, "
+    f"CPU {benefit(stable['cpu'], custom_off['cpu']):.1f}%"
+)
+print(
+    "OR same-binary benefit, custom/off -> custom/on: "
+    f"elapsed {benefit(or_off['elapsed'], or_on['elapsed']):.1f}%, "
+    f"CPU {benefit(or_off['cpu'], or_on['cpu']):.1f}%"
+)
+print(f"\nResults: {root}")
+PY
