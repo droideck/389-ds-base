@@ -1,0 +1,50 @@
+# OpenLDAP form of 99large-filter-study.ldif.  OIDs, syntaxes, cardinality,
+# and matching rules intentionally match the 389 Directory Server schema.
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.1 NAME 'sString1'
+    DESC 'Large-filter study selector one'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.2 NAME 'sString2'
+    DESC 'Large-filter study selector two'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.3 NAME 'sString3'
+    DESC 'Large-filter study selector three'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.4 NAME 'sString4'
+    DESC 'Large-filter study fallback guard'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.5 NAME 'sDN1'
+    DESC 'Large-filter study multi-valued DN family'
+    EQUALITY distinguishedNameMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.6 NAME 'sDN2'
+    DESC 'Large-filter study single-valued DN fallback'
+    EQUALITY distinguishedNameMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.7 NAME 'sSub'
+    DESC 'Large-filter study bounded substring value'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.2312.999.2026.100.8 NAME 'sApprox'
+    DESC 'Large-filter study approximate value'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+objectclass ( 1.3.6.1.4.1.2312.999.2026.100.20
+    NAME 'largeFilterStudyPerson'
+    DESC 'Synthetic auxiliary class for the external large-filter study'
+    SUP top AUXILIARY
+    MAY ( sString1 $ sString2 $ sString3 $ sString4 $ sDN1 $ sDN2 $
+          sSub $ sApprox ) )
+

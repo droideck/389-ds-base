@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Regenerate the full-screen report artifacts from an existing run directory."""
+
+import sys
+from pathlib import Path
+
+STUDY_ROOT = Path(__file__).resolve().parents[1]
+if str(STUDY_ROOT) not in sys.path:
+    sys.path.insert(0, str(STUDY_ROOT))
+
+from study.screen_report import regenerate_main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(regenerate_main())

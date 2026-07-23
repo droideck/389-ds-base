@@ -1,0 +1,74 @@
+{
+  "format_version": 1,
+  "backend_policy": {
+    "389ds_primary": "mdb",
+    "389ds_optional": "bdb",
+    "openldap": "mdb"
+  },
+  "servers": {
+    "389ds": {
+      "baseline": {
+        "sString1": ["eq"],
+        "sString2": ["eq"],
+        "sString3": ["eq"],
+        "sString4": ["eq"],
+        "sDN1": ["eq"],
+        "sDN2": ["eq"],
+        "sSub": ["eq", "sub"],
+        "sApprox": ["eq", "approx"],
+        "cn": ["eq", "sub"],
+        "sn": ["eq"],
+        "member": ["eq"]
+      },
+      "configuration_api": "dsconf backend index"
+    },
+    "openldap": {
+      "baseline": {
+        "sString1": ["eq"],
+        "sString2": ["eq"],
+        "sString3": ["eq"],
+        "sString4": ["eq"],
+        "sDN1": ["eq"],
+        "sDN2": ["eq"],
+        "sSub": ["eq", "sub"],
+        "sApprox": ["eq", "approx"],
+        "cn": ["eq", "sub"],
+        "sn": ["eq"],
+        "member": ["eq"]
+      },
+      "configuration_api": "olcDbIndex or slapd.conf index"
+    }
+  },
+  "variants": {
+    "baseline-no-presence": {
+      "description": "Baseline equality/sub/approx intent; no sDN presence indexes",
+      "add": {},
+      "remove": {}
+    },
+    "presence-sdn1": {
+      "description": "Add presence only to sDN1",
+      "add": {"sDN1": ["pres"]},
+      "remove": {}
+    },
+    "presence-sdn2": {
+      "description": "Add presence only to sDN2",
+      "add": {"sDN2": ["pres"]},
+      "remove": {}
+    },
+    "presence-both": {
+      "description": "Add presence to both DN attributes",
+      "add": {"sDN1": ["pres"], "sDN2": ["pres"]},
+      "remove": {}
+    },
+    "without-sdn1-equality": {
+      "description": "Diagnostic candidate-generation control",
+      "add": {},
+      "remove": {"sDN1": ["eq"]}
+    },
+    "without-sdn2-equality": {
+      "description": "Diagnostic candidate-generation control",
+      "add": {},
+      "remove": {"sDN2": ["eq"]}
+    }
+  }
+}
