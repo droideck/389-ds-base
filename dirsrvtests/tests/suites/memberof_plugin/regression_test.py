@@ -1826,6 +1826,109 @@ def test_replace_list_no_spurious_member_mods(topology_st, request):
             'gained memberOf' % (added, usn_before[added], usn_after[added]))
 
 
+def test_replace_list_internal_op_count(topology_st, request):
+    """Adding one member to a large group must not rewrite every other member.
+
+    :id: 6b2e0f4c-9a63-4a1e-9f2d-2f6d5f1c0a77
+    :setup: Standalone Instance, memberOf enabled, internal operations logged
+    :steps:
+        1. Create NUM_USERS users and a group holding all but the last one
+        2. Emit a marker search to bound the access log window
+        3. MOD_REPLACE the member list to [last] + the existing members, so the
+           new value sits at index 0 and the pre/post orders diverge immediately
+        4. Count internal MOD operations against the member entries
+    :expectedresults:
+        1. Success
+        2. Success
+        3. Every user holds memberOf for the group
+        4. Only the newly added member is written. A broken comparator makes the
+           merge loop delete every pre value and re-add every post value, which
+           shows up here as roughly 2 * NUM_USERS internal MODs.
+    """
+    inst = topology_st.standalone
+    NUM_USERS = 100
+    MARKER = 'AMPLIFICATION-PROBE'
+
+    memberof = MemberOfPlugin(inst)
+    memberof.set_attr('memberOf')
+    memberof.replace_groupattr('member')
+    memberof.remove_all_entryscope()
+    memberof.remove_all_excludescope()
+    memberof.remove_configarea()
+    memberof.set_autoaddoc('nsMemberOf')
+    memberof.enable()
+    deferred = memberof.get_memberofdeferredupdate()
+    delay = 3 if deferred and deferred.lower() == "on" else 0
+
+    saved = {attr: inst.config.get_attr_val_utf8(attr) for attr in
+             ('nsslapd-accesslog-level', 'nsslapd-plugin-logging',
+              'nsslapd-accesslog-logbuffering')}
+    # 256 (default ops) + 4 (internal ops); plugin logging exposes the
+    # memberOf-initiated modifies, unbuffered so they land before we read.
+    inst.config.set('nsslapd-plugin-logging', 'on')
+    inst.config.set('nsslapd-accesslog-level', '260')
+    inst.config.set('nsslapd-accesslog-logbuffering', 'off')
+    inst.restart()
+
+    users_idm = UserAccounts(inst, DEFAULT_SUFFIX)
+    user_list = []
+    group = None
+
+    def fin():
+        try:
+            if group is not None and group.exists():
+                group.delete()
+        except ldap.LDAPError as e:
+            log.warning('cleanup: group delete failed: %s', e)
+        for u in user_list:
+            try:
+                u.delete()
+            except ldap.LDAPError:
+                pass
+        for attr, val in saved.items():
+            if val is not None:
+                inst.config.set(attr, val)
+        inst.restart()
+    request.addfinalizer(fin)
+
+    for i in range(NUM_USERS):
+        user_list.append(users_idm.create(properties={
+            'uid': 'ampuser%03d' % i,
+            'sn': 'ampuser%03d' % i,
+            'cn': 'ampuser%03d' % i,
+            'uidNumber': str(600000 + i),
+            'gidNumber': str(600000 + i),
+            'homeDirectory': '/home/ampuser%03d' % i,
+        }))
+
+    groups = Groups(inst, DEFAULT_SUFFIX, rdn=None)
+    group = groups.create(properties={
+        'cn': 'amplification_group',
+        'member': [u.dn for u in user_list[:-1]],
+    })
+    time.sleep(delay)
+
+    inst.search_s(DEFAULT_SUFFIX, ldap.SCOPE_BASE, '(description=%s)' % MARKER)
+
+    # Put the new member first so pre and post diverge at index 0.
+    group.replace('member', [user_list[-1].dn] + [u.dn for u in user_list[:-1]])
+    time.sleep(delay)
+
+    group_dn_l = group.dn.lower()
+    for u in user_list:
+        assert group_dn_l in u.get_attr_vals_utf8_l('memberOf'), \
+            '%s is missing memberOf %s' % (u.dn, group.dn)
+
+    mods = inst.ds_access_log.match(
+        r'(?i).*conn=Internal\([0-9]+\).*MOD dn="uid=ampuser[0-9]+,.*',
+        after_pattern=r'.*%s.*' % MARKER)
+
+    assert len(mods) <= 5, (
+        'the replace wrote %d member entries; only the one added member should '
+        'have been written. %d members were already present before and after '
+        'the replace and must not be touched.' % (len(mods), NUM_USERS - 1))
+
+
 if __name__ == '__main__':
     # Run isolated
     # -s for DEBUG mode
