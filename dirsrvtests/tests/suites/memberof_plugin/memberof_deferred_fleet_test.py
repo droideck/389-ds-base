@@ -69,6 +69,22 @@ Workloads (run separately with -k, or in file order):
   in production the failing write is a BDB deadlock or lock exhaustion
   under load, not a read-only backend, but the abandon path is the
   same.
+- W5: the deferred MODIFY replay's entry-scope check runs on an entry
+  it never fetches.  With memberOfEntryScope configured (the FreeIPA
+  shape: suffix scope plus compat/provisioning/topology excludes),
+  deferred_mod_func scope-checks a NULL entry, no entry scope can
+  match, and the whole fanout of every grouping-attribute MODIFY is
+  silently skipped - on the origin supplier and on every replica
+  replaying the replicated MODIFY.  W5 applies the customer-shaped
+  scope for this test only, performs one plain single-value MOD_ADD
+  on supplier A, and attributes the two paths separately: the direct
+  verdict on A the moment the modify returns (the deferred client
+  parks until its own task completes), the replicated verdict on each
+  other supplier after the forward link arrives and a barrier write
+  proves that supplier's FIFO advanced past the replicated task.  The
+  group's initial members serve as the in-test control: the ADD
+  replay reads its entry from the task pblock, so the ADD-path
+  back-links must exist under the same scope config on any build.
 
 Environment knobs:
 
@@ -92,6 +108,7 @@ Environment knobs:
 - MEMBEROF_REPRO_W4_PIN      fixed pin-group size (default 0 = auto-calibrate)
 - MEMBEROF_REPRO_THREADS     nsslapd-threadnumber (default scales with topology)
 - MEMBEROF_REPRO_EXPECT      report (default) | stock | fixed - W2 assert policy
+- MEMBEROF_REPRO_W5_EXPECT   report (default) | broken | fixed - W5 assert policy
 - MEMBEROF_REPRO_DRAIN_TIMEOUT  fleet drain wait in seconds (default scales)
 - MEMBEROF_REPRO_DBCACHE     per-instance nsslapd-dbcachesize (default 128MB;
                              /dev/shm needs ~(DBCACHE + 40MB) * N)
@@ -103,7 +120,12 @@ unchanged), so a failure means the reproducer did not reach a backlog,
 not that the bug is fixed.  W2 depends on issue 7460, hence the EXPECT
 knob: stock 2.8.0 churns, builds carrying 90735eb16 must not.  W4,
 like W1, asserts unconditionally: the worker discards return codes on
-every build, so the abandon path is unchanged by the 7460 fix.
+every build, so the abandon path is unchanged by the 7460 fix.  W5 has
+its own knob because its defect is independent of 7460: the scope-skip
+is a regression from the issue 7035 scoping RFE (9b9ea493b), present
+from 2.8.0 through current main, so W5_EXPECT=broken is the expected
+setting on every current build; a build carrying the deferred_mod_func
+scope fix runs with W5_EXPECT=fixed.
 
 Sized for a Fedora/RHEL VM.  Smoke profile (2 suppliers, HOSTS=600) is
 enough to validate the mechanics; fidelity (16 suppliers, HOSTS=90000)
@@ -174,6 +196,13 @@ W4_PIN = int(os.getenv('MEMBEROF_REPRO_W4_PIN', '0'))
 W4_PIN_CAP = 40000
 W4_VICTIMS = 20
 EXPECT = os.getenv('MEMBEROF_REPRO_EXPECT', 'report')
+W5_EXPECT = os.getenv('MEMBEROF_REPRO_W5_EXPECT', 'report')
+W5_MEMBERS = 10
+# the customer-shaped scope: everything under the suffix except the
+# three subtrees FreeIPA excludes (compat/provisioning/topology)
+W5_EXCLUDES = (f'cn=compat,{DEFAULT_SUFFIX}',
+               f'cn=provisioning,{DEFAULT_SUFFIX}',
+               f'cn=topology,cn=ipa,cn=etc,{DEFAULT_SUFFIX}')
 
 # Every client whose op touched a grouping attribute occupies a server
 # worker thread in the 100ms result-poll loop until the deferred worker
@@ -207,6 +236,9 @@ WARN_RE = '.*It is recommended to launch memberof fixup task.*'
 # deferred_mod_func reuses the postop's message text when a fanout
 # write fails and the rest of the task is abandoned
 FAIL_RE = '.*Failed to add dn.*to target.*Error.*'
+# the only diagnostic a failing deferred task emits; the W5 scope skip
+# bails with a success return code and must produce none of these
+ALERT_RE = '.*Failed applying deferred updates.*'
 
 
 def _dm_conn(inst, timeout=None):
@@ -254,6 +286,12 @@ def _member_set(conn, group_dn):
                         ['member'])
     vals = res[0][1].get('member', [])
     return {v.decode().lower() for v in vals}
+
+
+def _memberof_values(conn, dn):
+    res = conn.search_s(dn, ldap.SCOPE_BASE, '(objectClass=*)',
+                        ['memberOf'])
+    return {v.decode().lower() for v in res[0][1].get('memberOf', [])}
 
 
 def _entry_exists(conn, dn):
@@ -499,6 +537,31 @@ def fleet(request):
             _safe_unbind(conn)
 
     return topo
+
+
+@pytest.fixture(scope="function")
+def entryscope_fleet(fleet):
+    """Apply the customer-shaped entry scope for the duration of one test.
+
+    Function-scoped by design: memberOfEntryScope is exactly the
+    variable W5 isolates, and on builds carrying the deferred-MODIFY
+    scope skip a module-wide scope would silently disable every
+    deferred MODIFY fanout - W1-W4's assertions would fail for the
+    wrong reason.  Restarts bracket the config change so no dynamic
+    plugin-config ambiguity leaks into the verdict.
+    """
+    suppliers = list(fleet.ms.values())
+    for inst in suppliers:
+        memberof = MemberOfPlugin(inst)
+        memberof.set('memberOfEntryScope', DEFAULT_SUFFIX)
+        memberof.set('memberOfEntryScopeExcludeSubtree', list(W5_EXCLUDES))
+        inst.restart()
+    yield fleet
+    for inst in suppliers:
+        memberof = MemberOfPlugin(inst)
+        memberof.remove_all('memberOfEntryScope')
+        memberof.remove_all('memberOfEntryScopeExcludeSubtree')
+        inst.restart()
 
 
 def test_w1_add_workload_kill_mid_backlog(fleet):
@@ -1346,6 +1409,170 @@ def test_w4_error_abandon_without_restart(fleet):
     log.info('W4 damage: %d of %d back-links silently lost on %s with '
              'zero restarts; control %s is fully consistent',
              missing, W4_VICTIMS, victim.serverid, control.serverid)
+
+
+def test_w5_entryscope_deferred_mod_skip(entryscope_fleet):
+    """A grouping-attr MOD_ADD's memberOf fanout is silently skipped under entry scope.
+
+    :id: 7d3a9e14-6c2b-4e8f-a1d5-9b0c4f7e2a55
+    :setup: Same fleet as W1, plus memberOfEntryScope set to the suffix
+            and the three FreeIPA exclude subtrees on every supplier
+            (function-scoped fixture, removed afterward)
+    :steps:
+        1. Create member entries, a group holding W5_MEMBERS of them,
+           and one empty barrier group per supplier
+        2. Wait for the ADD-path control back-links on every supplier
+        3. MOD_ADD one more member on supplier A; the deferred client
+           parks until its own fanout task completes, so check the
+           back-link on A as soon as the modify returns
+        4. On every other supplier wait for the replicated forward
+           link, then issue a barrier MOD_ADD into that supplier's own
+           FIFO (its park proves the queue advanced past the
+           replicated task), then check the back-link
+        5. Compare the error logs against the silence expectation
+    :expectedresults:
+        1. Success
+        2. Back-links exist everywhere - deferred_add_func reads its
+           entry from the task pblock, so the ADD replay scope-checks a
+           real entry and fans out under the same scope config
+        3. Correct build: back-link present on A; scope-skip builds:
+           deferred_mod_func scope-checks a NULL entry, no entry scope
+           matches, and the fanout is skipped on the op origin
+        4. Correct build: back-link present everywhere; scope-skip
+           builds: the forward link replicates but every replica skips
+           its replay the same way
+        5. The skip is silent - no WARNING/ERR/ALERT delta anywhere
+    """
+    suppliers = list(entryscope_fleet.ms.values())
+    a = suppliers[0]
+    others = suppliers[1:]
+    repl = ReplicationManager(DEFAULT_SUFFIX)
+
+    w5_ou = f'ou=w5,{FLEET_OU}'
+    group_dn = f'cn=w5group,{w5_ou}'
+    members = [f'cn=w5m{i:03d},{w5_ou}' for i in range(W5_MEMBERS + 1)]
+    late_member = members[0]
+    initial = members[1:]
+    barrier_dns = {inst.serverid: f'cn=w5barrier-{inst.serverid},{w5_ou}'
+                   for inst in suppliers}
+
+    errlogs = {inst.serverid: DirsrvErrorLog(inst) for inst in suppliers}
+
+    def _log_counts():
+        return {sid: (len(errlogs[sid].match(WARN_RE)),
+                      len(errlogs[sid].match(FAIL_RE)),
+                      len(errlogs[sid].match(ALERT_RE)))
+                for sid in errlogs}
+
+    conn = _dm_conn(a)
+    try:
+        _ensure_ou(conn, w5_ou)
+        _bulk_add_devices(a, members)
+        t0 = time.monotonic()
+        conn.add_s(group_dn, [('objectClass', [b'top', b'groupOfNames']),
+                              ('cn', [b'w5group']),
+                              ('member', [dn.encode() for dn in initial])])
+        log.info('W5 control group add (%d members) parked the client '
+                 'for %.1fs', len(initial), time.monotonic() - t0)
+        for sid, bdn in barrier_dns.items():
+            cn = bdn.split(',', 1)[0].split('=', 1)[1]
+            conn.add_s(bdn, [('objectClass', [b'top', b'groupOfNames']),
+                             ('cn', [cn.encode()])])
+    finally:
+        _safe_unbind(conn)
+
+    _fleet_barrier(repl, a, suppliers, timeout=600)
+    for inst in suppliers:
+        conn = _dm_conn(inst, timeout=60)
+        try:
+            _wait_count(conn, w5_ou, _holder_filter(group_dn),
+                        len(initial), timeout=DRAIN_TIMEOUT,
+                        what=f'W5 ADD-path control back-links on '
+                             f'{inst.serverid}')
+        finally:
+            _safe_unbind(conn)
+
+    log_before = _log_counts()
+
+    aconn = _dm_conn(a)
+    try:
+        t0 = time.monotonic()
+        aconn.modify_s(group_dn,
+                       [(ldap.MOD_ADD, 'member', [late_member.encode()])])
+        park = time.monotonic() - t0
+        deadline = time.monotonic() + 15
+        direct_backlink = False
+        while time.monotonic() < deadline:
+            if group_dn.lower() in _memberof_values(aconn, late_member):
+                direct_backlink = True
+                break
+            time.sleep(0.5)
+    finally:
+        _safe_unbind(aconn)
+    log.info('W5 direct MOD_ADD on %s: parked %.2fs, back-link %s',
+             a.serverid, park,
+             'present' if direct_backlink else 'MISSING')
+
+    replicated = {}
+    for inst in others:
+        conn = _dm_conn(inst, timeout=60)
+        try:
+            deadline = time.monotonic() + DRAIN_TIMEOUT
+            while time.monotonic() < deadline:
+                if late_member.lower() in _member_set(conn, group_dn):
+                    break
+                time.sleep(2)
+            else:
+                pytest.fail(f'forward link for {late_member} never '
+                            f'replicated to {inst.serverid}')
+            t0 = time.monotonic()
+            conn.modify_s(barrier_dns[inst.serverid],
+                          [(ldap.MOD_ADD, 'member',
+                            [initial[0].encode()])])
+            bpark = time.monotonic() - t0
+            deadline = time.monotonic() + 15
+            present = False
+            while time.monotonic() < deadline:
+                if group_dn.lower() in _memberof_values(conn,
+                                                        late_member):
+                    present = True
+                    break
+                time.sleep(0.5)
+            replicated[inst.serverid] = present
+            log.info('W5 replicated path on %s: barrier parked %.2fs, '
+                     'back-link %s', inst.serverid, bpark,
+                     'present' if present else 'MISSING')
+        finally:
+            _safe_unbind(conn)
+
+    log_after = _log_counts()
+    silent = log_after == log_before
+    present_repl = [sid for sid, p in replicated.items() if p]
+    missing_repl = [sid for sid, p in replicated.items() if not p]
+    log.info('W5 verdict: direct_backlink=%s replicated_present=%s '
+             'replicated_missing=%s silent=%s', direct_backlink,
+             present_repl, missing_repl, silent)
+
+    if W5_EXPECT == 'fixed':
+        assert direct_backlink, \
+            f'{a.serverid}: back-link missing on the op origin - the ' \
+            f'deferred MODIFY replay skipped its fanout under entry scope'
+        assert not missing_repl, \
+            f'back-link missing on {missing_repl} - the replicated ' \
+            f'deferred MODIFY replay skipped its fanout under entry scope'
+    elif W5_EXPECT == 'broken':
+        assert not direct_backlink, \
+            f'{a.serverid}: direct back-link present - this build does ' \
+            f'not skip the deferred MODIFY fanout under entry scope; ' \
+            f'set MEMBEROF_REPRO_W5_EXPECT=fixed'
+        assert not present_repl, \
+            f'back-link present on {present_repl} - expected the scope ' \
+            f'skip on every replica'
+        assert silent, \
+            f'the scope skip must be silent; log count deltas: ' \
+            f'{ {sid: (log_before[sid], log_after[sid]) for sid in log_after if log_after[sid] != log_before[sid]} }'
+    else:
+        log.info('W5 EXPECT=report: no assertion applied')
 
 
 if __name__ == '__main__':
