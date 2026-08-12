@@ -56,6 +56,19 @@ Workloads (run separately with -k, or in file order):
   client returns - that ordering is asserted instead of wall-clock
   thresholds.  An optional probe stops the instance mid-drain to
   exercise the systemd TimeoutStopSec race.
+- W4: a failing fanout write silently abandons the rest of the task,
+  with no restart anywhere.  The worker discards the deferred
+  functions' return codes, and inside deferred_mod_func the first
+  failing internal write bails out of the whole task.  W4 pins the
+  worker with a fat group-delete fanout, queues one MODIFY adding all
+  victim members in a single operation (one task, many values), then
+  flips the backend read-only so the victim task's first write fails.
+  The abandoned values keep their forward links but never get
+  memberOf; the client that issued the MODIFY sees success; the only
+  trace is an ERR line.  This is the spike-correlated loss mechanism:
+  in production the failing write is a BDB deadlock or lock exhaustion
+  under load, not a read-only backend, but the abandon path is the
+  same.
 
 Environment knobs:
 
@@ -73,6 +86,10 @@ Environment knobs:
 - MEMBEROF_REPRO_W3_GROUP    members in the delete-hang group (default HOSTS)
 - MEMBEROF_REPRO_W3_WRITERS  writers parked behind the delete (default threads+8)
 - MEMBEROF_REPRO_W3_STOP     1 = stop the instance mid-drain (systemd hosts only)
+- MEMBEROF_REPRO_W4_WINDOW   minimum pin-fanout window in seconds (default 4);
+                             the pin group is grown until deleting it keeps
+                             the worker busy at least this long
+- MEMBEROF_REPRO_W4_PIN      fixed pin-group size (default 0 = auto-calibrate)
 - MEMBEROF_REPRO_THREADS     nsslapd-threadnumber (default scales with topology)
 - MEMBEROF_REPRO_EXPECT      report (default) | stock | fixed - W2 assert policy
 - MEMBEROF_REPRO_DRAIN_TIMEOUT  fleet drain wait in seconds (default scales)
@@ -84,7 +101,9 @@ W1 asserts unconditionally: task loss on unclean shutdown is present on
 both stock 2.8.0 and current upstream (the deferred machinery itself is
 unchanged), so a failure means the reproducer did not reach a backlog,
 not that the bug is fixed.  W2 depends on issue 7460, hence the EXPECT
-knob: stock 2.8.0 churns, builds carrying 90735eb16 must not.
+knob: stock 2.8.0 churns, builds carrying 90735eb16 must not.  W4,
+like W1, asserts unconditionally: the worker discards return codes on
+every build, so the abandon path is unchanged by the 7460 fix.
 
 Sized for a Fedora/RHEL VM.  Smoke profile (2 suppliers, HOSTS=600) is
 enough to validate the mechanics; fidelity (16 suppliers, HOSTS=90000)
@@ -150,6 +169,10 @@ W2_OVERLAP = min(int(os.getenv('MEMBEROF_REPRO_W2_OVERLAP', '100')),
                  max(10, HOSTS // 4))
 W3_SIZE = min(int(os.getenv('MEMBEROF_REPRO_W3_GROUP', str(HOSTS))), HOSTS)
 W3_STOP_PROBE = os.getenv('MEMBEROF_REPRO_W3_STOP', '0') == '1'
+W4_WINDOW = float(os.getenv('MEMBEROF_REPRO_W4_WINDOW', '4'))
+W4_PIN = int(os.getenv('MEMBEROF_REPRO_W4_PIN', '0'))
+W4_PIN_CAP = 40000
+W4_VICTIMS = 20
 EXPECT = os.getenv('MEMBEROF_REPRO_EXPECT', 'report')
 
 # Every client whose op touched a grouping attribute occupies a server
@@ -181,6 +204,9 @@ HOSTS_OU = f'ou=hosts,{FLEET_OU}'
 HOST_DNS = [f'cn=h{i:06d},{HOSTS_OU}' for i in range(HOSTS)]
 
 WARN_RE = '.*It is recommended to launch memberof fixup task.*'
+# deferred_mod_func reuses the postop's message text when a fanout
+# write fails and the rest of the task is abandoned
+FAIL_RE = '.*Failed to add dn.*to target.*Error.*'
 
 
 def _dm_conn(inst, timeout=None):
@@ -309,14 +335,14 @@ def _add_sim_schema(inst):
             pass
 
 
-def _bulk_add_hosts(inst, loaders=4):
+def _bulk_add_devices(inst, dns, loaders=4):
     # nsMemberOf up front keeps autoaddoc from generating objectClass
-    # MODs on the hosts later: those MODs replicate (only memberOf is
+    # MODs on the entries later: those MODs replicate (only memberOf is
     # excluded) and their echoes would advance entryUSNs under W2's feet.
-    def load(dns):
+    def load(chunk):
         conn = _dm_conn(inst)
         try:
-            for dn in dns:
+            for dn in chunk:
                 cn = dn.split(',', 1)[0].split('=', 1)[1]
                 try:
                     conn.add_s(dn, [('objectClass',
@@ -329,12 +355,16 @@ def _bulk_add_hosts(inst, loaders=4):
 
     threads = []
     for i in range(loaders):
-        t = threading.Thread(target=load, args=(HOST_DNS[i::loaders],),
+        t = threading.Thread(target=load, args=(dns[i::loaders],),
                              daemon=True)
         t.start()
         threads.append(t)
     for t in threads:
         t.join()
+
+
+def _bulk_add_hosts(inst, loaders=4):
+    _bulk_add_devices(inst, HOST_DNS, loaders)
 
 
 def _fleet_barrier(repl, source, suppliers, timeout):
@@ -1081,6 +1111,241 @@ def test_w3_group_delete_hang(fleet):
     assert not early, \
         f'{len(early)} writers completed before the delete fanout ' \
         f'finished - deferred FIFO ordering did not engage'
+
+
+def test_w4_error_abandon_without_restart(fleet):
+    """A failing fanout write silently abandons the rest of the task.
+
+    :id: e2f6b1a8-4d07-49c3-a5b9-1c8e7f3d2a44
+    :setup: Same fleet as W1
+    :steps:
+        1. Create victim member entries and an empty victim group on
+           one supplier; wait for them to replicate to the control
+        2. Build a pin group and calibrate its size until deleting it
+           keeps the deferred worker busy for at least W4_WINDOW
+           seconds (its delete fanout is the FIFO task the victim op
+           queues behind)
+        3. DELETE the pin group in the background; the moment the
+           delete commits, MODIFY the victim group adding all victim
+           members in a single operation (one deferred task, many
+           values)
+        4. The moment the victim MODIFY commits, set the backend
+           read-only, so the victim task's first fanout write fails
+        5. Join both clients, restore the backend, and let the state
+           quiesce
+        6. Assert the damage on the victim supplier and the absence of
+           damage on the control supplier
+    :expectedresults:
+        1. Success
+        2. Pin delete window is at least W4_WINDOW seconds
+        3. Both operations commit; both clients park on their tasks
+        4. The worker bails on the victim task's first write; the rest
+           of the task is abandoned with only an ERR line
+        5. Both clients return success - the MODIFY itself committed,
+           so the loss is invisible at the protocol level
+        6. Victim: all members present in the group, back-links
+           missing, ERR line logged, no restart (same pid, no new
+           startup WARNING), damage survives quiescing (nothing
+           retries).  Control: all back-links present, proving the
+           replicated MODIFY fans out fine where no write failed
+    """
+    suppliers = list(fleet.ms.values())
+    control, victim = suppliers[0], suppliers[-1]
+    repl = ReplicationManager(DEFAULT_SUFFIX)
+
+    w4_ou = f'ou=w4,{FLEET_OU}'
+    group_dn = f'cn=w4group,{w4_ou}'
+    pin_dn = f'cn=w4pin,{w4_ou}'
+    victims = [f'cn=w4u{i:03d},{w4_ou}' for i in range(W4_VICTIMS)]
+    be = Backends(victim).get('userRoot')
+
+    conn = _dm_conn(victim)
+    try:
+        _ensure_ou(conn, w4_ou)
+        _bulk_add_devices(victim, victims)
+        conn.add_s(group_dn, [('objectClass', [b'top', b'groupOfNames']),
+                              ('cn', [b'w4group'])])
+    finally:
+        _safe_unbind(conn)
+
+    _fleet_barrier(repl, victim, suppliers, timeout=600)
+    cconn = _dm_conn(control, timeout=60)
+    try:
+        _wait_count(cconn, w4_ou, '(objectClass=device)', W4_VICTIMS,
+                    timeout=300,
+                    what=f'victim entries on {control.serverid}')
+    finally:
+        _safe_unbind(cconn)
+
+    # Calibrate the pin: its DELETE fanout is the window inside which
+    # the victim op must commit and the read-only flip must land.  The
+    # ADD fanout of the same members is a faithful dry-run of the
+    # DELETE fanout's duration (same op count on the same worker).
+    conn = _dm_conn(victim)
+    fillers_created = 0
+    pin_size = W4_PIN if W4_PIN > 0 else min(HOSTS, max(300, HOSTS // 2))
+    try:
+        while True:
+            members = HOST_DNS[:min(pin_size, HOSTS)]
+            need = pin_size - len(members)
+            if need > fillers_created:
+                new = [f'cn=w4f{i:05d},{w4_ou}'
+                       for i in range(fillers_created, need)]
+                _bulk_add_devices(victim, new)
+                fillers_created = need
+            if need > 0:
+                members = members + [f'cn=w4f{i:05d},{w4_ou}'
+                                     for i in range(need)]
+            t0 = time.monotonic()
+            conn.add_s(pin_dn,
+                       [('objectClass', [b'top', b'groupOfNames']),
+                        ('cn', [b'w4pin']),
+                        ('member', [dn.encode() for dn in members])])
+            window = time.monotonic() - t0
+            log.info('W4 pin add (%d members) blocked the client for '
+                     '%.1fs', len(members), window)
+            if W4_PIN > 0 or window >= W4_WINDOW:
+                break
+            conn.delete_s(pin_dn)
+            pin_size *= 2
+            if pin_size > W4_PIN_CAP:
+                pytest.fail(f'could not reach a {W4_WINDOW}s pin window '
+                            f'below {W4_PIN_CAP} members; set '
+                            f'MEMBEROF_REPRO_W4_PIN or raise '
+                            f'MEMBEROF_REPRO_W4_WINDOW')
+    finally:
+        _safe_unbind(conn)
+
+    errlog = DirsrvErrorLog(victim)
+    fail_before = len(errlog.match(FAIL_RE))
+    warn_before = len(errlog.match(WARN_RE))
+    with open(victim.pid_file(), 'r') as f:
+        pid_before = int(f.readline().strip())
+    assert pid_before > 0
+
+    pin_result = {}
+    victim_result = {}
+
+    def delete_pin():
+        c = _dm_conn(victim)
+        t = time.monotonic()
+        try:
+            c.delete_s(pin_dn)
+            pin_result['ok'] = time.monotonic() - t
+        except ldap.LDAPError as e:
+            pin_result['err'] = type(e).__name__
+        finally:
+            _safe_unbind(c)
+
+    def add_victims():
+        c = _dm_conn(victim)
+        t = time.monotonic()
+        try:
+            c.modify_s(group_dn,
+                       [(ldap.MOD_ADD, 'member',
+                         [dn.encode() for dn in victims])])
+            victim_result['ok'] = time.monotonic() - t
+        except ldap.LDAPError as e:
+            victim_result['err'] = type(e).__name__
+        finally:
+            _safe_unbind(c)
+
+    flipped = False
+    mon = _dm_conn(victim, timeout=30)
+    pin_thread = threading.Thread(target=delete_pin, daemon=True)
+    victim_thread = threading.Thread(target=add_victims, daemon=True)
+    try:
+        pin_thread.start()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if not _entry_exists(mon, pin_dn):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail('pin delete did not commit within 15s')
+
+        victim_thread.start()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if len(_member_set(mon, group_dn)) == W4_VICTIMS:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail('victim MODIFY did not commit within 15s')
+
+        be.replace('nsslapd-readonly', 'on')
+        flipped = True
+        log.info('W4 backend read-only; waiting for the parked clients')
+        victim_thread.join(timeout=300)
+        pin_thread.join(timeout=300)
+    finally:
+        if flipped:
+            try:
+                be.replace('nsslapd-readonly', 'off')
+            except ldap.LDAPError as e:
+                log.error('W4 could not restore nsslapd-readonly: %s', e)
+        _safe_unbind(mon)
+
+    assert not victim_thread.is_alive(), \
+        'victim client still parked - the worker did not clear its flag ' \
+        'after the bail'
+    # The deceptive part of the abandon path: the MODIFY itself
+    # committed before the flip, so the client that lost its fanout
+    # sees plain success.
+    assert 'ok' in victim_result, \
+        f'victim MODIFY failed at the protocol level: {victim_result}'
+    log.info('W4 victim client: success after %.1fs park; pin client: %s',
+             victim_result['ok'], pin_result)
+
+    vconn = _dm_conn(victim, timeout=60)
+    try:
+        holders = _quiesce_count(vconn, w4_ou, _holder_filter(group_dn),
+                                 timeout=180)
+        members_now = len(_member_set(vconn, group_dn))
+        pin_orphans = (_count_filter(vconn, HOSTS_OU,
+                                     _holder_filter(pin_dn)) +
+                       _count_filter(vconn, w4_ou, _holder_filter(pin_dn)))
+    finally:
+        _safe_unbind(vconn)
+
+    assert members_now == W4_VICTIMS, \
+        f'victim group lost members: {members_now} of {W4_VICTIMS}'
+    missing = W4_VICTIMS - holders
+    log.info('W4 %s: members=%d back-links=%d missing=%d pin_orphans=%d',
+             victim.serverid, members_now, holders, missing, pin_orphans)
+    if missing == 0:
+        pytest.fail('the read-only flip lost the race against the pin '
+                    'window - no damage on the victim; raise '
+                    'MEMBEROF_REPRO_W4_WINDOW or set MEMBEROF_REPRO_W4_PIN')
+
+    fail_after = len(errlog.match(FAIL_RE))
+    assert fail_after > fail_before, \
+        'no "Failed to add dn ... to target" ERR line - the abandon was ' \
+        'not the deferred bail path'
+
+    with open(victim.pid_file(), 'r') as f:
+        pid_after = int(f.readline().strip())
+    assert pid_after == pid_before, \
+        f'victim restarted during W4 (pid {pid_before} -> {pid_after})'
+    warn_after = len(errlog.match(WARN_RE))
+    assert warn_after == warn_before, \
+        'a startup fixup WARNING appeared during W4 - the damage must ' \
+        'come from the abandon path, not from a restart'
+
+    cconn = _dm_conn(control, timeout=60)
+    try:
+        _wait_count(cconn, w4_ou, _holder_filter(group_dn), W4_VICTIMS,
+                    timeout=DRAIN_TIMEOUT,
+                    what=f'W4 back-links on {control.serverid}')
+        _wait_count(cconn, DEFAULT_SUFFIX, _holder_filter(pin_dn), 0,
+                    timeout=DRAIN_TIMEOUT,
+                    what=f'W4 pin cleanup on {control.serverid}')
+    finally:
+        _safe_unbind(cconn)
+
+    log.info('W4 damage: %d of %d back-links silently lost on %s with '
+             'zero restarts; control %s is fully consistent',
+             missing, W4_VICTIMS, victim.serverid, control.serverid)
 
 
 if __name__ == '__main__':
