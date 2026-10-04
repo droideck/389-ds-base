@@ -39,7 +39,6 @@
 #include "fe.h"
 #include "pratom.h"
 #include "pw_verify.h"
-#include "pr7920_probe.h"
 #include <sasl/sasl.h>
 
 static void log_bind_access(
@@ -502,28 +501,16 @@ do_bind(Slapi_PBlock *pb)
             }
 
             /* set the bind credentials so anonymous limits are set */
-            pr7920_probe("anon_bind_creds_enter", pb_conn->c_connid, pb_op->o_opid,
-                         pr7920_now_ns(), 0, 0);
             bind_credentials_set(pb_conn, SLAPD_AUTH_NONE,
                                  NULL, NULL, NULL, NULL, NULL);
-            pr7920_probe("anon_bind_creds_exit", pb_conn->c_connid, pb_op->o_opid,
-                         pr7920_now_ns(), 0, 0);
 
             /* call preop plugins */
-            pr7920_probe("anon_bind_preop_enter", pb_conn->c_connid, pb_op->o_opid,
-                         pr7920_now_ns(), 0, 0);
             rc = plugin_call_plugins(pb, SLAPI_PLUGIN_PRE_BIND_FN);
-            pr7920_probe("anon_bind_preop_exit", pb_conn->c_connid, pb_op->o_opid,
-                         pr7920_now_ns(), 0, rc);
             if (rc == 0) {
                 if (auth_response_requested) {
                     slapi_add_auth_response_control(pb, "");
                 }
-                pr7920_probe("anon_bind_result_enter", pb_conn->c_connid, pb_op->o_opid,
-                             pr7920_now_ns(), 0, 0);
                 send_ldap_result(pb, LDAP_SUCCESS, NULL, NULL, 0, NULL);
-                pr7920_probe("anon_bind_result_exit", pb_conn->c_connid, pb_op->o_opid,
-                             pr7920_now_ns(), 0, 0);
                 slapi_log_security(pb, SECURITY_BIND_SUCCESS, SECURITY_MSG_ANONYMOUS_BIND);
                 /* call postop plugins */
                 plugin_call_plugins(pb, SLAPI_PLUGIN_POST_BIND_FN);

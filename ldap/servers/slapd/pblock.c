@@ -14,7 +14,6 @@
 
 #include "cert.h"
 #include "pblock_v3.h"
-#include "pr7920_probe.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -6814,21 +6813,10 @@ slapi_pblock_set_result_text_if_empty(Slapi_PBlock *pb, char *text) {
 void
 bind_credentials_set(Connection *conn, char *authtype, char *normdn, char *extauthtype, char *externaldn, CERTCertificate *clientcert, Slapi_Entry *bind_target_entry)
 {
-    uint64_t probe_start_ns;
-    uint64_t probe_end_ns;
-
-    pr7920_probe("bind_creds_mutex_wait", conn->c_connid, -1,
-                 pr7920_now_ns(), 0, 0);
-    probe_start_ns = pr7920_now_ns();
     pthread_mutex_lock(&(conn->c_mutex));
-    probe_end_ns = pr7920_now_ns();
-    pr7920_probe("bind_creds_mutex_acquired", conn->c_connid, -1,
-                 probe_end_ns, probe_end_ns - probe_start_ns, 0);
     bind_credentials_set_nolock(conn, authtype, normdn,
                                 extauthtype, externaldn, clientcert, bind_target_entry);
     pthread_mutex_unlock(&(conn->c_mutex));
-    pr7920_probe("bind_creds_mutex_released", conn->c_connid, -1,
-                 pr7920_now_ns(), 0, 0);
 }
 
 void

@@ -77,6 +77,22 @@ def _wait_for_error_log(inst, offset, pattern, timeout):
     return None
 
 
+def _wait_for_probe_dump(path, offset, conn_id, timeout):
+    """Wait for the Bind's post-send in-memory probe snapshot to reach disk."""
+    deadline = time.monotonic() + timeout
+    pattern = r"conn={} op=\d+ event=probe_dump_complete\b".format(conn_id)
+    while time.monotonic() < deadline:
+        try:
+            with open(path, "r", errors="replace") as source:
+                source.seek(offset)
+                if re.search(pattern, source.read()):
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.02)
+    return False
+
+
 def _capture_delayed_bind(inst, completed, output_dir):
     """Take a separate snapshot only if the diagnostic Bind is still waiting."""
     if completed.wait(0.75):
@@ -164,6 +180,7 @@ def test_dos_partial_message(topology_st):
     delayed_bind_done = threading.Event()
     snapshot_thread = None
     timing = {"backend": os.environ.get("NSSLAPD_DB_LIB"),
+              "probe_variant": "lite-ring-postsend",
               "gdb_enabled": os.environ.get("PR7920_GDB") == "1"}
     try:
         inst.config.loglevel([ErrorLog.CONNECT, ErrorLog.DEFAULT])
@@ -236,6 +253,9 @@ def test_dos_partial_message(topology_st):
         delayed_bind_done.set()
         if snapshot_thread is not None:
             snapshot_thread.join(timeout=4.5)
+        if "queued_connection_id" in timing:
+            timing["probe_dump_seen"] = _wait_for_probe_dump(
+                probe_path, probe_offset, timing["queued_connection_id"], 2)
         try:
             with open(probe_path, "rb") as source:
                 source.seek(probe_offset)
@@ -245,6 +265,10 @@ def test_dos_partial_message(topology_st):
             timing["probe_bytes"] = len(probe_data)
         except OSError as exc:
             timing["probe_error"] = repr(exc)
+            # Preserve an explicit empty artifact if the server never dumped.
+            with open(os.path.join(diag_dir, "server-probe.log"), "wb"):
+                pass
+            timing["probe_bytes"] = 0
         with open(os.path.join(diag_dir, "client-timing.json"), "w") as output:
             json.dump(timing, output, sort_keys=True, indent=2)
         if s is not None:

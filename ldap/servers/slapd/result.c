@@ -22,6 +22,12 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
 #include "slap.h"
 #include "pratom.h"
 #include "fe.h"
@@ -49,6 +55,185 @@ static char *op_to_string(int tag);
 
 #define SLAPI_SEND_VATTR_FLAG_REALONLY 0x01
 #define SLAPI_SEND_VATTR_FLAG_VIRTUALONLY 0x02
+
+/* Temporary PR 7920 diagnostic only. The server's hot path stores one
+ * in-memory record per poll or flush; disk I/O happens after every Bind
+ * ber_flush and c_pdumutex unlock. The post-send dump can inflate the access
+ * RESULT timestamp, so compare the client's receive time with the recorded
+ * lock/write timestamps. Records use the original probe line format.
+ */
+#define PR7920_RING_SIZE 8192
+
+typedef struct pr7920_record {
+    uint64_t sequence;
+    uint64_t connid;
+    int32_t opid;
+    unsigned long tid;
+    long lwp;
+    uint64_t stamp[5];
+    int kind; /* 1 = reader poll, 2 = result flush */
+    int aux;  /* poll wait number or result type */
+    int rc;
+} pr7920_record;
+
+typedef struct pr7920_slot {
+    unsigned char busy;
+    pr7920_record value;
+} pr7920_slot;
+
+static pr7920_slot pr7920_ring[PR7920_RING_SIZE];
+static uint64_t pr7920_next_sequence;
+static pthread_mutex_t pr7920_dump_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread long pr7920_thread_lwp;
+
+static void
+pr7920_store_record(pr7920_record *record)
+{
+    uint64_t sequence = __atomic_fetch_add(&pr7920_next_sequence, 1, __ATOMIC_RELAXED);
+    pr7920_slot *slot = &pr7920_ring[sequence % PR7920_RING_SIZE];
+
+    if (pr7920_thread_lwp == 0) {
+        pr7920_thread_lwp = (long)syscall(SYS_gettid);
+    }
+    record->sequence = sequence;
+    record->tid = (unsigned long)pthread_self();
+    record->lwp = pr7920_thread_lwp;
+    while (__atomic_test_and_set(&slot->busy, __ATOMIC_ACQUIRE)) {
+    }
+    slot->value = *record;
+    __atomic_clear(&slot->busy, __ATOMIC_RELEASE);
+}
+
+void
+pr7920_poll_record(uint64_t connid, int32_t opid, uint64_t lock_wait_ns,
+                   uint64_t lock_acquired_ns, uint64_t poll_enter_ns,
+                   uint64_t poll_exit_ns, uint64_t lock_released_ns,
+                   int waits_done, int poll_rc)
+{
+    pr7920_record record = {0};
+    record.connid = connid;
+    record.opid = opid;
+    record.stamp[0] = lock_wait_ns;
+    record.stamp[1] = lock_acquired_ns;
+    record.stamp[2] = poll_enter_ns;
+    record.stamp[3] = poll_exit_ns;
+    record.stamp[4] = lock_released_ns;
+    record.kind = 1;
+    record.aux = waits_done;
+    record.rc = poll_rc;
+    pr7920_store_record(&record);
+}
+
+void
+pr7920_flush_record(uint64_t connid, int32_t opid, uint64_t lock_wait_ns,
+                    uint64_t lock_acquired_ns, uint64_t write_enter_ns,
+                    uint64_t write_exit_ns, uint64_t lock_released_ns,
+                    int type, int write_rc)
+{
+    pr7920_record record = {0};
+    record.connid = connid;
+    record.opid = opid;
+    record.stamp[0] = lock_wait_ns;
+    record.stamp[1] = lock_acquired_ns;
+    record.stamp[2] = write_enter_ns;
+    record.stamp[3] = write_exit_ns;
+    record.stamp[4] = lock_released_ns;
+    record.kind = 2;
+    record.aux = type;
+    record.rc = write_rc;
+    pr7920_store_record(&record);
+}
+
+static void
+pr7920_emit_event(int fd, const pr7920_record *record, const char *event,
+                  uint64_t when_ns, uint64_t wait_ns, int aux)
+{
+    char line[256];
+    int n = snprintf(line, sizeof(line),
+                     "pr7920 ns=%" PRIu64 " tid=%lu lwp=%ld conn=%" PRIu64
+                     " op=%d event=%s wait_ns=%" PRIu64 " aux=%d\n",
+                     when_ns, record->tid, record->lwp, record->connid,
+                     record->opid, event, wait_ns, aux);
+    if (n > 0 && n < (int)sizeof(line)) {
+        (void)write(fd, line, (size_t)n);
+    }
+}
+
+static void
+pr7920_emit_record(int fd, const pr7920_record *record)
+{
+    if (record->kind == 1) {
+        pr7920_emit_event(fd, record, "pdumutex_wait_poll", record->stamp[0], 0, record->aux);
+        pr7920_emit_event(fd, record, "pdumutex_acquired_poll", record->stamp[1],
+                          record->stamp[1] - record->stamp[0], record->aux);
+        pr7920_emit_event(fd, record, "poll_enter", record->stamp[2], 0, record->aux);
+        pr7920_emit_event(fd, record, "poll_exit", record->stamp[3],
+                          record->stamp[3] - record->stamp[2], record->rc);
+        pr7920_emit_event(fd, record, "pdumutex_released_poll", record->stamp[4], 0, record->aux);
+    } else if (record->kind == 2) {
+        pr7920_emit_event(fd, record, "flush_pdumutex_wait", record->stamp[0], 0, record->aux);
+        pr7920_emit_event(fd, record, "flush_pdumutex_acquired", record->stamp[1],
+                          record->stamp[1] - record->stamp[0], record->aux);
+        pr7920_emit_event(fd, record, "flush_write_enter", record->stamp[2], 0, record->aux);
+        pr7920_emit_event(fd, record, "flush_write_exit", record->stamp[3],
+                          record->stamp[3] - record->stamp[2], record->rc);
+        pr7920_emit_event(fd, record, "flush_pdumutex_released", record->stamp[4], 0, record->aux);
+    }
+}
+
+void
+pr7920_dump_bind(uint64_t connid, int32_t opid, uint64_t lock_wait_ns)
+{
+    const char *path;
+    char *errorlog = NULL;
+    char pathbuf[PATH_MAX];
+    uint64_t end_sequence;
+    uint64_t start_sequence;
+    uint64_t sequence;
+    pr7920_record marker = {0};
+    int fd;
+    int n;
+
+    path = getenv("DS_PR7920_PROBE_PATH");
+    if (path == NULL || path[0] == '\0') {
+        errorlog = config_get_errorlog();
+        if (errorlog == NULL) {
+            return;
+        }
+        n = snprintf(pathbuf, sizeof(pathbuf), "%s.pr7920-probe", errorlog);
+        slapi_ch_free_string(&errorlog);
+        if (n < 0 || n >= (int)sizeof(pathbuf)) {
+            return;
+        }
+        path = pathbuf;
+    }
+
+    pthread_mutex_lock(&pr7920_dump_mutex);
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        end_sequence = __atomic_load_n(&pr7920_next_sequence, __ATOMIC_ACQUIRE);
+        start_sequence = end_sequence > PR7920_RING_SIZE ? end_sequence - PR7920_RING_SIZE : 0;
+        for (sequence = start_sequence; sequence < end_sequence; sequence++) {
+            pr7920_slot *slot = &pr7920_ring[sequence % PR7920_RING_SIZE];
+            pr7920_record copy;
+            while (__atomic_test_and_set(&slot->busy, __ATOMIC_ACQUIRE)) {
+            }
+            copy = slot->value;
+            __atomic_clear(&slot->busy, __ATOMIC_RELEASE);
+            if (copy.sequence == sequence && copy.connid == connid) {
+                pr7920_emit_record(fd, &copy);
+            }
+        }
+        marker.connid = connid;
+        marker.opid = opid;
+        marker.tid = (unsigned long)pthread_self();
+        marker.lwp = pr7920_thread_lwp;
+        pr7920_emit_event(fd, &marker, "probe_dump_complete", pr7920_now_ns(),
+                          lock_wait_ns, 0);
+        close(fd);
+    }
+    pthread_mutex_unlock(&pr7920_dump_mutex);
+}
 
 
 PRUint64
@@ -1899,8 +2084,12 @@ flush_ber(
 {
     ber_len_t bytes;
     int rc = 0;
-    uint64_t probe_start_ns;
-    uint64_t probe_end_ns;
+    uint64_t probe_lock_wait_ns;
+    uint64_t probe_lock_acquired_ns;
+    uint64_t probe_write_enter_ns;
+    uint64_t probe_write_exit_ns;
+    uint64_t probe_lock_released_ns;
+    int probe_saved_errno;
 
     switch (type) {
     case _LDAP_SEND_RESULT:
@@ -1930,24 +2119,25 @@ flush_ber(
         ber_get_option(ber, LBER_OPT_BYTES_TO_WRITE, &bytes);
 
         fgot_start(op, FGOT_WRITE);
-        pr7920_probe("flush_pdumutex_wait", conn->c_connid, op->o_opid,
-                     pr7920_now_ns(), 0, type);
-        probe_start_ns = pr7920_now_ns();
+        probe_lock_wait_ns = pr7920_now_ns();
         PR_Lock(conn->c_pdumutex);
-        probe_end_ns = pr7920_now_ns();
-        pr7920_probe("flush_pdumutex_acquired", conn->c_connid, op->o_opid,
-                     probe_end_ns, probe_end_ns - probe_start_ns, type);
-        pr7920_probe("flush_write_enter", conn->c_connid, op->o_opid,
-                     pr7920_now_ns(), 0, type);
-        probe_start_ns = pr7920_now_ns();
+        probe_lock_acquired_ns = pr7920_now_ns();
+        probe_write_enter_ns = pr7920_now_ns();
         rc = ber_flush(conn->c_sb, ber, 1);
-        probe_end_ns = pr7920_now_ns();
-        pr7920_probe("flush_write_exit", conn->c_connid, op->o_opid,
-                     probe_end_ns, probe_end_ns - probe_start_ns, rc);
+        probe_write_exit_ns = pr7920_now_ns();
         PR_Unlock(conn->c_pdumutex);
-        pr7920_probe("flush_pdumutex_released", conn->c_connid, op->o_opid,
-                     pr7920_now_ns(), 0, type);
+        probe_lock_released_ns = pr7920_now_ns();
         fgot_end(op, FGOT_WRITE);
+        probe_saved_errno = errno;
+        pr7920_flush_record(conn->c_connid, op->o_opid, probe_lock_wait_ns,
+                            probe_lock_acquired_ns, probe_write_enter_ns,
+                            probe_write_exit_ns, probe_lock_released_ns,
+                            type, rc);
+        if (type == _LDAP_SEND_RESULT && op->o_tag == LDAP_REQ_BIND) {
+            pr7920_dump_bind(conn->c_connid, op->o_opid,
+                             probe_lock_acquired_ns - probe_lock_wait_ns);
+        }
+        errno = probe_saved_errno;
 
         if (rc != 0) {
             int oserr = errno;
