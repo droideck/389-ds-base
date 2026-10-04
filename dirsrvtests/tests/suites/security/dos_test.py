@@ -157,6 +157,8 @@ def test_dos_partial_message(topology_st):
     s = None
     diag_dir = os.path.join("assets", "pr7920")
     os.makedirs(diag_dir, exist_ok=True)
+    # The CI upload action runs outside the root-owned test container.
+    os.chmod(diag_dir, 0o755)
     probe_path = inst.errlog + ".pr7920-probe"
     probe_offset = 0
     delayed_bind_done = threading.Event()
