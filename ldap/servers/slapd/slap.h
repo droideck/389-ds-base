@@ -81,6 +81,7 @@ static char ptokPBE[34] = "Internal (Software) Token        ";
 #define LITTLE_ENDIAN __LITTLE_ENDIAN
 #endif
 #include <cert.h>
+#include <prcvar.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -1751,7 +1752,12 @@ typedef struct conn
     PRInt32 c_threadnumber;          /* # threads used in this conn    */
     int c_refcnt;                    /* # ops refering to this conn    */
     pthread_mutex_t c_mutex;         /* protect each conn structure; need to be re-entrant */
-    PRLock *c_pdumutex;              /* only write one pdu at a time   */
+    PRLock *c_readmutex;             /* protect the read buffer */
+    PRLock *c_pdumutex;              /* serialize writes with reader polls */
+    PRCondVar *c_pdu_writer_cv;      /* hand the PDU lock to a waiting writer */
+    int32_t c_pdu_writers_waiting;   /* atomic writer intent count */
+    uint64_t c_pdu_writer_admissions; /* protected by c_pdumutex */
+    PRBool c_pdu_reader_waiting;     /* protected by c_pdumutex */
     time_t c_idlesince;              /* last time of activity on conn  */
     int c_idletimeout;               /* local copy of idletimeout */
     int c_idletimeout_handle;        /* the resource limits handle */
