@@ -170,6 +170,16 @@ On the failure path: never restore a parameter you already replaced — on a DB 
 
 Writing concurrent code:
 
+- A partial-PDU reader holds `c_readmutex` while assembling the request and
+  `c_pdumutex` across each `PR_Poll` (`connection.c (connection_read_operation)`).
+  Result writers register intent before taking `c_pdumutex`; the reader uses
+  the associated condition variable to let a waiting writer acquire it, then
+  continues polling the same PDU (`result.c (flush_ber)`). The reader must
+  release `c_mutex` before waiting and release `c_pdumutex` before reacquiring
+  `c_mutex`; the reverse order can deadlock a SASL Bind. The condition variable
+  lives with the reusable connection slot (`conntable.c (connection_table_new)`,
+  `connection.c (connection_done)`).
+
 - Operation callbacks run concurrently on worker threads (`connection.c (connection_threadmain)`), and a live config modify runs a plugin's DSE callback on another worker at the same time (the config-lock pattern in [plugins.md](plugins.md)). Anything outside locals and the per-operation pblock is shared state and needs a synchronization owner: `slapi_new_mutex()` / `slapi_new_rwlock()`, the `slapi_atomic_*` family (`slapi-plugin.h (slapi_atomic_incr_64)`), or `Slapi_Counter`.
 - Release every lock on every exit path — early returns, `goto bail`, and error branches are where missed unlocks hide, and a leaked lock deadlocks the next worker thread that contends it.
 - Nested locks need one fixed acquisition order across all call paths. betxn callbacks already run inside the backend's transaction (see [plugins.md](plugins.md)), so audit ordering across module boundaries, not just within one file.

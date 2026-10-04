@@ -159,6 +159,9 @@ connection_done(Connection *conn)
     if (NULL != conn->c_sb) {
         ber_sockbuf_free(conn->c_sb);
     }
+    if (NULL != conn->c_pdu_writer_cv) {
+        PR_DestroyCondVar(conn->c_pdu_writer_cv);
+    }
     if (NULL != conn->c_pdumutex) {
         PR_DestroyLock(conn->c_pdumutex);
     }
@@ -1492,6 +1495,47 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                  */
                 PR_Lock(conn->c_pdumutex);
                 pthread_mutex_unlock(&(conn->c_mutex));
+
+                /* A reader can otherwise reacquire c_pdumutex for every poll
+                 * while a result writer remains blocked behind it. The
+                 * condition wait releases the PDU lock atomically. Wait for
+                 * one writer admission, then resume reading this PDU.
+                 */
+                if (slapi_atomic_load_32(&conn->c_pdu_writers_waiting, __ATOMIC_ACQUIRE) > 0) {
+                    uint64_t admission = conn->c_pdu_writer_admissions;
+                    conn->c_pdu_reader_waiting = PR_TRUE;
+                    while (conn->c_pdu_writer_admissions == admission) {
+                        if (PR_WaitCondVar(conn->c_pdu_writer_cv, PR_INTERVAL_NO_TIMEOUT) != PR_SUCCESS) {
+                            err = PR_GetError();
+                            syserr = PR_GetOSError();
+                            conn->c_pdu_reader_waiting = PR_FALSE;
+                            PR_Unlock(conn->c_pdumutex);
+                            pthread_mutex_lock(&(conn->c_mutex));
+                            slapi_log_err(SLAPI_LOG_ERR, "connection_read_operation",
+                                          "PDU writer wait for connection %" PRIu64 " failed: %d (%s)\n",
+                                          conn->c_connid, err, slapd_pr_strerror(err));
+                            disconnect_server_nomutex(conn, conn->c_connid, -1, err, syserr);
+                            ret = CONN_DONE;
+                            goto done;
+                        }
+                    }
+                    conn->c_pdu_reader_waiting = PR_FALSE;
+
+                    /* The writer may have closed the connection while we
+                     * waited. Drop c_pdumutex before taking c_mutex, just as
+                     * we do after PR_Poll, and refresh the socket descriptor.
+                     */
+                    PR_Unlock(conn->c_pdumutex);
+                    pthread_mutex_lock(&(conn->c_mutex));
+                    if ((conn->c_sd == SLAPD_INVALID_SOCKET) ||
+                        (conn->c_flags & CONN_FLAG_CLOSING)) {
+                        ret = CONN_DONE;
+                        goto done;
+                    }
+                    pr_pd.fd = (PRFileDesc *)conn->c_prfd;
+                    PR_Lock(conn->c_pdumutex);
+                    pthread_mutex_unlock(&(conn->c_mutex));
+                }
 
                 ret = PR_Poll(&pr_pd, 1, timeout);
 

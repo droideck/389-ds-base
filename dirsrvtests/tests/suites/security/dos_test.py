@@ -74,15 +74,11 @@ def _wait_for_error_log(inst, offset, pattern, timeout):
 
 
 def test_dos_partial_message(topology_st):
-    """Verify that a partial LDAP message does not block previous operations on the same connection.
+    """Verify that a partial LDAP message neither delays a Bind nor blocks its completion.
 
-    This exercises the race deterministically instead of racing a wall-clock
-    timeout: nsslapd-ioblocktimeout is pinned to a known, short value, and we
-    wait on the error log for proof that the server actually queued the
-    buffered second request ("more_data") before measuring how fast the
-    first Bind response arrives. This avoids CI-load-dependent flakiness
-    while still failing clearly (and quickly) if the connection mutex is
-    ever held across the second worker's blocking read again.
+    The queued log confirms that the second request was buffered, but does not
+    by itself prove that another worker entered its read path. Complete the
+    fragment after the first response to verify that reading resumes.
 
     :id: 3c59bb2a-0f77-477e-aa1c-de3aa8a0fa80
     :setup: Standalone instance with connection logging and a short, pinned
@@ -92,13 +88,15 @@ def test_dos_partial_message(topology_st):
         2. Send a complete Anonymous Bind request followed by a partial second message.
         3. Wait for the error log to confirm the second (partial) message was buffered/queued.
         4. Verify that the Bind response for the first message is received promptly.
-        5. Verify that other connections can still be established and used.
+        5. Complete the fragmented Bind request and receive its response.
+        6. Verify that other connections can still be established and used.
     :expectedresults:
         1. Connection established.
         2. Data sent.
         3. The server logs that it queued the connection due to buffered data.
         4. Bind response received well within ioblocktimeout.
-        5. Server remains responsive.
+        5. The second Bind succeeds on the same connection.
+        6. Server remains responsive.
     """
     inst = topology_st.standalone
     original_loglevel = inst.config.get_attr_val_utf8("nsslapd-errorlog-level")
@@ -138,25 +136,28 @@ def test_dos_partial_message(topology_st):
         start = time.monotonic()
         log.info("Waiting for bind response...")
         try:
-            data = s.recv(1024)
+            msgid, tag, payload = _recv_ldap_message(s)
         except socket.timeout:
             pytest.fail("Timed out waiting for bind response. The server might be deadlocked.")
         elapsed = time.monotonic() - start
         log.info(f"Bind response received after {elapsed:.2f}s")
-        log.debug(f"Received data: {data.hex()}")
 
-        # Bind response for MsgID=1: 30 0c 02 01 01 61 07 0a 01 00 04 00 04 00
-        assert b'\x02\x01\x01\x61' in data
-        # The real regression signature is the response taking close to the
-        # full ioblocktimeout (because a second worker held c_mutex while
-        # blocked reading the fragment). A healthy server replies almost
-        # immediately, so a generous fraction of the timeout still leaves
-        # plenty of margin above normal scheduling noise.
+        assert (msgid, tag) == (1, 0x61)
+        assert payload.startswith(b'\x0a\x01\x00'), "First Bind did not succeed"
+        # A blocked writer waits near the full ioblocktimeout. Leave ample
+        # margin for CI scheduling while detecting that regression.
         assert elapsed < (test_ioblocktimeout_ms / 1000.0) / 2, (
             f"Bind response took {elapsed:.2f}s - the server may be blocked "
             f"behind the partial second LDAP message"
         )
         log.info("Successfully received a prompt bind response for the first operation")
+
+        # Complete MsgID=2 only after receiving MsgID=1. The same reader must
+        # resume and process the bytes that follow the buffered prefix.
+        s.sendall(bind_req[5:])
+        msgid, tag, payload = _recv_ldap_message(s)
+        assert (msgid, tag) == (2, 0x61)
+        assert payload.startswith(b'\x0a\x01\x00'), "Fragmented Bind did not succeed"
     finally:
         if s is not None:
             s.close()
