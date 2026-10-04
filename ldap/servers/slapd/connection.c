@@ -23,6 +23,7 @@
 #include "prlog.h" /* for PR_ASSERT */
 #include "fe.h"
 #include "threadpool_stats.h"
+#include "pr7920_probe.h"
 #include <sasl/sasl.h>
 #include <stdbool.h>
 #if defined(LINUX)
@@ -1298,10 +1299,23 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
     struct berval **bvals = NULL;
     int proxy_connection = 0;
     int32_t log_format = config_get_accesslog_log_format();
+    uint64_t probe_start_ns;
+    uint64_t probe_end_ns;
 
     /* Keep one reader responsible for the whole PDU, including poll waits. */
+    pr7920_probe("read_enter", conn->c_connid, op->o_opid, pr7920_now_ns(), 0, 0);
+    pr7920_probe("readmutex_wait", conn->c_connid, op->o_opid, pr7920_now_ns(), 0, 0);
+    probe_start_ns = pr7920_now_ns();
     PR_Lock(conn->c_readmutex);
+    probe_end_ns = pr7920_now_ns();
+    pr7920_probe("readmutex_acquired", conn->c_connid, op->o_opid,
+                 probe_end_ns, probe_end_ns - probe_start_ns, 0);
+    pr7920_probe("mutex_wait_initial", conn->c_connid, op->o_opid, pr7920_now_ns(), 0, 0);
+    probe_start_ns = pr7920_now_ns();
     pthread_mutex_lock(&(conn->c_mutex));
+    probe_end_ns = pr7920_now_ns();
+    pr7920_probe("mutex_acquired_initial", conn->c_connid, op->o_opid,
+                 probe_end_ns, probe_end_ns - probe_start_ns, 0);
     /*
      * if the socket is still valid, get the ber element
      * waiting for us on this connection. timeout is handled
@@ -1490,10 +1504,24 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                  * We then release c_mutex to allow other threads to access
                  * connection metadata (e.g., for logging or result flushing).
                  */
+                pr7920_probe("pdumutex_wait_poll", conn->c_connid, op->o_opid,
+                             pr7920_now_ns(), 0, waits_done);
+                probe_start_ns = pr7920_now_ns();
                 PR_Lock(conn->c_pdumutex);
+                probe_end_ns = pr7920_now_ns();
+                pr7920_probe("pdumutex_acquired_poll", conn->c_connid, op->o_opid,
+                             probe_end_ns, probe_end_ns - probe_start_ns, waits_done);
                 pthread_mutex_unlock(&(conn->c_mutex));
+                pr7920_probe("mutex_released_poll", conn->c_connid, op->o_opid,
+                             pr7920_now_ns(), 0, waits_done);
 
+                pr7920_probe("poll_enter", conn->c_connid, op->o_opid,
+                             pr7920_now_ns(), 0, waits_done);
+                probe_start_ns = pr7920_now_ns();
                 ret = PR_Poll(&pr_pd, 1, timeout);
+                probe_end_ns = pr7920_now_ns();
+                pr7920_probe("poll_exit", conn->c_connid, op->o_opid,
+                             probe_end_ns, probe_end_ns - probe_start_ns, ret);
 
                 /*
                  * DEADLOCK AVOIDANCE: We MUST release c_pdumutex BEFORE
@@ -1504,7 +1532,15 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                  * for c_pdumutex (e.g., in flush_ber() called from a SASL bind).
                  */
                 PR_Unlock(conn->c_pdumutex);
+                pr7920_probe("pdumutex_released_poll", conn->c_connid, op->o_opid,
+                             pr7920_now_ns(), 0, waits_done);
+                pr7920_probe("mutex_wait_after_poll", conn->c_connid, op->o_opid,
+                             pr7920_now_ns(), 0, waits_done);
+                probe_start_ns = pr7920_now_ns();
                 pthread_mutex_lock(&(conn->c_mutex));
+                probe_end_ns = pr7920_now_ns();
+                pr7920_probe("mutex_acquired_after_poll", conn->c_connid, op->o_opid,
+                             probe_end_ns, probe_end_ns - probe_start_ns, waits_done);
 
                 /* check if the connection was closed while we were waiting */
                 if ((conn->c_sd == SLAPD_INVALID_SOCKET) ||
@@ -1635,7 +1671,11 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
     op->o_tag = *tag;
 done:
     pthread_mutex_unlock(&(conn->c_mutex));
+    pr7920_probe("mutex_released_final", conn->c_connid, op->o_opid,
+                 pr7920_now_ns(), 0, ret);
     PR_Unlock(conn->c_readmutex);
+    pr7920_probe("readmutex_released", conn->c_connid, op->o_opid,
+                 pr7920_now_ns(), 0, ret);
     return ret;
 }
 
@@ -1960,7 +2000,11 @@ connection_threadmain(void *arg)
         }
         maxthreads = conn->c_max_threads_per_conn;
         more_data = 0;
+        pr7920_probe("worker_read_call", conn->c_connid, op->o_opid,
+                     pr7920_now_ns(), 0, 0);
         ret = connection_read_operation(conn, op, &tag, &more_data);
+        pr7920_probe("worker_read_return", conn->c_connid, op->o_opid,
+                     pr7920_now_ns(), 0, ret);
         if ((ret == CONN_DONE) || (ret == CONN_TIMEDOUT)) {
             slapi_log_err(SLAPI_LOG_CONNS, "connection_threadmain",
                           "conn %" PRIu64 " read not ready due to %d - thread_turbo_flag %d more_data %d "

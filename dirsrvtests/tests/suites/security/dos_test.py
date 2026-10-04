@@ -7,8 +7,12 @@
 # --- END COPYRIGHT BLOCK ---
 #
 import logging
+import json
 import os
 import re
+import shutil
+import subprocess
+import threading
 import time
 import socket
 import pytest
@@ -73,6 +77,50 @@ def _wait_for_error_log(inst, offset, pattern, timeout):
     return None
 
 
+def _capture_delayed_bind(inst, completed, output_dir):
+    """Take a separate snapshot only if the diagnostic Bind is still waiting."""
+    if completed.wait(0.75):
+        return
+    snapshot = {"mono_ns": time.monotonic_ns(), "pid": inst.get_pid(),
+                "threads": []}
+    task_dir = "/proc/{}/task".format(snapshot["pid"])
+    try:
+        for tid in sorted(os.listdir(task_dir), key=int):
+            thread = {"lwp": tid}
+            for name in ("comm", "wchan", "stack"):
+                try:
+                    with open(os.path.join(task_dir, tid, name), "r",
+                              errors="replace") as source:
+                        thread[name] = source.read()
+                except OSError as exc:
+                    thread[name + "_error"] = repr(exc)
+            snapshot["threads"].append(thread)
+    except OSError as exc:
+        snapshot["error"] = repr(exc)
+    with open(os.path.join(output_dir, "delayed-bind-proc.json"), "w") as output:
+        json.dump(snapshot, output, sort_keys=True, indent=2)
+
+    # Opt-in: gdb stops the server and therefore changes the measured delay.
+    if os.environ.get("PR7920_GDB") == "1" and shutil.which("gdb"):
+        started_ns = time.monotonic_ns()
+        try:
+            result = subprocess.run(
+                ["gdb", "-q", "-n", "-batch", "-ex", "set pagination off",
+                 "-ex", "thread apply all bt 16", "-p", str(snapshot["pid"])],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True, timeout=4)
+            stack_text = result.stdout
+            stack_status = {"exit_code": result.returncode}
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            stack_text = repr(exc)
+            stack_status = {"error": repr(exc)}
+        stack_status["duration_ms"] = (time.monotonic_ns() - started_ns) / 1000000.0
+        with open(os.path.join(output_dir, "delayed-bind-gdb.txt"), "w") as output:
+            output.write(stack_text)
+        with open(os.path.join(output_dir, "delayed-bind-gdb.json"), "w") as output:
+            json.dump(stack_status, output, sort_keys=True)
+
+
 def test_dos_partial_message(topology_st):
     """Verify that a partial LDAP message does not block previous operations on the same connection.
 
@@ -107,10 +155,20 @@ def test_dos_partial_message(topology_st):
     # fails fast, long enough that CI scheduling jitter can't trip it.
     test_ioblocktimeout_ms = 5000
     s = None
+    diag_dir = os.path.join("assets", "pr7920")
+    os.makedirs(diag_dir, exist_ok=True)
+    probe_path = inst.errlog + ".pr7920-probe"
+    probe_offset = 0
+    delayed_bind_done = threading.Event()
+    snapshot_thread = None
+    timing = {"backend": os.environ.get("NSSLAPD_DB_LIB"),
+              "gdb_enabled": os.environ.get("PR7920_GDB") == "1"}
     try:
         inst.config.loglevel([ErrorLog.CONNECT, ErrorLog.DEFAULT])
         inst.config.replace("nsslapd-ioblocktimeout", str(test_ioblocktimeout_ms))
         inst.restart()
+        if os.path.exists(probe_path):
+            probe_offset = os.path.getsize(probe_path)
 
         # Anonymous Bind (MsgID=1): 30 0c 02 01 01 60 07 02 01 03 04 00 80 00
         bind_req = b'\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00'
@@ -126,6 +184,8 @@ def test_dos_partial_message(topology_st):
 
         log_offset = os.path.getsize(inst.errlog)
         log.info("Sending full bind request + partial second message")
+        timing["send_mono_ns"] = time.monotonic_ns()
+        timing["send_wall_ns"] = time.time_ns()
         s.sendall(bind_req + partial_req)
 
         # Confirm the race window is actually open: the server must have
@@ -134,15 +194,28 @@ def test_dos_partial_message(topology_st):
         queued = _wait_for_error_log(
             inst, log_offset, r"conn \d+ queued because more_data", 5)
         assert queued is not None, "the partial second message was not buffered/queued"
+        timing["queued_seen_mono_ns"] = time.monotonic_ns()
+        timing["queued_connection_id"] = queued.group(0).split()[1]
 
-        start = time.monotonic()
+        timing["recv_start_mono_ns"] = time.monotonic_ns()
+        snapshot_thread = threading.Thread(target=_capture_delayed_bind,
+                                           args=(inst, delayed_bind_done, diag_dir),
+                                           daemon=True)
+        snapshot_thread.start()
         log.info("Waiting for bind response...")
         try:
             data = s.recv(1024)
         except socket.timeout:
             pytest.fail("Timed out waiting for bind response. The server might be deadlocked.")
-        elapsed = time.monotonic() - start
+        finally:
+            timing["recv_end_mono_ns"] = time.monotonic_ns()
+            timing["recv_end_wall_ns"] = time.time_ns()
+            delayed_bind_done.set()
+        elapsed = (timing["recv_end_mono_ns"] - timing["recv_start_mono_ns"]) / 1000000000.0
+        timing["recv_wait_s"] = elapsed
+        timing["send_to_recv_s"] = (timing["recv_end_mono_ns"] - timing["send_mono_ns"]) / 1000000000.0
         log.info(f"Bind response received after {elapsed:.2f}s")
+        log.info("PR7920 client timing: %s", json.dumps(timing, sort_keys=True))
         log.debug(f"Received data: {data.hex()}")
 
         # Bind response for MsgID=1: 30 0c 02 01 01 61 07 0a 01 00 04 00 04 00
@@ -158,6 +231,20 @@ def test_dos_partial_message(topology_st):
         )
         log.info("Successfully received a prompt bind response for the first operation")
     finally:
+        delayed_bind_done.set()
+        if snapshot_thread is not None:
+            snapshot_thread.join(timeout=4.5)
+        try:
+            with open(probe_path, "rb") as source:
+                source.seek(probe_offset)
+                probe_data = source.read()
+            with open(os.path.join(diag_dir, "server-probe.log"), "wb") as output:
+                output.write(probe_data)
+            timing["probe_bytes"] = len(probe_data)
+        except OSError as exc:
+            timing["probe_error"] = repr(exc)
+        with open(os.path.join(diag_dir, "client-timing.json"), "w") as output:
+            json.dump(timing, output, sort_keys=True, indent=2)
         if s is not None:
             s.close()
         inst.config.replace("nsslapd-errorlog-level", original_loglevel)

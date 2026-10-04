@@ -27,6 +27,7 @@
 #include "fe.h"
 #include "vattr_spi.h"
 #include "slapi-plugin.h"
+#include "pr7920_probe.h"
 #include <ssl.h>
 
 static long current_conn_count;
@@ -1898,6 +1899,8 @@ flush_ber(
 {
     ber_len_t bytes;
     int rc = 0;
+    uint64_t probe_start_ns;
+    uint64_t probe_end_ns;
 
     switch (type) {
     case _LDAP_SEND_RESULT:
@@ -1927,9 +1930,23 @@ flush_ber(
         ber_get_option(ber, LBER_OPT_BYTES_TO_WRITE, &bytes);
 
         fgot_start(op, FGOT_WRITE);
+        pr7920_probe("flush_pdumutex_wait", conn->c_connid, op->o_opid,
+                     pr7920_now_ns(), 0, type);
+        probe_start_ns = pr7920_now_ns();
         PR_Lock(conn->c_pdumutex);
+        probe_end_ns = pr7920_now_ns();
+        pr7920_probe("flush_pdumutex_acquired", conn->c_connid, op->o_opid,
+                     probe_end_ns, probe_end_ns - probe_start_ns, type);
+        pr7920_probe("flush_write_enter", conn->c_connid, op->o_opid,
+                     pr7920_now_ns(), 0, type);
+        probe_start_ns = pr7920_now_ns();
         rc = ber_flush(conn->c_sb, ber, 1);
+        probe_end_ns = pr7920_now_ns();
+        pr7920_probe("flush_write_exit", conn->c_connid, op->o_opid,
+                     probe_end_ns, probe_end_ns - probe_start_ns, rc);
         PR_Unlock(conn->c_pdumutex);
+        pr7920_probe("flush_pdumutex_released", conn->c_connid, op->o_opid,
+                     pr7920_now_ns(), 0, type);
         fgot_end(op, FGOT_WRITE);
 
         if (rc != 0) {
