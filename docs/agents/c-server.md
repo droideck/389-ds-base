@@ -170,6 +170,24 @@ On the failure path: never restore a parameter you already replaced — on a DB 
 
 Writing concurrent code:
 
+- A partial-PDU reader holds `c_readmutex` while assembling the request and
+  `c_pdumutex` across each `PR_Poll` (`connection.c (connection_read_operation)`).
+  Result writers register intent before taking `c_pdumutex`. If the reader
+  observes pending intent, it sets `c_pdu_handoff_pending` under that lock and
+  waits until a writer acquires the lock, clears the flag, and notifies it
+  (`result.c (flush_ber)`). Once intent is published, the writer must reach
+  admission or resolve the pending handoff. The reader must
+  release `c_mutex` before waiting and release `c_pdumutex` before reacquiring
+  `c_mutex`; the reverse order can deadlock a SASL Bind. The condition variable
+  lives with the reusable connection slot (`conntable.c (connection_table_new)`,
+  `connection.c (connection_done)`).
+- When a worker has queued another read for buffered bytes, it must release
+  its connection reference after dispatching the current operation. Rechecking
+  the buffer and reading again would occupy two workers on one fragmented PDU:
+  one polling for bytes and one waiting on `c_readmutex`
+  (`connection.c (connection_threadmain)`). If no reader was queued, the worker
+  retains the existing continuation path.
+
 - Operation callbacks run concurrently on worker threads (`connection.c (connection_threadmain)`), and a live config modify runs a plugin's DSE callback on another worker at the same time (the config-lock pattern in [plugins.md](plugins.md)). Anything outside locals and the per-operation pblock is shared state and needs a synchronization owner: `slapi_new_mutex()` / `slapi_new_rwlock()`, the `slapi_atomic_*` family (`slapi-plugin.h (slapi_atomic_incr_64)`), or `Slapi_Counter`.
 - Release every lock on every exit path — early returns, `goto bail`, and error branches are where missed unlocks hide, and a leaked lock deadlocks the next worker thread that contends it.
 - Nested locks need one fixed acquisition order across all call paths. betxn callbacks already run inside the backend's transaction (see [plugins.md](plugins.md)), so audit ordering across module boundaries, not just within one file.
