@@ -165,9 +165,6 @@ connection_done(Connection *conn)
     if (NULL != conn->c_pdumutex) {
         PR_DestroyLock(conn->c_pdumutex);
     }
-    if (NULL != conn->c_readmutex) {
-        PR_DestroyLock(conn->c_readmutex);
-    }
     /* PAGED_RESULTS */
     pagedresults_cleanup_all(conn, 0);
 
@@ -196,7 +193,6 @@ connection_cleanup(Connection *conn)
      * We hang onto these, since we can reuse them.
      * Sockbuf *c_sb;
      * pthread_mutex_t c_mutex;
-     * PRLock *c_readmutex;
      * PRLock *c_pdumutex;
      * PRCondVar *c_pdu_writer_cv;
      * Conn_private *c_private;
@@ -1303,8 +1299,6 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
     int proxy_connection = 0;
     int32_t log_format = config_get_accesslog_log_format();
 
-    /* Keep one reader responsible for the whole PDU, including poll waits. */
-    PR_Lock(conn->c_readmutex);
     pthread_mutex_lock(&(conn->c_mutex));
     /*
      * if the socket is still valid, get the ber element
@@ -1670,7 +1664,6 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
     op->o_tag = *tag;
 done:
     pthread_mutex_unlock(&(conn->c_mutex));
-    PR_Unlock(conn->c_readmutex);
     return ret;
 }
 

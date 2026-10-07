@@ -1752,7 +1752,6 @@ typedef struct conn
     PRInt32 c_threadnumber;          /* # threads used in this conn    */
     int c_refcnt;                    /* # ops refering to this conn    */
     pthread_mutex_t c_mutex;         /* protect each conn structure; need to be re-entrant */
-    PRLock *c_readmutex;             /* protect the read buffer */
     PRLock *c_pdumutex;              /* only write one pdu at a time   */
     PRCondVar *c_pdu_writer_cv;      /* hand the PDU lock to a waiting writer */
     int32_t c_pdu_writers_waiting;   /* atomic writer intent count */
