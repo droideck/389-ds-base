@@ -110,6 +110,13 @@ typedef struct _task_data
     char *filter_str;
 } task_data;
 
+typedef struct
+{
+    MemberOfConfig *config;
+    int entry_rc;
+    int search_rc;
+} memberof_fixup_data;
+
 typedef struct _MemberofEntryInfo
 {
     Slapi_Entry *e;
@@ -171,8 +178,7 @@ static int memberof_modop_one_replace_r(Slapi_PBlock *pb, MemberOfConfig *config
 static int memberof_task_add(Slapi_PBlock *pb, Slapi_Entry *e, Slapi_Entry *eAfter, int *returncode, char *returntext, void *arg);
 static void memberof_task_destructor(Slapi_Task *task);
 static void memberof_fixup_task_thread(void *arg);
-static int memberof_fix_memberof(MemberOfConfig *config, Slapi_Task *task, task_data *td);
-static int memberof_fix_memberof_callback(Slapi_Entry *e, void *callback_data);
+static int memberof_fix_memberof(MemberOfConfig *config, task_data *td);
 static int memberof_reconcile_memberof_callback(Slapi_Entry *e, MemberOfConfig *config);
 static int memberof_fixup_memberof_callback(Slapi_Entry *e, void *callback_data);
 static int memberof_entry_in_scope(MemberOfConfig *config, MemberofEntryInfo *entry_info);
@@ -1218,7 +1224,7 @@ perform_needed_fixup(void)
     while (be) {
         td.dn = (char*) slapi_sdn_get_dn(slapi_be_getsuffix(be, 0));
         if (td.dn) {
-            int rc1 = memberof_fix_memberof(&config, NULL, &td);
+            int rc1 = memberof_fix_memberof(&config, &td);
             if (rc1) {
                 slapi_log_err(SLAPI_LOG_ERR, MEMBEROF_PLUGIN_SUBSYSTEM,
                               "memberof plugin failed to perform fixup on dn %s with filter %s - error: %d\n",
@@ -1963,6 +1969,8 @@ memberof_call_foreach_dn(Slapi_PBlock *pb __attribute__((unused)), Slapi_Entry *
                     /* do nothing, entry scope is spanning
                      * multiple suffixes, start at suffix */
                 } else if (config->entryScopes) {
+                    /* Only included subtrees in this backend can contain groups. */
+                    do_suffix_search = PR_FALSE;
                     for (size_t ii = 0; config->entryScopes[ii]; ii++) {
                         if (slapi_sdn_issuffix(config->entryScopes[ii], base_sdn)) {
                             /* Search each include scope */
@@ -1970,9 +1978,6 @@ memberof_call_foreach_dn(Slapi_PBlock *pb __attribute__((unused)), Slapi_Entry *
                                                          LDAP_SCOPE_SUBTREE, filter_str, 0, 0, 0, 0,
                                                          memberof_get_plugin_id(), 0);
                             rc = slapi_search_internal_callback_pb(search_pb, callback_data, result_callback, callback, 0);
-                            /* We already did the search for this backend, don't
-                             * do it again when we fall through */
-                            do_suffix_search = PR_FALSE;
                             slapi_pblock_init(search_pb);
                             if (rc) {
                                 break;
@@ -4363,7 +4368,7 @@ memberof_fixup_task_thread(void *arg)
     }
 
     /* do real work */
-    rc = memberof_fix_memberof(&configCopy, task, td);
+    rc = memberof_fix_memberof(&configCopy, td);
 
 done:
     if (usetxn && fixup_pb) {
@@ -4545,32 +4550,38 @@ memberof_task_destructor(Slapi_Task *task)
                   "memberof_task_destructor <--\n");
 }
 
-/* The fixup task meat */
-int
-memberof_fix_memberof(MemberOfConfig *config, Slapi_Task *task, task_data *td)
+static void
+memberof_fixup_result_callback(int rc, void *callback_data)
 {
-    int rc = 0;
+    memberof_fixup_data *data = callback_data;
+
+    /* Global recovery also visits backends without a suffix entry. */
+    if (!data->config->task && rc == LDAP_NO_SUCH_OBJECT) {
+        rc = LDAP_SUCCESS;
+    }
+    data->search_rc = rc;
+}
+
+int
+memberof_fix_memberof(MemberOfConfig *config, task_data *td)
+{
+    /* SLAPI can reject a search before installing the callbacks. */
+    memberof_fixup_data data = {.config = config, .search_rc = LDAP_OPERATIONS_ERROR};
     Slapi_PBlock *search_pb = slapi_pblock_new();
 
-    slapi_search_internal_set_pb(search_pb, td->dn,
-                                 LDAP_SCOPE_SUBTREE, td->filter_str, 0, 0,
-                                 0, 0,
-                                 memberof_get_plugin_id(),
-                                 0);
-    rc = slapi_search_internal_callback_pb(search_pb,
-                                           config,
-                                           0, memberof_fixup_memberof_callback,
-                                           0);
-    if (rc) {
-        char *errmsg;
-        int result;
-
-        slapi_pblock_get(search_pb, SLAPI_PLUGIN_INTOP_RESULT, &result);
-        errmsg = ldap_err2string(result);
+    slapi_search_internal_set_pb(search_pb, td->dn, LDAP_SCOPE_SUBTREE, td->filter_str,
+                                 NULL, 0, NULL, NULL, memberof_get_plugin_id(), 0);
+    if (slapi_search_internal_callback_pb(search_pb, &data, memberof_fixup_result_callback,
+                                          memberof_fixup_memberof_callback, NULL) != 0) {
+        slapi_pblock_get(search_pb, SLAPI_PLUGIN_INTOP_RESULT, &data.search_rc);
+    }
+    int rc = data.entry_rc ? data.entry_rc : data.search_rc;
+    if (rc != LDAP_SUCCESS) {
+        const char *errmsg = ldap_err2string(rc);
         slapi_log_err(SLAPI_LOG_ERR, MEMBEROF_PLUGIN_SUBSYSTEM,
                       "memberof_fix_memberof - Failed (%s)\n", errmsg);
-        if (task) {
-            slapi_task_log_notice(task, "Memberof task failed (%s)", errmsg);
+        if (config->task) {
+            slapi_task_log_notice(config->task, "Memberof task failed (%s)", errmsg);
         }
     }
 
@@ -4672,16 +4683,6 @@ ancestors_cache_add(MemberOfConfig *config, const void *key, void *value)
     }
 #endif
     return e;
-}
-
-int
-memberof_fixup_memberof_callback(Slapi_Entry *e, void *callback_data)
-{
-    /* Always check shutdown in fixup task */
-    if (slapi_is_shutting_down()) {
-        return -1;
-    }
-    return memberof_fix_memberof_callback(e, callback_data);
 }
 
 /* Compare complete membership sets using the memberOf attribute syntax.
@@ -4944,9 +4945,17 @@ bail:
 }
 
 static int
-memberof_fix_memberof_callback(Slapi_Entry *e, void *callback_data)
+memberof_fixup_memberof_callback(Slapi_Entry *e, void *callback_data)
 {
-    return memberof_update_memberof_callback(e, (MemberOfConfig *)callback_data, false);
+    memberof_fixup_data *data = callback_data;
+
+    if (data->entry_rc != LDAP_SUCCESS) {
+        return -1;
+    }
+    data->entry_rc = slapi_is_shutting_down() ? LDAP_UNAVAILABLE
+                                              : memberof_update_memberof_callback(e, data->config, false);
+    /* -1 requests abandonment. Keep the LDAP error for the task. */
+    return data->entry_rc == LDAP_SUCCESS ? 0 : -1;
 }
 
 static int
